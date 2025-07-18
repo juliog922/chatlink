@@ -49,4 +49,5 @@ Thumbs.db
 
 # Temporary
 init_db.py
+examplestore.db
 auth.db
