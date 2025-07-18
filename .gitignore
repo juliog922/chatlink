@@ -1,0 +1,53 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Output of the go coverage tool
+*.coverprofile
+
+# Virtual environments
+.venv
+
+# Environment variables or secret configs
+.env
+.env.*
+
+# Downloads
+*.zip
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE/editor config files
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Temporary
+init_db.py
+examplestore.db
+auth.db

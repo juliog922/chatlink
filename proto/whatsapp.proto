@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package whatsapp;
+option go_package = "./proto";
+
+service WhatsAppService {
+  rpc StreamMessages(Empty) returns (stream MessageEvent);
+  rpc StartLogin(Empty) returns (QRCodeResponse);
+  rpc SendMessage(SendRequest) returns (SendResponse);
+  rpc ListDevices(Empty) returns (DeviceList);
+  rpc LogoutDevice(DeviceID) returns (StatusResponse);
+  rpc DeleteDevice(DeviceID) returns (StatusResponse);
+}
+
+message Empty {}
+
+message MessageEvent {
+  string from = 1;
+  string to = 2;
+  string name = 3;
+  string text = 4;
+  string timestamp = 5;
+  bytes binary = 6;
+  string filename = 7;
+}
+
+message QRCodeResponse {
+  string code = 1;       // QR como string
+  string status = 2;     // success | timeout | error
+}
+
+message SendRequest {
+  string to = 1;         // Teléfono destino
+  string text = 2;       // Texto a enviar
+  string from_jid = 3;   // JID del emisor (opcional)
+
+  bytes binary = 4;      // Contenido binario del archivo (opcional)
+  string filename = 5;   // Nombre del archivo (opcional)
+}
+
+message SendResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message DeviceInfo {
+  string jid = 1;
+}
+
+message DeviceList {
+  repeated DeviceInfo devices = 1;
+}
+
+message DeviceID {
+  string jid = 1;
+}
+
+message StatusResponse {
+  bool success = 1;
+  string error = 2;
+}

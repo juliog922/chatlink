@@ -1,0 +1,34 @@
+[project]
+name = "whatsapp-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google>=3.0.0",
+    "grpcio>=1.72.1",
+    "langchain>=0.3.25",
+    "langchain-ollama>=0.3.3",
+    "number-parser>=0.3.2",
+    "numpy>=2.2.6",
+    "opencv-python>=4.11.0.86",
+    "opencv-python-headless>=4.11.0.86",
+    "openpyxl>=3.1.5",
+    "paddleocr>=2.10.0",
+    "paddlepaddle>=3.1.0",
+    "pandas>=2.3.0",
+    "paramiko>=3.5.1",
+    "pillow>=11.2.1",
+    "protobuf>=6.31.1",
+    "pyodbc>=5.2.0",
+    "pypdf2>=3.0.1",
+    "python-docx>=1.1.2",
+    "python-dotenv>=1.1.0",
+    "qrcode>=8.2",
+    "reportlab>=4.4.2",
+    "rich>=14.0.0",
+    "setuptools>=80.9.0",
+    "sqlalchemy>=2.0.41",
+    "vosk>=0.3.45",
+    "websocket-client>=1.8.0",
+]
