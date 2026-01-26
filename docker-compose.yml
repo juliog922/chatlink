@@ -1,0 +1,191 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: chatlink-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 60s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chatlink-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: chatlink-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"] 
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - chatlink-net
+
+  meow_server:
+    build:
+      context: ./meow_server
+      dockerfile: Dockerfile
+    container_name: meow-server
+    restart: unless-stopped
+    ports:
+      - "50051:50051"
+    env_file:
+      - .env
+    environment:
+      WHATSMEOW_HOST: 0.0.0.0
+      WHATSMEOW_PORT: 50051
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_SSLMODE: disable
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50051"]
+      interval: 60s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chatlink-net
+
+  chatlink_bot:
+    build:
+      context: ./chatlink_bot
+      dockerfile: Dockerfile
+    container_name: chatlink-bot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      GRPC_HOST: meow_server
+      GRPC_PORT: 50051
+    volumes:
+      - ./chatlink_bot/gmail_accounts.json:/app/gmail_accounts.json:ro
+    depends_on:
+      meow_server:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      cudara:
+        condition: service_healthy
+      model_puller:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    networks:
+      - chatlink-net
+  
+  cudara:
+    image: ghcr.io/juliog922/cudara:latest
+    container_name: cudara
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    volumes:
+      - cudara_models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()\""]
+      interval: 60s
+      timeout: 5s
+      retries: 30
+      start_period: 1200s
+    networks:
+      - chatlink-net
+    
+  model_puller:
+    image: alpine:latest
+    container_name: cudara_model_puller
+    env_file:
+      - .env
+    depends_on:
+      cudara:
+        condition: service_healthy
+    command: >
+      /bin/sh -c '
+        apk add --no-cache curl jq
+
+        echo "Starting Sequential Model Puller..."
+        
+        if [ -z "$$CUDARA_DEFAULT_MODELS" ]; then
+          echo "Error: CUDARA_DEFAULT_MODELS not set."
+          exit 1
+        fi
+        
+        models=$$(echo "$$CUDARA_DEFAULT_MODELS" | tr "," " ")
+
+        # Iterar modelo por modelo (Secuencial)
+        for model in $$models; do
+          echo ">>> Processing model: $$model"
+          
+          # Bucle "Until Done": No pasamos al siguiente modelo hasta que este esté ready
+          while true; do
+            # 1. Comprobar estado actual
+            CURRENT_STATE=$$(curl -s http://cudara:8000/api/tags)
+            STATUS=$$(echo "$$CURRENT_STATE" | jq -r ".models[] | select(.name == \"$$model\") | .status")
+
+            if [ "$$STATUS" = "ready" ]; then
+              echo "[OK] Model $$model is ready."
+              break # Sale del while, pasa al siguiente modelo del for
+            fi
+
+            # 2. Si no está listo, iniciamos descarga bloqueante
+            echo "[DOWNLOADING] $$model status is \"$$STATUS\". Starting pull (blocking)..."
+            
+            # stream: false hace que curl espere a que termine (o falle) antes de devolver el control
+            curl -s -X POST http://cudara:8000/api/pull \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"$$model\", \"stream\": false}"
+            
+            # Pequeña pausa antes de volver a verificar el estado
+            echo "Download call finished. Verifying..."
+            sleep 2
+          done
+        done
+        
+        echo "SUCCESS: All models are downloaded and ready."
+        exit 0
+      '
+    networks:
+      - chatlink-net
+
+volumes:
+  postgres_data:
+  cudara_models:
+  qdrant_data:
+
+networks:
+  chatlink-net:
+    driver: bridge

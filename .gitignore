@@ -1,0 +1,130 @@
+# =======================================================
+# GENERAL / OS / ENVIRONMENT
+# =======================================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.log
+
+# Environment Variables (CRITICAL: Never commit secrets)
+.env
+.env.local
+.env.*.local
+*.env
+
+# =======================================================
+# PYTHON
+# =======================================================
+# Byte-compiled / Optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / Packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Unit Test / Coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Type Checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# =======================================================
+# GO (GOLANG)
+# =======================================================
+# Binaries
+# If you compile to a specific folder, ignore it (e.g., /bin)
+/bin/
+/dist/
+# Ignore specific binary names if they are in root (replace 'my-app' with your app name)
+# my-app
+# my-app.exe
+
+# Test binaries and profiles
+*.test
+*.prof
+*.out
+
+# Vendor directory (optional: un-comment if you use Go Modules and DON'T want to commit dependencies)
+# vendor/
+
+# Local history (if using tooling that generates it)
+.history/
+
+# =======================================================
+# DOCKER
+# =======================================================
+# Docker Compose override file (usually for local dev settings)
+docker-compose.override.yml
+
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+
+# Checkpoints
+.docker/
+
+# =======================================================
+# IDE / EDITOR SETTINGS
+# =======================================================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# JetBrains (PyCharm, GoLand, IntelliJ)
+.idea/
+*.iml
+
+# Vim / Emacs
+*~
+*.swp
+*.swo
+\#*#

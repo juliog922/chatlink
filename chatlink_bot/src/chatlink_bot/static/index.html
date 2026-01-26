@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatLink Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        [v-cloak] { display: none; }
+        .log-line { font-family: 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.4; }
+        /* Scrollbar styling */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-200 h-screen w-screen overflow-hidden font-sans">
+    <div id="app" v-cloak class="flex h-full">
+        
+        <div class="w-64 bg-slate-800 flex flex-col border-r border-slate-700 shadow-2xl z-20">
+            <div class="p-5 flex items-center gap-3 border-b border-slate-700 bg-slate-900">
+                <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center text-white font-bold"><i class="fas fa-robot"></i></div>
+                <div>
+                    <h1 class="font-bold text-lg leading-none">ChatLink</h1>
+                    <span class="text-xs text-slate-500">v3.0.0 Pro</span>
+                </div>
+            </div>
+
+            <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
+                <template v-for="item in navItems" :key="item.id">
+                    <a @click="currentView = item.id" 
+                       :class="currentView === item.id ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-700 hover:text-white'"
+                       class="flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200 group">
+                        <i :class="item.icon" class="w-5 text-center group-hover:scale-110 transition-transform"></i>
+                        <span class="font-medium">{{ item.label }}</span>
+                    </a>
+                </template>
+            </nav>
+
+            <div class="p-4 border-t border-slate-700 bg-slate-800/50 text-xs text-slate-400 space-y-4">
+                <div v-if="resources.ram && resources.ram.total_mb > 0">
+                    <div class="flex justify-between mb-1">
+                        <span>RAM</span> 
+                        <span>{{ resources.ram.used_mb }} / {{ resources.ram.total_mb }} MB</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-1.5">
+                        <div class="bg-emerald-500 h-1.5 rounded-full transition-all duration-500" 
+                             :style="{width: (resources.ram.used_mb / resources.ram.total_mb * 100) + '%'}"></div>
+                    </div>
+                </div>
+            
+                <div v-if="resources.gpu?.available && resources.gpu.gpus.length">
+                    <div class="flex justify-between mb-1">
+                        <span class="text-purple-400">VRAM GPU</span> 
+                        <span>{{ resources.gpu.gpus[0].vram_used_mb }} / {{ resources.gpu.gpus[0].vram_total_mb }} MB</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-1.5">
+                        <div class="bg-purple-500 h-1.5 rounded-full transition-all duration-500" 
+                             :style="{width: resources.gpu.gpus[0].percent + '%'}"></div>
+                    </div>
+                </div>
+            
+                <div v-if="resources.disk">
+                    <div class="flex justify-between mb-1">
+                        <span>Disco (Storage)</span> 
+                        <span>{{ resources.disk.used_gb }} / {{ resources.disk.total_gb }} GB</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-1.5">
+                        <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500" 
+                             :style="{width: resources.disk.percent + '%'}"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="flex-1 flex flex-col bg-slate-900 relative">
+            <header class="h-16 bg-slate-800/80 backdrop-blur border-b border-slate-700 flex items-center justify-between px-6">
+                <h2 class="text-xl font-bold text-white tracking-wide">{{ pageTitle }}</h2>
+                <div class="flex items-center gap-4">
+                    <span v-if="loading" class="text-blue-400 text-sm animate-pulse"><i class="fas fa-circle-notch fa-spin mr-2"></i>Processing</span>
+                    <button @click="refreshAll" class="w-8 h-8 rounded-full bg-slate-700 hover:bg-blue-600 flex items-center justify-center transition-colors">
+                        <i class="fas fa-sync-alt text-sm"></i>
+                    </button>
+                </div>
+            </header>
+
+            <main class="flex-1 overflow-hidden relative">
+                
+                <div v-if="currentView === 'dashboard'" class="p-6 h-full overflow-y-auto">
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                        <div v-for="(stat, key) in statusCards" :key="key" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
+                            <div class="absolute right-0 top-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity"><i :class="stat.icon" class="text-6xl"></i></div>
+                            <div class="text-slate-400 text-sm font-medium uppercase tracking-wider mb-1">{{ stat.label }}</div>
+                            <div class="text-2xl font-bold flex items-center gap-2" :class="stat.color">
+                                <i :class="stat.statusIcon"></i> {{ stat.value }}
+                            </div>
+                            <div class="text-xs text-slate-500 mt-2">{{ stat.subtext }}</div>
+                        </div>
+                    </div>
+
+                    <div class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
+                        <div class="p-4 bg-slate-800 border-b border-slate-700 font-bold">System Configuration (Safe View)</div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm text-left text-slate-400">
+                                <thead class="text-xs text-slate-300 uppercase bg-slate-900/50">
+                                    <tr>
+                                        <th class="px-6 py-3">Environment Variable</th>
+                                        <th class="px-6 py-3">Value</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="(val, key) in config" :key="key" class="border-b border-slate-700/50 hover:bg-slate-700/30">
+                                        <td class="px-6 py-3 font-mono text-blue-400">{{ key }}</td>
+                                        <td class="px-6 py-3 font-mono text-slate-300">{{ val }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-if="currentView === 'users'" class="p-6 h-full flex flex-col">
+                    <div class="flex justify-between mb-4">
+                        <input v-model="userSearch" placeholder="Search users..." class="bg-slate-800 border border-slate-700 rounded px-4 py-2 text-sm w-64 focus:outline-none focus:border-blue-500">
+                        <button @click="showAddUserModal=true" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-blue-900/20 transition-all">
+                            <i class="fas fa-plus mr-2"></i>New User
+                        </button>
+                    </div>
+                    <div class="flex-1 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
+                        <table class="w-full text-sm text-left text-slate-400">
+                            <thead class="text-xs text-slate-300 uppercase bg-slate-900/50">
+                                <tr>
+                                    <th class="px-6 py-4">User</th>
+                                    <th class="px-6 py-4">Role</th>
+                                    <th class="px-6 py-4">Status</th>
+                                    <th class="px-6 py-4 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="user in filteredUsers" :key="user.id" class="border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors">
+                                    <td class="px-6 py-4">
+                                        <div class="font-bold text-white">{{ user.name }}</div>
+                                        <div class="text-xs">{{ user.email }} | {{ user.phone }}</div>
+                                    </td>
+                                    <td class="px-6 py-4">
+                                        <span class="px-2 py-1 rounded text-xs uppercase font-bold" 
+                                              :class="user.role==='admin'?'bg-purple-900/30 text-purple-400 border border-purple-800':'bg-blue-900/30 text-blue-400 border border-blue-800'">
+                                            {{ user.role }}
+                                        </span>
+                                    </td>
+                                    <td class="px-6 py-4">
+                                        <div class="flex items-center gap-2">
+                                            <div class="w-2 h-2 rounded-full" :class="user.enabled ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500'"></div>
+                                            <span>{{ user.enabled ? 'Active' : 'Disabled' }}</span>
+                                        </div>
+                                    </td>
+                                    <td class="px-6 py-4 text-right space-x-2">
+                                        <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Login / QR"><i class="fas fa-qrcode"></i></button>
+                                        <button @click="deleteUser(user.id)" class="p-2 hover:text-red-400 transition-colors" title="Delete"><i class="fas fa-trash"></i></button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div v-if="currentView === 'simulator'" class="h-full flex flex-col md:flex-row divide-y md:divide-y-0 md:divide-x divide-slate-700">
+                    <div class="md:w-1/3 bg-slate-800/50 p-6 overflow-y-auto space-y-5">
+                        <div class="space-y-4">
+                            <h3 class="text-xs font-bold uppercase text-slate-500 tracking-wider">Simulation Parameters</h3>
+                            
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">Channel</label>
+                                    <select v-model="sim.channel" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none">
+                                        <option value="whatsapp">WhatsApp</option>
+                                        <option value="email">Email</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">Type</label>
+                                    <select v-model="sim.media_type" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none">
+                                        <option value="text">Text Only</option>
+                                        <option value="image">Image (Mock PNG)</option>
+                                        <option value="document">Document (PDF)</option>
+                                        <option value="audio">Audio (WAV)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">Sender (From)</label>
+                                <select v-model="sim.sender" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none font-mono">
+                                    <option value="" disabled>Select Actor...</option>
+                                    <optgroup label="Real Clients (SQL Server)">
+                                        <option v-for="a in simActors.filter(x => x.type === 'client')" :value="a.id">
+                                            {{ a.name }} ({{ a.id }})
+                                        </option>
+                                    </optgroup>
+                                    <optgroup label="Common Not-Clients">
+                                        <option v-for="a in simActors.filter(x => x.type === 'non_client')" :value="a.id">
+                                            {{ a.name }}
+                                        </option>
+                                    </optgroup>
+                                    <optgroup label="Internal Staff (Testing)">
+                                        <option v-for="a in simActors.filter(x => ['admin','user'].includes(x.type))" :value="a.id">
+                                            {{ a.name }}
+                                        </option>
+                                    </optgroup>
+                                </select>
+                                <div v-if="isNonClientSender" class="text-[10px] text-red-400 mt-1 flex items-center gap-1">
+                                    <i class="fas fa-exclamation-circle"></i> Message will be dropped (Not a Client).
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">Receiver (To)</label>
+                                <select v-model="sim.receiver" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none font-mono">
+                                    <option value="" disabled>Select Internal User...</option>
+                                    <option v-for="a in availableReceivers" :value="a.id">
+                                        {{ a.name }}
+                                    </option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">Content / Caption</label>
+                                <textarea v-model="sim.text" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm" placeholder="Type a message..."></textarea>
+                            </div>
+
+                            <button @click="sendSimulation" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded shadow-lg shadow-blue-900/50 transition-all active:scale-95">
+                                Inject Message
+                            </button>
+                        </div>
+
+                        <div v-if="simState.order_status" class="bg-slate-900 p-4 rounded border border-slate-700 space-y-2 font-mono text-xs">
+                            <div class="font-bold text-blue-400 uppercase border-b border-slate-700 pb-1 mb-2">Internal State</div>
+                            <div class="flex justify-between"><span>Status:</span> <span class="text-yellow-400">{{ simState.order_status }}</span></div>
+                            <div class="flex justify-between"><span>Last Latency:</span> <span class="text-green-400">{{ simState.last_benchmark_ms }}ms</span></div>
+                            <div v-if="simState.confirmed_items.length">
+                                <div class="mt-2 text-slate-500">Confirmed Items:</div>
+                                <ul class="list-disc ml-4 text-emerald-300">
+                                    <li v-for="item in simState.confirmed_items">{{ item.qty }}x {{ item.code || item.CodigoArticulo }}</li>
+                                </ul>
+                                <button @click="downloadCsv" class="mt-2 w-full bg-emerald-600/20 text-emerald-400 border border-emerald-600/50 py-1 rounded hover:bg-emerald-600/40">
+                                    <i class="fas fa-file-csv mr-1"></i> CSV
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flex-1 flex flex-col bg-slate-950">
+                        <div class="p-3 border-b border-slate-800 flex justify-between items-center text-xs text-slate-500 uppercase tracking-widest">
+                            <span>Live Feed</span>
+                            <button @click="loadSimChat" class="hover:text-blue-400"><i class="fas fa-sync"></i></button>
+                        </div>
+                        <div id="simChatBox" class="flex-1 overflow-y-auto p-4 space-y-4">
+                            <div v-if="simChat.length === 0" class="h-full flex items-center justify-center text-slate-700 italic">
+                                No interaction history found.
+                            </div>
+                            <div v-for="msg in simChat" :key="msg.id" class="flex flex-col max-w-[85%]" 
+                                 :class="msg.direction === 'sent' ? 'self-end items-end' : 'self-start items-start'">
+                                <div class="px-4 py-3 rounded-2xl text-sm shadow-md"
+                                     :class="msg.direction === 'sent' 
+                                        ? (msg.is_bot ? 'bg-purple-600 text-white rounded-br-none' : 'bg-blue-600 text-white rounded-br-none') 
+                                        : 'bg-slate-800 text-slate-200 rounded-bl-none border border-slate-700'">
+                                    
+                                    <div class="flex items-center gap-2 mb-1 text-[10px] opacity-75 font-mono">
+                                        <i :class="msg.channel === 'whatsapp' ? 'fab fa-whatsapp' : 'fas fa-envelope'"></i>
+                                        <span>{{ msg.direction === 'sent' ? (msg.is_bot ? 'BOT' : 'SALESMAN') : 'CLIENT' }}</span>
+                                        <span>•</span>
+                                        <span>{{ formatTime(msg.timestamp) }}</span>
+                                    </div>
+
+                                    <div class="whitespace-pre-wrap leading-relaxed">{{ msg.message }}</div>
+                                    
+                                    <div v-if="msg.input_type !== 'text'" class="mt-2 inline-flex items-center gap-1 bg-black/20 px-2 py-1 rounded text-xs">
+                                        <i class="fas fa-paperclip"></i> {{ msg.input_type }}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-if="currentView === 'logs'" class="h-full flex flex-col p-6">
+                    <div class="flex gap-2 mb-4">
+                        <select v-model="logsFilter.level" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none">
+                            <option value="">All Levels</option>
+                            <option value="INFO">INFO</option>
+                            <option value="WARNING">WARNING</option>
+                            <option value="ERROR">ERROR</option>
+                        </select>
+                        <input v-model="logsFilter.search" placeholder="Grep logs..." class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 text-sm focus:border-blue-500 outline-none font-mono">
+                        <button @click="loadLogs" class="bg-slate-700 hover:bg-slate-600 px-4 rounded text-white"><i class="fas fa-search"></i></button>
+                    </div>
+                    <div class="flex-1 bg-black/50 rounded-lg border border-slate-700 p-4 overflow-y-auto font-mono text-xs shadow-inner">
+                        <div v-for="(log, idx) in logs" :key="idx" class="mb-1 break-words hover:bg-white/5 px-1 rounded transition-colors"
+                             :class="{
+                                'text-red-400': log.line.includes('ERROR'),
+                                'text-yellow-400': log.line.includes('WARNING'),
+                                'text-slate-400': !log.line.includes('ERROR') && !log.line.includes('WARNING')
+                             }">
+                            {{ log.line }}
+                        </div>
+                    </div>
+                </div>
+
+            </main>
+        </div>
+
+        <div v-if="showAddUserModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+            <div class="bg-slate-800 border border-slate-700 p-6 rounded-xl shadow-2xl w-96">
+                <h3 class="text-xl font-bold mb-6">Create User</h3>
+                <div class="space-y-3">
+                    <input v-model="newUser.name" placeholder="Name" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+                    <input v-model="newUser.email" placeholder="Email" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+                    <input v-model="newUser.phone" placeholder="Phone" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+                    <select v-model="newUser.role" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
+                        <option value="user">Salesman</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                <div class="flex justify-end gap-3 mt-6">
+                    <button @click="showAddUserModal=false" class="px-4 py-2 text-slate-400 hover:text-white">Cancel</button>
+                    <button @click="createUser" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold">Create</button>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="showQrModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+            <div class="bg-white text-slate-900 p-8 rounded-xl shadow-2xl max-w-sm text-center">
+                <h3 class="text-2xl font-bold mb-2">Link Device</h3>
+                <p class="text-sm text-slate-500 mb-6">Scan with WhatsApp (Linked Devices)</p>
+                
+                <div class="bg-slate-100 p-4 rounded-lg mb-4 flex items-center justify-center min-h-[200px]">
+                    <img v-if="qrData" :src="'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(qrData)" alt="QR Code">
+                    <div v-else class="text-red-500 font-bold">Session Active / Error</div>
+                </div>
+                
+                <div class="bg-slate-100 p-2 rounded text-[10px] font-mono break-all text-slate-400 mb-4 select-all">
+                    {{ qrData || 'NO_QR_DATA' }}
+                </div>
+                <button @click="showQrModal=false" class="bg-slate-900 text-white px-8 py-2 rounded-full hover:bg-slate-700 transition">Done</button>
+            </div>
+        </div>
+
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>

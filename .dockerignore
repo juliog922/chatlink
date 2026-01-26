@@ -1,0 +1,9 @@
+# Git
+.git
+.gitignore
+
+# Python/Environment
+__pycache__
+*.pyc
+uv.lock
+.venv/

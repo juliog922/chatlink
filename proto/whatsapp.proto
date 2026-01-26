@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package whatsapp;
+option go_package = "./proto";
+
+// WhatsAppService defines the remote procedure calls for managing WhatsApp sessions,
+// streaming incoming messages, and sending outgoing messages via the whatsmeow library.
+service WhatsAppService {
+  // StreamMessages establishes a continuous stream to receive incoming messages (text, media, etc.)
+  // from connected WhatsApp devices.
+  rpc StreamMessages(Empty) returns (stream MessageEvent);
+
+  // StartLogin initiates the QR code login flow. It returns a stream of status updates
+  // (QR code generation, timeout, or success).
+  rpc StartLogin(Empty) returns (QRCodeResponse);
+
+  // SendMessage sends a text or media message to a specific recipient.
+  rpc SendMessage(SendRequest) returns (SendResponse);
+
+  // ListDevices retrieves all registered WhatsApp sessions (devices) and their connection status.
+  rpc ListDevices(Empty) returns (DeviceList);
+
+  // LogoutDevice performs a clean logout for a specific device, invalidating the session.
+  rpc LogoutDevice(DeviceID) returns (StatusResponse);
+
+  // DeleteDevice disconnects and physically removes the device session data from the database.
+  rpc DeleteDevice(DeviceID) returns (StatusResponse);
+}
+
+// Empty is a generic void message used when no input parameters are required.
+message Empty {}
+
+// MessageEvent represents an incoming message received from WhatsApp.
+message MessageEvent {
+  // The JID of the sender.
+  // Required. Example: "1234567890@s.whatsapp.net"
+  string from = 1;
+
+  // The JID of the receiver (usually the bot's JID).
+  // Required. Example: "0987654321@s.whatsapp.net"
+  string to = 2;
+
+  // The pushname or display name of the sender.
+  // Optional. Example: "John Doe"
+  string name = 3;
+
+  // The text content of the message or the media caption.
+  // Optional (if media is present). Example: "Hello, world!"
+  string text = 4;
+
+  // The time the message was received in ISO 8601 or RFC3339 format.
+  // Required. Example: "2023-10-27T10:00:00Z"
+  string timestamp = 5;
+
+  // The raw bytes of the media file (image, document, etc.).
+  // Optional. Example: [0x89, 0x50, 0x4E, 0x47, ...]
+  bytes binary = 6;
+
+  // The name of the file if binary data is present.
+  // Optional. Example: "photo.jpg"
+  string filename = 7;
+}
+
+// QRCodeResponse handles the states of the QR login process.
+message QRCodeResponse {
+  // The QR code string intended to be displayed or converted to an image.
+  // Optional (present only if status is "code"). Example: "2@...==,..."
+  string code = 1;
+
+  // The current status of the login flow.
+  // Required. Example: "code", "timeout", "success", "error"
+  string status = 2;
+}
+
+// SendRequest contains the necessary data to send a message.
+message SendRequest {
+  // The destination phone number or JID.
+  // Required. Example: "1234567890" or "1234567890@s.whatsapp.net"
+  string to = 1;
+
+  // The text body or caption for media.
+  // Optional (if binary is provided). Example: "Here is your invoice."
+  string text = 2;
+
+  // The specific device JID to send from. If empty, the server picks the first available connected device.
+  // Optional. Example: "9876543210@s.whatsapp.net"
+  string from_jid = 3;
+
+  // The raw file data to upload and send.
+  // Optional. Example: [bytes...]
+  bytes binary = 4;
+
+  // The filename (extension determines MIME type).
+  // Optional (Required if binary is present). Example: "invoice.pdf"
+  string filename = 5;
+}
+
+// SendResponse indicates the result of a message sending attempt.
+message SendResponse {
+  // Whether the message was successfully handed off to the WhatsApp servers.
+  // Required. Example: true
+  bool success = 1;
+
+  // Error description if success is false.
+  // Optional. Example: "server disconnected"
+  string error = 2;
+}
+
+// DeviceInfo holds summary data for a single WhatsApp session.
+message DeviceInfo {
+  // The full JID of the device, often appended with status text by the server.
+  // Required. Example: "1234567890@s.whatsapp.net (connected)"
+  string jid = 1;
+}
+
+// DeviceList wraps a list of devices.
+message DeviceList {
+  // A list of known devices.
+  // Optional (can be empty).
+  repeated DeviceInfo devices = 1;
+}
+
+// DeviceID identifies a specific session for administrative actions.
+message DeviceID {
+  // The JID (or partial JID) of the device to target.
+  // Required. Example: "1234567890"
+  string jid = 1;
+}
+
+// StatusResponse is a generic acknowledgment for void-return operations.
+message StatusResponse {
+  // Indicates if the operation completed successfully.
+  // Required. Example: true
+  bool success = 1;
+
+  // Error message if operation failed.
+  // Optional. Example: "Device not found"
+  string error = 2;
+}
