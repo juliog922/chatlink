@@ -80,6 +80,14 @@ class UnifiedMessageResponse(BaseModel):
 class LogEntry(BaseModel):
     line: str
 
+class UserConnectionStatus(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    phone: str
+    whatsapp_connected: bool
+    email_connected: bool
+
 @router.get("/healthz", response_model=HealthResponse, tags=["System"])
 async def health_check():
     status = "ok"
@@ -396,3 +404,39 @@ async def get_logs(
         return [LogEntry(line=f"Error reading logs: {str(e)}")]
 
     return lines
+
+@router.get("/connections", response_model=List[UserConnectionStatus], tags=["System"])
+async def get_active_connections(db: AsyncSession = Depends(get_db)):
+    """
+    Returns the active connection status (WhatsApp and Email) for all real, enabled users.
+    Excludes simulated accounts.
+    """
+    # 1. Fetch current active connections directly from the transports
+    active_wa_jids = set(whatsapp_transport.list_devices())
+    active_emails = set(email_transport.active_mailboxes)
+    
+    # 2. Fetch all enabled users, explicitly filtering out the simulation domain
+    stmt = select(User).where(
+        User.enabled == True,
+        User.email.not_like("%@sim.local%")
+    )
+    users = (await db.execute(stmt)).scalars().all()
+    
+    connections = []
+    for u in users:
+        # Check WhatsApp: Is the user's saved device JID currently active in the transport?
+        wa_connected = bool(u.wa_device_jid and u.wa_device_jid in active_wa_jids)
+        
+        # Check Email: Is the user's email actively being polled by a mailbox listener?
+        email_connected = bool(u.email and u.email.strip().lower() in active_emails)
+        
+        connections.append(UserConnectionStatus(
+            user_id=u.id,
+            name=u.name,
+            email=u.email,
+            phone=u.phone,
+            whatsapp_connected=wa_connected,
+            email_connected=email_connected
+        ))
+        
+    return connections

@@ -26,36 +26,35 @@ createApp({
         const simChat = ref([]);
         const simState = ref({ order_status: '', confirmed_items: [], last_benchmark_ms: 0 });
 
+        // Connections (Monitorization)
+        const connections = ref([]);
+
         // --- Computed for Actor Dropdowns ---
         const availableSenders = computed(() => {
-            // Senders can be anyone (Clients, Non-Clients, or Users acting as senders)
-            // But typically for testing BOT logic, Sender = Client/Non-Client
             return simActors.value; 
         });
 
         const availableReceivers = computed(() => {
-            // Receivers must be internal (Salesman/Admin)
             return simActors.value.filter(a => ['user', 'admin'].includes(a.type));
         });
 
-        // Detect if the selected Sender is a "Non-Client"
         const isNonClientSender = computed(() => {
             const actor = simActors.value.find(a => a.id === sim.value.sender);
             return actor && actor.type === 'non_client';
         });
 
-        // ... (Nav items, existing computed props) ...
+        // --- Navigation ---
         const navItems = [
             { id: 'dashboard', label: 'Dashboard', icon: 'fas fa-tachometer-alt' },
             { id: 'users', label: 'User Management', icon: 'fas fa-users' },
+            { id: 'connections', label: 'Active Connections', icon: 'fas fa-network-wired' },
             { id: 'simulator', label: 'Simulator', icon: 'fas fa-flask' },
             { id: 'logs', label: 'System Logs', icon: 'fas fa-terminal' },
         ];
         const pageTitle = computed(() => navItems.find(i => i.id === currentView.value)?.label || 'Console');
-        // ... (statusCards, filteredUsers, etc. - keep existing) ...
         
-        // ... (Fetch/Load functions) ...
-        const fetchJson = async (url, opts) => { /* keep existing */ 
+        // --- Fetch/Load functions ---
+        const fetchJson = async (url, opts) => { 
              try {
                 const res = await fetch(url, opts);
                 if (!res.ok) throw new Error(`API Error: ${res.statusText}`);
@@ -74,11 +73,18 @@ createApp({
             if (r) resources.value = r;
             if (c) config.value = c;
         };
+
         const loadUsers = async () => { 
             const data = await fetchJson('/api/users'); 
-            if (data) users.value = data; // Note: Ensure `users` ref is defined (it was in original)
+            if (data) users.value = data; 
         };
-        const loadLogs = async () => { /* keep existing */ 
+
+        const loadConnections = async () => {
+            const data = await fetchJson('/api/connections');
+            if (data) connections.value = data;
+        };
+
+        const loadLogs = async () => { 
             let url = `/api/logs?limit=200`;
             if (logsFilter.value.level) url += `&level=${logsFilter.value.level}`;
             if (logsFilter.value.search) url += `&search=${encodeURIComponent(logsFilter.value.search)}`;
@@ -86,12 +92,10 @@ createApp({
             if (data) logs.value = data;
         };
 
-        // NEW: Load Actors
         const loadActors = async () => {
             const data = await fetchJson('/api/test/actors');
             if (data && data.actors) {
                 simActors.value = data.actors;
-                // Defaults
                 if (!sim.value.receiver) {
                     const sales = simActors.value.find(a => a.type === 'user');
                     if (sales) sim.value.receiver = sales.id;
@@ -106,7 +110,6 @@ createApp({
         const loadSimChat = async () => {
             if (!sim.value.sender) return;
             const endpoint = sim.value.channel === 'whatsapp' ? '/api/messages' : '/api/emails';
-            // Use user OR client search
             const param = sim.value.channel === 'whatsapp' ? `phone=${sim.value.sender}` : `email=${sim.value.sender}`;
             const data = await fetchJson(`${endpoint}?${param}&limit=50`);
             
@@ -126,20 +129,9 @@ createApp({
             
             loading.value = true;
             try {
-                // If it is a non-client, we do NOT force mock. 
-                // If it is a client/user, we FORCE mock (in case SQL server is inconsistent in dev).
-                // Actually, logic: If actor.type == 'non_client', mock_client_force = false.
-                // Else mock_client_force = true (to be safe in simulation).
-                // BUT per user request: "Common (client) ... we check the sqlserver".
-                // So if we pick a 'client' type, we expect it to exist. We should NOT force mock.
-                // Only force mock if we are testing a hypothetical client that doesn't exist in DB.
-                // To keep it simple: Let's assume we rely on real DB data for 'client' types, 
-                // and we rely on DB absence for 'non_client'.
-                // So mock_client_force = false always, unless we add a specific "Hypothetical Client" option.
-                
                 const payload = {
                     ...sim.value,
-                    mock_client_force: false // Rely on DB logic (Success for Client, Fail for Non-Client)
+                    mock_client_force: false
                 };
 
                 const res = await fetch('/api/test/message', {
@@ -164,9 +156,8 @@ createApp({
             }
         };
 
-        // ... (Keep other actions: createUser, deleteUser, loginUser, downloadCsv, formatTime) ...
-        const users = ref([]); // Ensure users is defined
-        const filteredUsers = computed(() => users.value); // simple stub
+        const users = ref([]); 
+        const filteredUsers = computed(() => users.value);
         const userSearch = ref("");
         const newUser = ref({});
         const showAddUserModal = ref(false);
@@ -198,12 +189,13 @@ createApp({
             const data = await fetchJson(`/api/users/${user.id}/login`, { method: 'POST' });
             loading.value = false;
             if (data && data.success) {
-                qrData.value = data.qr || ""; // Datos para el código QR
+                qrData.value = data.qr || "";
                 showQrModal.value = true;
             } else {
                 alert("Error al iniciar sesión: " + (data?.error || "Desconocido"));
             }
         };
+
         const downloadCsv = () => {
             const items = simState.value.confirmed_items;
             if (!items || items.length === 0) {
@@ -211,7 +203,6 @@ createApp({
                 return;
             }
         
-            // Crear cabecera y filas
             const header = "code,qty\n";
             const rows = items.map(item => {
                 const code = item.code || item.CodigoArticulo || "N/A";
@@ -222,15 +213,15 @@ createApp({
             const csvContent = "data:text/csv;charset=utf-8," + header + rows;
             const encodedUri = encodeURI(csvContent);
             
-            // Crear link temporal para la descarga
             const link = document.createElement("a");
             link.setAttribute("href", encodedUri);
             link.setAttribute("download", `pedido_${sim.value.sender || 'sim'}.csv`);
             document.body.appendChild(link);
             
-            link.click(); // Disparar descarga
+            link.click();
             document.body.removeChild(link);
         };
+
         const statusCards = computed(() => ({
             health: {
                 label: "Estado Global",
@@ -248,7 +239,6 @@ createApp({
                 color: resources.value.gpu?.available ? 'text-purple-400' : 'text-slate-400',
                 subtext: resources.value.gpu?.available ? resources.value.gpu.gpus[0].name : 'Sin aceleración'
             }
-            // Puedes añadir más según necesites
         }));
 
         const formatTime = (ts) => new Date(ts).toLocaleTimeString();
@@ -258,8 +248,9 @@ createApp({
             loadSystem();
             if (currentView.value === 'users') loadUsers();
             if (currentView.value === 'logs') loadLogs();
+            if (currentView.value === 'connections') loadConnections();
             if (currentView.value === 'simulator') {
-                loadActors(); // New
+                loadActors(); 
                 loadSimChat();
             }
         };
@@ -271,6 +262,7 @@ createApp({
             refreshAll();
             setInterval(loadSystem, 5000);
             setInterval(() => { if (currentView.value === 'logs') loadLogs(); }, 3000);
+            setInterval(() => { if (currentView.value === 'connections') loadConnections(); }, 5000);
         });
 
         return {
@@ -278,14 +270,15 @@ createApp({
             health, resources, config, 
             // Users
             users, filteredUsers, userSearch, newUser, showAddUserModal, createUser, deleteUser, loginUser,
+            // Connections
+            connections, loadConnections,
             // Logs
             logs, logsFilter, loadLogs,
             // Sim
             sim, simChat, simState, sendSimulation, loadSimChat, downloadCsv,
             simActors, availableSenders, availableReceivers, isNonClientSender,
             // Modal
-            showQrModal, qrData, formatTime, 
-            statusCards: computed(() => { /* keep original statusCards logic */ return {}; }) 
+            showQrModal, qrData, formatTime, statusCards
         };
     }
 }).mount('#app');

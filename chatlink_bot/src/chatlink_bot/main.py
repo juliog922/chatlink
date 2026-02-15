@@ -20,7 +20,6 @@ from .handlers import (
 )
 from .models import User
 from .api.routes import router as api_router
-from .api.system import router as system_router
 from .api.simulation import router as sim_router
 
 from .ai.qdrant import qdrant_service
@@ -169,7 +168,6 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # Mount API
 app.include_router(api_router, prefix="/api")
 app.include_router(sim_router, prefix="/api/test")
-app.include_router(system_router, prefix="/api/system")
 
 from fastapi.responses import FileResponse
 @app.get("/")

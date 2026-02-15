@@ -10,7 +10,6 @@
     <style>
         [v-cloak] { display: none; }
         .log-line { font-family: 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.4; }
-        /* Scrollbar styling */
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: #1e293b; }
         ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
@@ -160,6 +159,53 @@
                                     <td class="px-6 py-4 text-right space-x-2">
                                         <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Login / QR"><i class="fas fa-qrcode"></i></button>
                                         <button @click="deleteUser(user.id)" class="p-2 hover:text-red-400 transition-colors" title="Delete"><i class="fas fa-trash"></i></button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div v-if="currentView === 'connections'" class="p-6 h-full flex flex-col">
+                    <div class="flex justify-between items-center mb-6">
+                        <h3 class="text-xl font-bold text-white">Live Transports</h3>
+                        <button @click="loadConnections" class="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded text-white text-sm transition-colors">
+                            <i class="fas fa-sync-alt mr-2"></i>Refresh Now
+                        </button>
+                    </div>
+                    <div class="flex-1 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
+                        <table class="w-full text-sm text-left text-slate-400">
+                            <thead class="text-xs text-slate-300 uppercase bg-slate-900/50">
+                                <tr>
+                                    <th class="px-6 py-4">Real Human Users</th>
+                                    <th class="px-6 py-4 text-center">WhatsApp Device Status</th>
+                                    <th class="px-6 py-4 text-center">Email Polling Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="connections.length === 0" class="border-b border-slate-700/50">
+                                    <td colspan="3" class="px-6 py-8 text-center text-slate-500 italic">No human users currently enabled or active.</td>
+                                </tr>
+                                <tr v-for="conn in connections" :key="conn.user_id" class="border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors">
+                                    <td class="px-6 py-4">
+                                        <div class="font-bold text-white">{{ conn.name }}</div>
+                                        <div class="text-xs">{{ conn.email }} | {{ conn.phone }}</div>
+                                    </td>
+                                    <td class="px-6 py-4 text-center">
+                                        <span v-if="conn.whatsapp_connected" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-emerald-900/30 text-emerald-400 border border-emerald-800/50">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> Linked
+                                        </span>
+                                        <span v-else class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-500 border border-slate-700">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-slate-600"></span> Disconnected
+                                        </span>
+                                    </td>
+                                    <td class="px-6 py-4 text-center">
+                                        <span v-if="conn.email_connected" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-blue-900/30 text-blue-400 border border-blue-800/50">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_5px_#3b82f6]"></span> Listening
+                                        </span>
+                                        <span v-else class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-500 border border-slate-700">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-slate-600"></span> Inactive
+                                        </span>
                                     </td>
                                 </tr>
                             </tbody>
