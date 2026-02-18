@@ -2,12 +2,30 @@ const { createApp, ref, onMounted, computed, watch } = Vue;
 
 createApp({
     setup() {
+        // --- Authentication State ---
+        const isAuthenticated = ref(false);
+        const loginUsername = ref('');
+        const loginPassword = ref('');
+        const loginError = ref('');
+
+        const performLogin = () => {
+            if (loginUsername.value === 'admin' && loginPassword.value === 'kapalua') {
+                isAuthenticated.value = true;
+                loginError.value = '';
+                // Start background tasks only after login
+                refreshAll();
+                setInterval(loadSystem, 5000);
+                setInterval(() => { if (currentView.value === 'logs') loadLogs(); }, 3000);
+                setInterval(() => { if (currentView.value === 'connections') loadConnections(); }, 5000);
+            } else {
+                loginError.value = 'Invalid username or password';
+            }
+        };
+
         // --- State ---
         const currentView = ref('dashboard');
         const loading = ref(false);
         const health = ref({ status: '...', details: {} });
-        const resources = ref({ ram: { used_mb: 0, total_mb: 0 }, gpu: { available: false, gpus: [] } });
-        const config = ref({});
         
         // Logs
         const logs = ref([]);
@@ -30,9 +48,7 @@ createApp({
         const connections = ref([]);
 
         // --- Computed for Actor Dropdowns ---
-        const availableSenders = computed(() => {
-            return simActors.value; 
-        });
+        const availableSenders = computed(() => simActors.value);
 
         const availableReceivers = computed(() => {
             return simActors.value.filter(a => ['user', 'admin'].includes(a.type));
@@ -63,15 +79,8 @@ createApp({
         };
 
         const loadSystem = async () => {
-            const [h, r, c] = await Promise.all([
-                fetchJson('/api/healthz'),
-                fetchJson('/api/system/resources'),
-                fetchJson('/api/system/config')
-            ]);
-        
+            const h = await fetchJson('/api/healthz');
             if (h) health.value = h;
-            if (r) resources.value = r;
-            if (c) config.value = c;
         };
 
         const loadUsers = async () => { 
@@ -129,11 +138,7 @@ createApp({
             
             loading.value = true;
             try {
-                const payload = {
-                    ...sim.value,
-                    mock_client_force: false
-                };
-
+                const payload = { ...sim.value, mock_client_force: false };
                 const res = await fetch('/api/test/message', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -202,22 +207,18 @@ createApp({
                 alert("No hay productos confirmados para exportar.");
                 return;
             }
-        
             const header = "code,qty\n";
             const rows = items.map(item => {
                 const code = item.code || item.CodigoArticulo || "N/A";
                 const qty = item.qty || 1;
                 return `${code},${qty}`;
             }).join("\n");
-        
             const csvContent = "data:text/csv;charset=utf-8," + header + rows;
             const encodedUri = encodeURI(csvContent);
-            
             const link = document.createElement("a");
             link.setAttribute("href", encodedUri);
             link.setAttribute("download", `pedido_${sim.value.sender || 'sim'}.csv`);
             document.body.appendChild(link);
-            
             link.click();
             document.body.removeChild(link);
         };
@@ -230,14 +231,6 @@ createApp({
                 statusIcon: health.value.status === 'ok' ? 'fas fa-check-circle' : 'fas fa-exclamation-triangle',
                 color: health.value.status === 'ok' ? 'text-emerald-400' : 'text-amber-400',
                 subtext: `Cudara: ${health.value.details?.cudara?.status || '?'}`
-            },
-            gpu: {
-                label: "Hardware AI",
-                value: resources.value.gpu?.available ? 'GPU ACTIVA' : 'CPU MODE',
-                icon: "fas fa-microchip",
-                statusIcon: resources.value.gpu?.available ? 'fas fa-bolt' : 'fas fa-server',
-                color: resources.value.gpu?.available ? 'text-purple-400' : 'text-slate-400',
-                subtext: resources.value.gpu?.available ? resources.value.gpu.gpus[0].name : 'Sin aceleración'
             }
         }));
 
@@ -245,6 +238,7 @@ createApp({
         
         // --- Lifecycle ---
         const refreshAll = () => {
+            if (!isAuthenticated.value) return; // Guard clause
             loadSystem();
             if (currentView.value === 'users') loadUsers();
             if (currentView.value === 'logs') loadLogs();
@@ -258,26 +252,17 @@ createApp({
         watch(currentView, refreshAll);
         watch(() => [sim.value.sender, sim.value.channel], loadSimChat);
 
-        onMounted(() => {
-            refreshAll();
-            setInterval(loadSystem, 5000);
-            setInterval(() => { if (currentView.value === 'logs') loadLogs(); }, 3000);
-            setInterval(() => { if (currentView.value === 'connections') loadConnections(); }, 5000);
-        });
-
         return {
+            // Auth exports
+            isAuthenticated, loginUsername, loginPassword, loginError, performLogin,
+            
             currentView, navItems, pageTitle, loading, refreshAll,
-            health, resources, config, 
-            // Users
+            health, 
             users, filteredUsers, userSearch, newUser, showAddUserModal, createUser, deleteUser, loginUser,
-            // Connections
             connections, loadConnections,
-            // Logs
             logs, logsFilter, loadLogs,
-            // Sim
             sim, simChat, simState, sendSimulation, loadSimChat, downloadCsv,
             simActors, availableSenders, availableReceivers, isNonClientSender,
-            // Modal
             showQrModal, qrData, formatTime, statusCards
         };
     }
