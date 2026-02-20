@@ -421,7 +421,6 @@ async def get_active_connections(db: AsyncSession = Depends(get_db)):
     
     # 2. Fetch all enabled users, explicitly filtering out the simulation domain
     stmt = select(User).where(
-        User.enabled == True,
         User.email.not_like("sales@sim.com"), # Filter specific sim account
         User.email.not_like("admin@sim.com")  # Filter specific sim account
     )
