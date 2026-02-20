@@ -43,11 +43,7 @@ def _parse_admin_command(text: str) -> Optional[Dict[str, Optional[str]]]:
     cmd = parts[0].lower()
     if cmd not in ("login", "logout"):
         return None
-    if len(parts) == 1:
-        return {"command": cmd, "email": None}
-    if len(parts) == 2 and "@" in parts[1]:
-        return {"command": cmd, "email": parts[1].strip()}
-    return None
+    return {"command": cmd}
 
 
 
@@ -146,12 +142,8 @@ class WhatsAppTransport:
                         if parsed:
                             self._emit_threadsafe("admin_command", {
                                 "transport": "whatsapp",
-                                "issuer_phone": msg.from_phone,     # who typed the command
-                                "admin_phone": msg.to_phone if msg.to_phone in ADMIN_WA_NUMBERS else msg.from_phone,
-                                "raw_from": msg.from_jid,
-                                "raw_to": msg.to_jid,
-                                "command": parsed["command"],
-                                "email": parsed["email"],          # may be None
+                                "phone": msg.from_phone,
+                                "command": parsed["command"]
                             })
                             continue
 

@@ -35,18 +35,17 @@ GUARDRAIL_TEXT = os.getenv("BOT_GUARDRAIL_TEXT", "El comercial te contactará pr
 MAX_HISTORY = int(os.getenv("BOT_HISTORY_LIMIT", "60"))
 
 # For admin command parsing when admin is stored in Postgres (not only ADMIN_WA_NUMBERS)
-ADMIN_CMD_RE = re.compile(r"^\s*(login|logout)\b(?:\s+([^\s]+))?\s*$", re.IGNORECASE)
+ADMIN_CMD_RE = re.compile(r"^\s*(login|logout)\b", re.IGNORECASE)
 ADMIN_HELP_TEXT = (
     "🤖 *ChatLink Admin Help*\n\n"
     "Para gestionar tu acceso, utiliza los siguientes comandos:\n\n"
-    "• *login <email>*: Activa el monitoreo de WhatsApp y Email para el usuario.\n"
-    "• *logout <email>*: Desactiva el servicio y cierra las sesiones activas.\n\n"
-    "Ejemplo: `login comercial@empresa.com`"
+    "• *login*: Activa el monitoreo de WhatsApp y Email para tu cuenta.\n"
+    "• *logout*: Desactiva el servicio y cierra las sesiones activas.\n"
 )
 
 # prevent concurrent AI work per conversation
 _processing_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
-
+_admin_help_cache: Dict[str, datetime] = {}
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -356,23 +355,40 @@ async def logout_user(user: User) -> Dict[str, Any]:
 
 async def handle_admin_command(payload: Dict[str, Any]) -> None:
     cmd = (payload.get("command") or "").lower()
-    email = (payload.get("email") or "").strip().lower()
+    phone = (payload.get("phone") or "").strip()
 
-    if cmd not in ("login", "logout") or not email:
+    if cmd not in ("login", "logout") or not phone:
         return
 
     async with AsyncSessionPG() as db:
-        user = (await db.execute(select(User).where(func.lower(User.email) == email))).scalars().first()
+        user = await _get_user_by_phone(db, phone)
         if not user:
-            logger.warning(f"Admin command target user not found: {email}")
+            logger.warning(f"Admin command target user not found for phone: {phone}")
+            whatsapp_transport.send_message(
+                to_phone=phone,
+                text="❌ *Error:* Tu número de teléfono no está registrado en el sistema como un usuario válido."
+            )
             return
 
         if cmd == "login":
             out = await login_user(user)
+            if out.get("success"):
+                reply_msg = "✅ *Servicio Activado*\nEl monitoreo se ha iniciado correctamente. Si es tu primera vez o tu sesión expiró, revisa tu correo electrónico para escanear el código QR."
+            else:
+                err = out.get("error", "Error desconocido")
+                reply_msg = f"❌ *Error al activar el servicio*\nDetalle: {err}"
         else:
             out = await logout_user(user)
+            if out.get("success"):
+                reply_msg = "✅ *Servicio Desactivado*\nSe han cerrado tus sesiones y el bot ya no responderá por ti."
+            else:
+                err = out.get("error", "Error desconocido")
+                reply_msg = f"❌ *Error al desactivar el servicio*\nDetalle: {err}"
 
-        logger.info(f"Admin cmd {cmd} for {email}: {out}")
+        # Send the confirmation message back to the user via WhatsApp
+        whatsapp_transport.send_message(to_phone=phone, text=reply_msg)
+
+        logger.info(f"Admin cmd {cmd} for {user.email}: {out}")
 
 
 async def handle_new_message(payload: Dict[str, Any]) -> None:
@@ -435,10 +451,8 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             m = ADMIN_CMD_RE.match(text_msg or "")
             if m:
                 cmd = m.group(1).lower()
-                email = (m.group(2) or "").strip().lower()
-                if email:
-                    logger.info(f"[MSG_FLOW] Admin Command: {cmd} {email}")
-                    await event_bus.emit("admin_command", {"command": cmd, "email": email})
+                logger.info(f"[MSG_FLOW] Admin Command: {cmd} from {from_phone}")
+                await event_bus.emit("admin_command", {"command": cmd, "phone": from_phone})
                 return
 
         if not internal_user.enabled and not is_simulation:
@@ -451,10 +465,8 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             
             if m:
                 cmd = m.group(1).lower()
-                email = (m.group(2) or "").strip().lower()
-                if email:
-                    logger.info(f"[MSG_FLOW] Admin Command: {cmd} {email}")
-                    await event_bus.emit("admin_command", {"command": cmd, "email": email})
+                logger.info(f"[MSG_FLOW] Admin Command: {cmd} from {from_phone}")
+                await event_bus.emit("admin_command", {"command": cmd, "phone": from_phone})
                 return  # Salir tras procesar comando válido
             
             else:
@@ -464,16 +476,28 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
 
                 # Solo si el remitente es un usuario registrado (o simulación) Y no es el mensaje de ayuda
                 if (user_from or is_simulation) and not is_help_message:
-                    logger.info(f"[MSG_FLOW] Sending Admin Help to {from_phone}")
                     
-                    # Obtener JID del admin para responder
-                    admin_jid = getattr(msg, "to_jid", None)
+                    # --- NEW: DEBOUNCE LOGIC ---
+                    now = _now_utc()
+                    cache_key = f"{from_phone}_{to_phone}"
+                    last_sent = _admin_help_cache.get(cache_key)
                     
-                    whatsapp_transport.send_message(
-                        to_phone=from_phone, 
-                        text=ADMIN_HELP_TEXT,
-                        from_jid=admin_jid
-                    )
+                    # Only send if we haven't sent one in the last 10 seconds
+                    if not last_sent or (now - last_sent).total_seconds() > 10:
+                        _admin_help_cache[cache_key] = now
+                        logger.info(f"[MSG_FLOW] Sending Admin Help to {from_phone}")
+                        
+                        # Obtener JID del admin para responder
+                        admin_jid = getattr(msg, "to_jid", None)
+                        
+                        whatsapp_transport.send_message(
+                            to_phone=from_phone, 
+                            text=ADMIN_HELP_TEXT,
+                            from_jid=admin_jid
+                        )
+                    else:
+                        logger.info(f"[MSG_FLOW] Suppressed duplicate Admin Help for {from_phone} (debounced)")
+
                 return # Bloquear cualquier otro procesamiento para el admin
             
         # 2. Identify Client (Gatekeeper)
