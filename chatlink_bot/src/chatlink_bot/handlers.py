@@ -453,7 +453,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             logger.info(f"[MSG_FLOW] WA IGNORED: Unknown participants {from_phone} -> {to_phone}")
             return
 
-        # Check Admin Command
+        # Check Admin Command (If the sender is an admin)
         if internal_user.role == "admin":
             m = ADMIN_CMD_RE.match(text_msg or "")
             if m:
@@ -461,11 +461,8 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                 logger.info(f"[MSG_FLOW] Admin Command: {cmd} from {from_phone}")
                 await event_bus.emit("admin_command", {"command": cmd, "phone": from_phone})
                 return
-
-        if not internal_user.enabled and not is_simulation:
-            logger.info(f"[MSG_FLOW] WA IGNORED: User {internal_user.email} is DISABLED.")
-            return
         
+        # Check if the message is sent TO an admin (for a regular user to login/logout)
         if user_to and user_to.role == "admin":
             # Intentar matchear el comando (login/logout)
             m = ADMIN_CMD_RE.match(text_msg or "")
@@ -506,6 +503,11 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                         logger.info(f"[MSG_FLOW] Suppressed duplicate Admin Help for {from_phone} (debounced)")
 
                 return # Bloquear cualquier otro procesamiento para el admin
+
+        # --- MOVED DOWN: Now we block disabled users from talking to clients ---
+        if not internal_user.enabled and not is_simulation:
+            logger.info(f"[MSG_FLOW] WA IGNORED: User {internal_user.email} is DISABLED.")
+            return
             
         # 2. Identify Client (Gatekeeper)
         client = await _find_client_by_phone(client_phone)
