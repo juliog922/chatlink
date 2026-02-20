@@ -84,14 +84,16 @@
                 <main class="flex-1 overflow-hidden relative">
                     
                     <div v-if="currentView === 'dashboard'" class="p-6 h-full overflow-y-auto">
-                        <div class="grid grid-cols-1 md:grid-cols-1 gap-6 mb-8 max-w-sm">
-                            <div v-for="(stat, key) in statusCards" :key="key" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
-                                <div class="absolute right-0 top-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity"><i :class="stat.icon" class="text-6xl"></i></div>
-                                <div class="text-slate-400 text-sm font-medium uppercase tracking-wider mb-1">{{ stat.label }}</div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                            <div v-for="stat in statusCards" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
+                                <div class="absolute right-0 top-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                                    <i :class="stat.icon" class="text-6xl"></i>
+                                </div>
+                                <div class="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">{{ stat.label }}</div>
                                 <div class="text-2xl font-bold flex items-center gap-2" :class="stat.color">
                                     <i :class="stat.statusIcon"></i> {{ stat.value }}
                                 </div>
-                                <div class="text-xs text-slate-500 mt-2">{{ stat.subtext }}</div>
+                                <div class="text-xs text-slate-500 mt-2 leading-relaxed">{{ stat.desc }}</div>
                             </div>
                         </div>
                     </div>

@@ -339,15 +339,22 @@ async def login_user(user: User) -> Dict[str, Any]:
 
 
 async def logout_user(user: User) -> Dict[str, Any]:
-    email_transport.stop_mailbox(user.email)
+    # Stop email listening
+    if user.email:
+        email_transport.stop_mailbox(user.email)
 
-    if getattr(user, "wa_device_jid", None):
-        whatsapp_transport.delete_device(user.wa_device_jid)
+    # Actively unlink from WhatsApp servers using the user's phone number
+    if user.phone:
+        logger.info(f"Sending WhatsApp logout signal for {user.phone}...")
+        whatsapp_transport.logout_device(user.phone)
+        # Also call delete just in case it was a dead session that needs local cleanup
+        whatsapp_transport.delete_device(user.phone)
 
     async with AsyncSessionPG() as db:
         u = (await db.execute(select(User).where(User.id == user.id))).scalars().first()
         if u:
             u.enabled = False
+            u.wa_device_jid = None  # Clear the saved JID
             await db.commit()
 
     return {"success": True}

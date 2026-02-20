@@ -8,15 +8,27 @@ createApp({
         const loginPassword = ref('');
         const loginError = ref('');
 
+        const SESSION_KEY = 'chatlink_session_expiry';
+        const SESSION_MINUTES = 30;
+
+        // Helper to start the intervals
+        const startBackgroundTasks = () => {
+            refreshAll();
+            setInterval(loadSystem, 5000);
+            setInterval(() => { if (currentView.value === 'logs') loadLogs(); }, 3000);
+            setInterval(() => { if (currentView.value === 'connections') loadConnections(); }, 5000);
+        };
+
         const performLogin = () => {
             if (loginUsername.value === 'admin' && loginPassword.value === 'kapalua') {
                 isAuthenticated.value = true;
                 loginError.value = '';
-                // Start background tasks only after login
-                refreshAll();
-                setInterval(loadSystem, 5000);
-                setInterval(() => { if (currentView.value === 'logs') loadLogs(); }, 3000);
-                setInterval(() => { if (currentView.value === 'connections') loadConnections(); }, 5000);
+                
+                // Save expiration time to localStorage
+                const expiryTime = Date.now() + (SESSION_MINUTES * 60 * 1000);
+                localStorage.setItem(SESSION_KEY, expiryTime);
+                
+                startBackgroundTasks();
             } else {
                 loginError.value = 'Invalid username or password';
             }
@@ -223,16 +235,68 @@ createApp({
             document.body.removeChild(link);
         };
 
-        const statusCards = computed(() => ({
-            health: {
-                label: "Estado Global",
-                value: health.value.status.toUpperCase(),
-                icon: "fas fa-heartbeat",
-                statusIcon: health.value.status === 'ok' ? 'fas fa-check-circle' : 'fas fa-exclamation-triangle',
-                color: health.value.status === 'ok' ? 'text-emerald-400' : 'text-amber-400',
-                subtext: `Cudara: ${health.value.details?.cudara?.status || '?'}`
-            }
-        }));
+        const statusCards = computed(() => {
+            const details = health.value.details || {};
+            
+            // Helper to get status color and icon
+            const getStatusInfo = (val) => {
+                const ok = val === 'ok' || val === true || (Array.isArray(val) && val.length > 0);
+                return {
+                    color: ok ? 'text-emerald-400' : 'text-amber-400',
+                    icon: ok ? 'fas fa-check-circle' : 'fas fa-exclamation-triangle',
+                    label: ok ? 'ACTIVO' : 'PROBLEMA'
+                };
+            };
+        
+            const pg = getStatusInfo(details.postgres);
+            const sql = getStatusInfo(details.sqlserver);
+            const wa = getStatusInfo(details.whatsapp_running);
+            const qd = getStatusInfo(details.qdrant?.status);
+            const ai = getStatusInfo(details.cudara?.status);
+        
+            return [
+                {
+                    label: "Base de Datos Principal",
+                    desc: "Almacena usuarios y mensajes del bot (Postgres)",
+                    value: pg.label,
+                    color: pg.color,
+                    icon: "fas fa-database",
+                    statusIcon: pg.icon
+                },
+                {
+                    label: "Conexión ERP / Clientes",
+                    desc: "Lectura de datos de Clientes y Artículos (SQL Server)",
+                    value: sql.label,
+                    color: sql.color,
+                    icon: "fas fa-server",
+                    statusIcon: sql.icon
+                },
+                {
+                    label: "Servicio de WhatsApp",
+                    desc: "Motor de envío y recepción de mensajes (Meow Server)",
+                    value: wa.label,
+                    color: wa.color,
+                    icon: "fab fa-whatsapp",
+                    statusIcon: wa.icon
+                },
+                {
+                    label: "Buscador Inteligente",
+                    desc: "Permite al bot buscar productos en el catálogo (Qdrant)",
+                    value: qd.label,
+                    color: qd.color,
+                    icon: "fas fa-search-plus",
+                    statusIcon: qd.icon
+                },
+                {
+                    label: "Cerebro Artificial",
+                    desc: "Inteligencia que genera las respuestas (AI/Cudara)",
+                    value: ai.label,
+                    color: ai.color,
+                    icon: "fas fa-brain",
+                    statusIcon: ai.icon
+                }
+            ];
+        });
 
         const formatTime = (ts) => new Date(ts).toLocaleTimeString();
         
@@ -251,6 +315,20 @@ createApp({
 
         watch(currentView, refreshAll);
         watch(() => [sim.value.sender, sim.value.channel], loadSimChat);
+
+        // --- NEW: Check session on page load ---
+        onMounted(() => {
+            const expiry = localStorage.getItem(SESSION_KEY);
+            if (expiry && Date.now() < parseInt(expiry, 10)) {
+                // Session is valid. Log them in and extend the timer another 30 mins
+                isAuthenticated.value = true;
+                localStorage.setItem(SESSION_KEY, Date.now() + (SESSION_MINUTES * 60 * 1000));
+                startBackgroundTasks();
+            } else {
+                // Expired or doesn't exist. Clear it out.
+                localStorage.removeItem(SESSION_KEY);
+            }
+        });
 
         return {
             // Auth exports
