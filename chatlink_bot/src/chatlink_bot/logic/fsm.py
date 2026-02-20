@@ -67,6 +67,8 @@ class ConversationFSM:
         async with entry.lock:
             await self._cancel_debounce_locked(entry)
             entry.state = ConversationState.IDLE
+        
+        self._conversations.pop(key, None)
 
     async def on_ai_done(self, channel: str, client_id: str, user_id: str) -> None:
         key = conversation_key(channel, client_id, user_id)
@@ -75,6 +77,9 @@ class ConversationFSM:
         async with entry.lock:
             if entry.state == ConversationState.PROCESSING:
                 entry.state = ConversationState.IDLE
+        
+        if entry.state == ConversationState.IDLE and not entry.debounce_task:
+                self._conversations.pop(key, None)
 
     async def _cancel_debounce_locked(self, entry: ConversationEntry) -> None:
         if entry.debounce_task and not entry.debounce_task.done():

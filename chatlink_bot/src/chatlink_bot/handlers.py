@@ -45,7 +45,18 @@ ADMIN_HELP_TEXT = (
 
 # prevent concurrent AI work per conversation
 _processing_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+
 _admin_help_cache: Dict[str, datetime] = {}
+_admin_command_cache: Dict[str, datetime] = {}
+
+def _prune_caches():
+    """Prevents memory leaks by capping caches to 1000 items."""
+    if len(_admin_help_cache) > 1000:
+        _admin_help_cache.clear()
+    if len(_admin_command_cache) > 1000:
+        _admin_command_cache.clear()
+    if len(_processing_locks) > 5000:
+        _processing_locks.clear()
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -367,6 +378,18 @@ async def handle_admin_command(payload: Dict[str, Any]) -> None:
     if cmd not in ("login", "logout") or not phone:
         return
 
+    now = _now_utc()
+    cache_key = f"{phone}_{cmd}"
+    last_exec = _admin_command_cache.get(cache_key)
+    
+    # Only process the command if we haven't processed the exact same one for this user in the last 10 seconds
+    if last_exec and (now - last_exec).total_seconds() < 10:
+        logger.info(f"Skipping duplicate {cmd} command for {phone} (debounced)")
+        return
+        
+    _admin_command_cache[cache_key] = now
+    # ------------------------------
+
     async with AsyncSessionPG() as db:
         user = await _get_user_by_phone(db, phone)
         if not user:
@@ -403,6 +426,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
     WhatsApp ingestion handler.
     Removes MOCK logic; relies on DB lookup or Simulation flags only.
     """
+    _prune_caches()
     msg = payload.get("normalized")
     if not msg:
         return

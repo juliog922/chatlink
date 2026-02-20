@@ -43,6 +43,11 @@ class User(PGBase):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    @property
+    def has_gmail_password(self) -> bool:
+        from .transport.email import email_transport
+        return email_transport.has_app_password(self.email)
+
 
 class Chat(PGBase):
     __tablename__ = "chats"
@@ -129,6 +134,7 @@ class UserResponse(BaseModel):
     role: UserRole
     enabled: bool
     wa_device_jid: str | None = None
+    has_gmail_password: bool = False
 
     class Config:
         from_attributes = True

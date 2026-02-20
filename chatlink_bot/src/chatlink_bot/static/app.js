@@ -180,6 +180,9 @@ createApp({
         const showAddUserModal = ref(false);
         const showQrModal = ref(false);
         const qrData = ref("");
+        const showPasswordModal = ref(false);
+        const selectedUserForPassword = ref(null);
+        const newGmailPassword = ref('');
 
         const createUser = async () => {
             if (!newUser.value.email || !newUser.value.name) return alert("Datos incompletos");
@@ -210,6 +213,33 @@ createApp({
                 showQrModal.value = true;
             } else {
                 alert("Error al iniciar sesión: " + (data?.error || "Desconocido"));
+            }
+        };
+
+        const openPasswordModal = (user) => {
+            selectedUserForPassword.value = user;
+            newGmailPassword.value = '';
+            showPasswordModal.value = true;
+        };
+
+        const saveGmailPassword = async () => {
+            if (!selectedUserForPassword.value || !newGmailPassword.value) return;
+            try {
+                const res = await fetch(`/api/users/${selectedUserForPassword.value.id}/gmail-password`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: newGmailPassword.value })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showPasswordModal.value = false;
+                    loadUsers(); // Refresh the table to show the new badge
+                } else {
+                    alert('Error saving password: ' + data.error);
+                }
+            } catch (err) {
+                console.error(err);
+                alert('Connection error');
             }
         };
 

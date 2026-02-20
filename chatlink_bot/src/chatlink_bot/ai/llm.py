@@ -48,12 +48,25 @@ async def health_check() -> Dict[str, Any]:
 def get_summary_state(chat_id: str) -> Dict[str, Any]:
     return _state.get(chat_id) or {"summary": _default_summary(), "_last_seen_id": 0}
 
+def _prune_state():
+    """Prevents memory leaks by keeping max 1000 active summaries."""
+    if len(_state) > 1000:
+        # Delete the 100 oldest, most inactive conversations
+        keys_to_delete = list(_state.keys())[:100]
+        for k in keys_to_delete:
+            _state.pop(k, None)
 
 def set_summary_state(chat_id: str, summary: Dict[str, Any], **meta: Any) -> None:
-    st = _state.get(chat_id) or {"summary": _default_summary(), "_last_seen_id": 0}
+    _prune_state()
+    
+    # If it exists, pop it so we can re-insert it at the end (marking it as recently used)
+    st = _state.pop(chat_id, {"summary": _default_summary(), "_last_seen_id": 0})
+    
     st["summary"] = summary
     for k, v in meta.items():
         st[k] = v
+        
+    # Re-insert at the end of the dictionary
     _state[chat_id] = st
 
 

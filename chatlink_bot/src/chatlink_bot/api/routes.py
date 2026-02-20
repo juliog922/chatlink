@@ -446,3 +446,17 @@ async def get_active_connections(db: AsyncSession = Depends(get_db)):
         ))
         
     return connections
+
+class SetGmailPasswordRequest(BaseModel):
+    password: str
+
+@router.post("/users/{user_id}/gmail-password", response_model=ActionResponse, tags=["Users"])
+async def set_gmail_password(user_id: int, req: SetGmailPasswordRequest, db: AsyncSession = Depends(get_db)):
+    user = (await db.execute(select(User).where(User.id == user_id))).scalars().first()
+    if not user:
+        return ActionResponse(success=False, error="User not found")
+    
+    ok = email_transport.set_app_password(user.email, req.password)
+    if ok:
+        return ActionResponse(success=True)
+    return ActionResponse(success=False, error="Could not write to gmail_accounts.json")

@@ -75,7 +75,7 @@
                     <h2 class="text-xl font-bold text-white tracking-wide">{{ pageTitle }}</h2>
                     <div class="flex items-center gap-4">
                         <span v-if="loading" class="text-blue-400 text-sm animate-pulse"><i class="fas fa-circle-notch fa-spin mr-2"></i>Processing</span>
-                        <button @click="refreshAll" class="w-8 h-8 rounded-full bg-slate-700 hover:bg-blue-600 flex items-center justify-center transition-colors">
+                        <button @click="refreshAll" class="w-8 h-8 rounded-full bg-slate-700 hover:bg-blue-600 flex items-center justify-center transition-colors" title="Force Refresh">
                             <i class="fas fa-sync-alt text-sm"></i>
                         </button>
                     </div>
@@ -112,7 +112,7 @@
                                         <th class="px-6 py-4">User</th>
                                         <th class="px-6 py-4">Role</th>
                                         <th class="px-6 py-4">Status</th>
-                                        <th class="px-6 py-4 text-right">Actions</th>
+                                        <th class="px-6 py-4">Gmail Auth</th> <th class="px-6 py-4 text-right">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -133,9 +133,20 @@
                                                 <span>{{ user.enabled ? 'Active' : 'Disabled' }}</span>
                                             </div>
                                         </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <span v-if="user.has_gmail_password" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-800">
+                                                <i class="fas fa-key mr-1 mt-0.5"></i> Configured
+                                            </span>
+                                            <span v-else class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-slate-800 text-slate-500 border border-slate-700">
+                                                No Password
+                                            </span>
+                                        </td>
                                         <td class="px-6 py-4 text-right space-x-2">
                                             <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Login / QR"><i class="fas fa-qrcode"></i></button>
                                             <button @click="deleteUser(user.id)" class="p-2 hover:text-red-400 transition-colors" title="Delete"><i class="fas fa-trash"></i></button>
+                                            <button v-if="user.role === 'user'" @click="openPasswordModal(user)" class="text-amber-400 hover:text-amber-300 ml-3" title="Set App Password">
+                                                <i class="fas fa-key"></i>
+                                            </button>
                                         </td>
                                     </tr>
                                 </tbody>
@@ -370,6 +381,21 @@
                     <button @click="showQrModal=false" class="bg-slate-900 text-white px-8 py-2 rounded-full hover:bg-slate-700 transition">Done</button>
                 </div>
             </div>
+
+            <div v-if="showPasswordModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+                <div class="bg-slate-800 p-8 rounded-xl shadow-2xl max-w-md w-full border border-slate-700">
+                    <h3 class="text-2xl font-bold mb-4 text-white">Set Gmail App Password</h3>
+                    <p class="text-sm text-slate-400 mb-6">Enter the 16-character Google App Password for <b>{{ selectedUserForPassword?.email }}</b>.</p>
+                    <div class="mb-4">
+                        <input v-model="newGmailPassword" type="text" placeholder="abcd efgh ijkl mnop" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all">
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button @click="showPasswordModal=false" class="text-slate-400 hover:text-white font-bold transition-colors">Cancel</button>
+                        <button @click="saveGmailPassword" class="bg-amber-600 hover:bg-amber-500 text-white px-5 py-2 rounded-lg font-bold shadow-lg shadow-amber-900/20 transition-all">Save Password</button>
+                    </div>
+                </div>
+            </div>
+
         </template>
     </div>
     <script src="/static/app.js?v=2.0"></script>

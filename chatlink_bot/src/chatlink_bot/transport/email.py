@@ -465,6 +465,29 @@ class EmailTransport:
         except Exception as e:
             logger.error(f"SMTP send_email_as error: {e}")
             return False, str(e)
+        
+    def has_app_password(self, email_addr: str) -> bool:
+        """Checks if a password exists for the given email."""
+        self._load_accounts_if_changed()
+        return bool(self._accounts.get(email_addr.strip().lower()))
+
+    def set_app_password(self, email_addr: str, password: str) -> bool:
+        """Saves a new app password to the JSON file."""
+        self._load_accounts_if_changed()
+        clean_email = email_addr.strip().lower()
+        # Remove spaces (Google app passwords are often copied with spaces)
+        clean_pass = password.replace(" ", "") 
+        
+        self._accounts[clean_email] = clean_pass
+        try:
+            with open(self._accounts_file, "w") as f:
+                json.dump(self._accounts, f, indent=4)
+            if self._accounts_file.exists():
+                self._last_mtime = self._accounts_file.stat().st_mtime
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save gmail password: {e}")
+            return False
 
 
 
