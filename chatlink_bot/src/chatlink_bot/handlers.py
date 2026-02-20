@@ -335,6 +335,7 @@ async def login_user(user: User) -> Dict[str, Any]:
         "login_user_email": login_email,
         "logical_user_mailbox": logical_user_mailbox,
         "imap_login_email": monitored_imap_login,
+        "qr": qr_data,
     }
 
 
@@ -457,9 +458,12 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                 return  # Salir tras procesar comando válido
             
             else:
-                # Si le escriben al admin y no es un comando válido, enviamos el HELP
-                # Solo si el remitente es un usuario registrado (o estamos en simulación)
-                if user_from or is_simulation:
+                # --- PREVENT INFINITE LOOP ---
+                # Check if the message is already our help text
+                is_help_message = text_msg and ("ChatLink Admin Help" in text_msg)
+
+                # Solo si el remitente es un usuario registrado (o simulación) Y no es el mensaje de ayuda
+                if (user_from or is_simulation) and not is_help_message:
                     logger.info(f"[MSG_FLOW] Sending Admin Help to {from_phone}")
                     
                     # Obtener JID del admin para responder
@@ -471,7 +475,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                         from_jid=admin_jid
                     )
                 return # Bloquear cualquier otro procesamiento para el admin
-
+            
         # 2. Identify Client (Gatekeeper)
         client = await _find_client_by_phone(client_phone)
 

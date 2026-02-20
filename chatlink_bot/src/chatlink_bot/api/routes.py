@@ -412,7 +412,11 @@ async def get_active_connections(db: AsyncSession = Depends(get_db)):
     Excludes simulated accounts.
     """
     # 1. Fetch current active connections directly from the transports
-    active_wa_jids = set(whatsapp_transport.list_devices())
+    active_wa_jids = whatsapp_transport.list_devices()
+    
+    # Extract plain phone numbers from the JIDs (e.g., "34600111222:5@s.whatsapp.net" -> "34600111222")
+    active_wa_phones = {jid.split("@")[0].split(":")[0] for jid in active_wa_jids if jid}
+    
     active_emails = set(email_transport.active_mailboxes)
     
     # 2. Fetch all enabled users, explicitly filtering out the simulation domain
@@ -424,8 +428,10 @@ async def get_active_connections(db: AsyncSession = Depends(get_db)):
     
     connections = []
     for u in users:
-        # Check WhatsApp: Is the user's saved device JID currently active in the transport?
-        wa_connected = bool(u.wa_device_jid and u.wa_device_jid in active_wa_jids)
+        clean_phone = (u.phone or "").strip()
+        
+        # Check WhatsApp: Is the user's phone number currently active in the transport?
+        wa_connected = bool(clean_phone and clean_phone in active_wa_phones)
         
         # Check Email: Is the user's email actively being polled by a mailbox listener?
         email_connected = bool(u.email and u.email.strip().lower() in active_emails)
