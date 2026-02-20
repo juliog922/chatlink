@@ -85,7 +85,7 @@
                     
                     <div v-if="currentView === 'dashboard'" class="p-6 h-full overflow-y-auto">
                         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
-                            <div v-for="stat in statusCards" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
+                            <div v-for="stat in statusCards" :key="stat.label" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
                                 <div class="absolute right-0 top-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
                                     <i :class="stat.icon" class="text-6xl"></i>
                                 </div>
@@ -372,6 +372,6 @@
             </div>
         </template>
     </div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2.0"></script>
 </body>
 </html>
