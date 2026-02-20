@@ -104,16 +104,14 @@ async def _ensure_simulation_actors():
     """Ensures a default Salesman and Admin exist for simulation purposes."""
     async with AsyncSessionPG() as db:
         # 1. Sim Salesman
-        sales = (await db.execute(select(User).where(User.email == "sales@sim.local"))).scalars().first()
+        sales = (await db.execute(select(User).where(User.email == "sales@sim.com"))).scalars().first()
         if not sales:
-            db.add(User(name="Sim Salesman", email="sales@sim.local", phone="34600999001", role="user", enabled=True))
-            root_logger.info("Created Simulation Salesman (sales@sim.local)")
+            db.add(User(name="Sim Salesman", email="sales@sim.com", phone="34600999001", role="user", enabled=True))
         
         # 2. Sim Admin
-        admin = (await db.execute(select(User).where(User.email == "admin@sim.local"))).scalars().first()
+        admin = (await db.execute(select(User).where(User.email == "admin@sim.com"))).scalars().first()
         if not admin:
-            db.add(User(name="Sim Admin", email="admin@sim.local", phone="34600999002", role="admin", enabled=True))
-            root_logger.info("Created Simulation Admin (admin@sim.local)")
+            db.add(User(name="Sim Admin", email="admin@sim.com", phone="34600999002", role="admin", enabled=True))
         
         await db.commit()
 

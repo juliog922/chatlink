@@ -124,7 +124,7 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     id: int
     name: str
-    email: EmailStr
+    email: str
     phone: str
     role: UserRole
     enabled: bool
