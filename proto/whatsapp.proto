@@ -12,7 +12,7 @@ service WhatsAppService {
 
   // StartLogin initiates the QR code login flow. It returns a stream of status updates
   // (QR code generation, timeout, or success).
-  rpc StartLogin(Empty) returns (QRCodeResponse);
+  rpc StartLogin(LoginRequest) returns (QRCodeResponse);
 
   // SendMessage sends a text or media message to a specific recipient.
   rpc SendMessage(SendRequest) returns (SendResponse);
@@ -136,4 +136,9 @@ message StatusResponse {
   // Error message if operation failed.
   // Optional. Example: "Device not found"
   string error = 2;
+}
+
+message LoginRequest {
+  // The phone number of the device to link (e.g., "34600111222")
+  string phone_number = 1;
 }

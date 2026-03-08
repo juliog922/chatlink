@@ -377,37 +377,23 @@ class EmailTransport:
             logger.error(f"SMTP error: {e}")
             return False, str(e)
 
-    def send_qr_email(self, to_email: str, name: str, qr_data: str) -> Tuple[bool, Optional[str]]:
-        try:
-            import io
-            import qrcode
-        except Exception as e:
-            return False, f"qrcode dependency missing: {e}"
-
+    def send_pairing_code_email(self, to_email: str, name: str, code: str) -> Tuple[bool, Optional[str]]:
         if not SMTP_USER or not SMTP_PASSWORD:
             return False, "Missing SMTP credentials"
 
         subject = f"WhatsApp Login for {name}"
         body = (
             f"Hello {name},\n\n"
-            "Please scan the attached QR code to link your device.\n"
+            f"Here is your WhatsApp linking code:\n\n"
+            f"    {code}\n\n"
+            "Please enter this code in your WhatsApp app (Settings -> Linked Devices -> Link with phone number).\n"
             "Note: This code expires quickly.\n"
         )
-
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
 
         return self.send_email(
             to_email=to_email,
             subject=subject,
             body=body,
-            attachments=[("login_qr.png", "image/png", png_bytes)],
         )
     
     def _load_accounts_if_changed(self) -> None:

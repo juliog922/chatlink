@@ -1,5 +1,5 @@
 # -------- Build Stage --------
-    FROM golang:1.24-bookworm AS builder
+    FROM golang:latest AS builder
 
     WORKDIR /src
     

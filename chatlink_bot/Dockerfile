@@ -44,14 +44,9 @@ RUN uv sync --no-install-project --no-cache
 # 6. Copy Source Code
 COPY src/ ./src/
 
-# 7. Patch gRPC imports
-# Reason: Fixes relative import issues in generated protobuf files
-RUN sed -i 's/import whatsapp_pb2 as whatsapp__pb2/from . import whatsapp_pb2 as whatsapp__pb2/' src/chatlink_bot/whatsapp_pb2_grpc.py
-
-# 8. Final Setup
+# 7. Final Setup
 EXPOSE 8000
 
-# Fix: Add 'src' to PYTHONPATH so python can find 'chatlink_bot' package
 ENV PYTHONPATH="/app/src"
 
 CMD ["uvicorn", "chatlink_bot.main:app", "--host", "0.0.0.0", "--port", "8000"]

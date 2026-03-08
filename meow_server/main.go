@@ -374,29 +374,66 @@ func (s *WhatsAppServer) StreamMessages(_ *pb.Empty, stream pb.WhatsAppService_S
 	return nil
 }
 
-func (s *WhatsAppServer) StartLogin(_ context.Context, _ *pb.Empty) (*pb.QRCodeResponse, error) {
-	s.Logger.Info("Starting login flow")
+func (s *WhatsAppServer) StartLogin(ctx context.Context, req *pb.LoginRequest) (*pb.QRCodeResponse, error) {
+	s.Logger.WithField("phone", req.PhoneNumber).Info("Starting pairing code login flow")
+
+	if req.PhoneNumber == "" {
+		return &pb.QRCodeResponse{Status: "error", Code: "Phone number required"}, nil
+	}
+
 	newDev := s.Container.NewDevice()
 	client := whatsmeow.NewClient(newDev, waLog.Stdout("Client", "INFO", true))
+
+	// 1. Get the QR channel so we can wait for the connection to stabilize
 	qrChan, _ := client.GetQRChannel(context.Background())
 
+	// 2. We MUST connect before asking for a pairing code
 	if err := client.Connect(); err != nil {
 		s.Logger.WithError(err).Error("Connection failed")
-		return &pb.QRCodeResponse{Status: "error"}, err
+		return &pb.QRCodeResponse{Status: "error", Code: err.Error()}, nil
 	}
 
-	go s.handleQRLifecycle(client, qrChan)
-
+	// 3. Wait for the websocket to fully open (by waiting for the first QR event)
 	select {
-	case evt := <-qrChan:
-		if evt.Event == "code" {
-			return &pb.QRCodeResponse{Code: evt.Code, Status: "code"}, nil
-		}
-		return &pb.QRCodeResponse{Status: evt.Event}, nil
-	case <-time.After(60 * time.Second): // 60s Timeout
-		s.Logger.Warn("StartLogin timed out waiting for QR code")
-		return &pb.QRCodeResponse{Status: "timeout"}, nil
+	case <-qrChan:
+		s.Logger.Info("Websocket connected, requesting pairing code...")
+	case <-time.After(10 * time.Second):
+		s.Logger.Warn("Timeout waiting for websocket to establish")
+		client.Disconnect()
+		return &pb.QRCodeResponse{Status: "error", Code: "Connection timeout"}, nil
 	}
+
+	// 4. Generate the 8-character pairing code (Notice the 'ctx' argument added here)
+	linkingCode, err := client.PairPhone(ctx, req.PhoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		s.Logger.WithError(err).Error("Failed to generate pairing code")
+		client.Disconnect()
+		return &pb.QRCodeResponse{Status: "error", Code: err.Error()}, nil
+	}
+
+	// 5. Wait in the background for the user to type the code into their phone
+	go func() {
+		// As the docs state, the websocket closes after ~160 seconds if no login occurs
+		timeout := time.After(3 * time.Minute)
+		for {
+			select {
+			case <-timeout:
+				s.Logger.Warn("Pairing timed out")
+				client.Disconnect()
+				return
+			default:
+				if client.IsLoggedIn() {
+					s.Logger.Info("Pairing Success")
+					s.registerClient(client)
+					return
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+
+	// Return the pairing code immediately to Python
+	return &pb.QRCodeResponse{Code: linkingCode, Status: "code"}, nil
 }
 
 func (s *WhatsAppServer) SendMessage(ctx context.Context, req *pb.SendRequest) (*pb.SendResponse, error) {
@@ -479,22 +516,6 @@ func (s *WhatsAppServer) DeleteDevice(ctx context.Context, req *pb.DeviceID) (*p
 // -----------------------------------------------------------------------------
 // Internal Logic
 // -----------------------------------------------------------------------------
-
-func (s *WhatsAppServer) handleQRLifecycle(c *whatsmeow.Client, ch <-chan whatsmeow.QRChannelItem) {
-	for {
-		select {
-		case evt := <-ch:
-			if evt.Event == "success" {
-				s.Logger.Info("QR Success")
-				s.registerClient(c)
-				return
-			}
-		case <-time.After(5 * time.Minute):
-			c.Disconnect()
-			return
-		}
-	}
-}
 
 func (s *WhatsAppServer) registerClient(c *whatsmeow.Client) {
 	s.mu.Lock()

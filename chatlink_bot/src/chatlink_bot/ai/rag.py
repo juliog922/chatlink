@@ -86,7 +86,7 @@ class HybridRetriever:
             self.corpus_ids.append(pid)
             tokenized.append(self._tokenize(content))
 
-        self.bm25 = BM25Okapi(tokenized)
+        self.bm25 = await asyncio.to_thread(BM25Okapi, tokenized)
         logger.info(f"HybridRetriever ready: {len(self.corpus_ids)} docs")
 
     def _bm25_search(self, query: str, top_k: int) -> List[Tuple[str, float]]:

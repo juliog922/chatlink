@@ -142,7 +142,7 @@
                                             </span>
                                         </td>
                                         <td class="px-6 py-4 text-right space-x-2">
-                                            <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Login / QR"><i class="fas fa-qrcode"></i></button>
+                                            <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Link Device"><i class="fas fa-link"></i></button>
                                             <button @click="deleteUser(user.id)" class="p-2 hover:text-red-400 transition-colors" title="Delete"><i class="fas fa-trash"></i></button>
                                             <button v-if="user.role === 'user'" @click="openPasswordModal(user)" class="text-amber-400 hover:text-amber-300 ml-3" title="Set App Password">
                                                 <i class="fas fa-key"></i>
@@ -365,20 +365,19 @@
                 </div>
             </div>
 
-            <div v-if="showQrModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+            <div v-if="showPairCodeModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
                 <div class="bg-white text-slate-900 p-8 rounded-xl shadow-2xl max-w-sm text-center">
                     <h3 class="text-2xl font-bold mb-2">Link Device</h3>
-                    <p class="text-sm text-slate-500 mb-6">Scan with WhatsApp (Linked Devices)</p>
+                    <p class="text-sm text-slate-500 mb-6">Enter this code in WhatsApp (Linked Devices <i class="fas fa-arrow-right text-[10px] mx-1"></i> Link with phone number)</p>
                     
-                    <div class="bg-slate-100 p-4 rounded-lg mb-4 flex items-center justify-center min-h-[200px]">
-                        <img v-if="qrData" :src="'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(qrData)" alt="QR Code">
+                    <div class="bg-slate-100 p-6 rounded-lg mb-6 flex items-center justify-center min-h-[120px]">
+                        <div v-if="pairCode" class="text-4xl font-mono font-bold tracking-[0.2em] text-blue-600">
+                            {{ pairCode }}
+                        </div>
                         <div v-else class="text-red-500 font-bold">Session Active / Error</div>
                     </div>
                     
-                    <div class="bg-slate-100 p-2 rounded text-[10px] font-mono break-all text-slate-400 mb-4 select-all">
-                        {{ qrData || 'NO_QR_DATA' }}
-                    </div>
-                    <button @click="showQrModal=false" class="bg-slate-900 text-white px-8 py-2 rounded-full hover:bg-slate-700 transition">Done</button>
+                    <button @click="showPairCodeModal=false" class="bg-slate-900 text-white px-8 py-2 w-full rounded-full hover:bg-slate-700 transition font-bold shadow-lg shadow-slate-900/20">Done</button>
                 </div>
             </div>
 

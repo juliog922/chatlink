@@ -22,7 +22,6 @@ dependencies = [
     "pyodbc>=5.3.0",
     "python-multipart>=0.0.20",
     "qdrant-client>=1.16.2",
-    "qrcode[pil]>=8.2",
     "rank-bm25>=0.2.2",
     "requests>=2.32.5",
     "sqlalchemy[asyncio]>=2.0.44",

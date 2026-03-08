@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+from cudara_client import CudaraClient
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
@@ -115,6 +116,57 @@ async def _ensure_simulation_actors():
         
         await db.commit()
 
+async def _ensure_models_ready() -> None:
+    cudara_models_env = os.getenv("CUDARA_DEFAULT_MODELS", "")
+    if not cudara_models_env:
+        root_logger.warning("CUDARA_DEFAULT_MODELS not set. Skipping model puller.")
+        return
+
+    models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
+    cudara_url = os.getenv("CUDARA_URL", "http://cudara:8000")
+    
+    client = CudaraClient(base_url=cudara_url, timeout=10.0)
+    root_logger.info(f"Starting Sequential Model Puller for: {models}")
+
+    for model in models:
+        root_logger.info(f">>> Checking model: {model}")
+        
+        # Connection retry backoff (starts at 5s, caps at 30s)
+        error_backoff = 5 
+        
+        while True:
+            try:
+                # 1. Fetch status in a background thread (consumes 0 CPU while waiting for HTTP)
+                models_info = await asyncio.to_thread(client.list_models)
+                model_state = next((m for m in models_info if m.name == model), None)
+                status = model_state.status if model_state else "not_found"
+
+                if status == "ready":
+                    root_logger.info(f"[OK] Model {model} is ready.")
+                    error_backoff = 5  # Reset backoff for the next model
+                    break
+                
+                elif status == "downloading":
+                    # Downloading takes a long time. Sleep for 15 seconds to save network/CPU.
+                    root_logger.info(f"[WAIT] Model {model} is downloading. Sleeping for 15s...")
+                    await asyncio.sleep(15)
+                    continue
+                
+                # 2. If missing, trigger the pull
+                root_logger.info(f"[DOWNLOADING] Triggering pull for {model}...")
+                await asyncio.to_thread(client.pull, model)
+                
+                # Give the server 5 seconds to register the download state before checking again
+                await asyncio.sleep(5)
+
+            except Exception as e:
+                # If Cudara is completely down/booting, wait longer each time (5s, 10s, 20s...)
+                root_logger.warning(f"[Cudara] Server unreachable/booting. Retrying in {error_backoff}s... ({e})")
+                await asyncio.sleep(error_backoff)
+                error_backoff = min(error_backoff * 2, 30)
+    
+    root_logger.info("SUCCESS: All models are downloaded and ready.")
+                
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1) Create Postgres tables
@@ -140,6 +192,8 @@ async def lifespan(app: FastAPI):
         root_logger.info("SQL Server connectivity: OK")
     except Exception as e:
         root_logger.warning(f"SQL Server connectivity: FAILED ({e})")
+
+    await _ensure_models_ready()
 
     # 5) Start background ingestion tasks
     app.state.stop_daily_ingest = asyncio.Event()

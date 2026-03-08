@@ -178,8 +178,8 @@ createApp({
         const userSearch = ref("");
         const newUser = ref({});
         const showAddUserModal = ref(false);
-        const showQrModal = ref(false);
-        const qrData = ref("");
+        const showPairCodeModal = ref(false);
+        const pairCode = ref("");
         const showPasswordModal = ref(false);
         const selectedUserForPassword = ref(null);
         const newGmailPassword = ref('');
@@ -209,8 +209,8 @@ createApp({
             const data = await fetchJson(`/api/users/${user.id}/login`, { method: 'POST' });
             loading.value = false;
             if (data && data.success) {
-                qrData.value = data.qr || "";
-                showQrModal.value = true;
+                pairCode.value = data.code || "";
+                showPairCodeModal.value = true;
             } else {
                 alert("Error al iniciar sesión: " + (data?.error || "Desconocido"));
             }
@@ -371,7 +371,7 @@ createApp({
             logs, logsFilter, loadLogs,
             sim, simChat, simState, sendSimulation, loadSimChat, downloadCsv,
             simActors, availableSenders, availableReceivers, isNonClientSender,
-            showQrModal, qrData, formatTime, statusCards
+            showPairCodeModal, pairCode, formatTime, statusCards
         };
     }
 }).mount('#app');

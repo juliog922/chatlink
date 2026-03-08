@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v3.21.12
-// source: proto/whatsapp.proto
+// source: whatsapp.proto
 
 package proto
 
@@ -39,7 +39,7 @@ type WhatsAppServiceClient interface {
 	StreamMessages(ctx context.Context, in *Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MessageEvent], error)
 	// StartLogin initiates the QR code login flow. It returns a stream of status updates
 	// (QR code generation, timeout, or success).
-	StartLogin(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*QRCodeResponse, error)
+	StartLogin(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*QRCodeResponse, error)
 	// SendMessage sends a text or media message to a specific recipient.
 	SendMessage(ctx context.Context, in *SendRequest, opts ...grpc.CallOption) (*SendResponse, error)
 	// ListDevices retrieves all registered WhatsApp sessions (devices) and their connection status.
@@ -77,7 +77,7 @@ func (c *whatsAppServiceClient) StreamMessages(ctx context.Context, in *Empty, o
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type WhatsAppService_StreamMessagesClient = grpc.ServerStreamingClient[MessageEvent]
 
-func (c *whatsAppServiceClient) StartLogin(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*QRCodeResponse, error) {
+func (c *whatsAppServiceClient) StartLogin(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*QRCodeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(QRCodeResponse)
 	err := c.cc.Invoke(ctx, WhatsAppService_StartLogin_FullMethodName, in, out, cOpts...)
@@ -139,7 +139,7 @@ type WhatsAppServiceServer interface {
 	StreamMessages(*Empty, grpc.ServerStreamingServer[MessageEvent]) error
 	// StartLogin initiates the QR code login flow. It returns a stream of status updates
 	// (QR code generation, timeout, or success).
-	StartLogin(context.Context, *Empty) (*QRCodeResponse, error)
+	StartLogin(context.Context, *LoginRequest) (*QRCodeResponse, error)
 	// SendMessage sends a text or media message to a specific recipient.
 	SendMessage(context.Context, *SendRequest) (*SendResponse, error)
 	// ListDevices retrieves all registered WhatsApp sessions (devices) and their connection status.
@@ -161,7 +161,7 @@ type UnimplementedWhatsAppServiceServer struct{}
 func (UnimplementedWhatsAppServiceServer) StreamMessages(*Empty, grpc.ServerStreamingServer[MessageEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method StreamMessages not implemented")
 }
-func (UnimplementedWhatsAppServiceServer) StartLogin(context.Context, *Empty) (*QRCodeResponse, error) {
+func (UnimplementedWhatsAppServiceServer) StartLogin(context.Context, *LoginRequest) (*QRCodeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method StartLogin not implemented")
 }
 func (UnimplementedWhatsAppServiceServer) SendMessage(context.Context, *SendRequest) (*SendResponse, error) {
@@ -209,7 +209,7 @@ func _WhatsAppService_StreamMessages_Handler(srv interface{}, stream grpc.Server
 type WhatsAppService_StreamMessagesServer = grpc.ServerStreamingServer[MessageEvent]
 
 func _WhatsAppService_StartLogin_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(Empty)
+	in := new(LoginRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -221,7 +221,7 @@ func _WhatsAppService_StartLogin_Handler(srv interface{}, ctx context.Context, d
 		FullMethod: WhatsAppService_StartLogin_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WhatsAppServiceServer).StartLogin(ctx, req.(*Empty))
+		return srv.(WhatsAppServiceServer).StartLogin(ctx, req.(*LoginRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -333,5 +333,5 @@ var WhatsAppService_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "proto/whatsapp.proto",
+	Metadata: "whatsapp.proto",
 }

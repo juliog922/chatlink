@@ -278,64 +278,47 @@ async def login_user(user: User) -> Dict[str, Any]:
             mailbox_password=mailbox_pwd,
             user_mailbox=logical_user_mailbox,
         )
-        if not email_monitoring:
-            logger.warning(
-                f"Email monitoring could not start for mailbox={logical_user_mailbox} (imap_login={monitored_imap_login}); continuing WhatsApp-only."
-            )
     else:
-        logger.info(
-            f"No Gmail app password for imap_login={monitored_imap_login}; continuing WhatsApp-only."
-        )
+        logger.info(f"No Gmail app password for imap_login={monitored_imap_login}; continuing WhatsApp-only.")
 
-    qr = whatsapp_transport.start_login()
+    # 1. Request the Pairing Code from the Go Server
+    login_resp = whatsapp_transport.start_login(phone_number=(user.phone or "").strip())
 
-    ok = bool(qr.get("success"))
-    status = (qr.get("status") or "").strip().lower()
-    if status in ("ok", "success"):
-        ok = True
-
-    qr_data = qr.get("qr") or qr.get("code") or ""
-    if qr_data:
-        ok = True
+    ok = bool(login_resp.get("success"))
+    code = login_resp.get("code") or ""
 
     if not ok:
         if email_monitoring:
             email_transport.stop_mailbox(logical_user_mailbox)
-        return {"success": False, "error": qr.get("error") or qr.get("status") or "start_login_failed"}
+        return {"success": False, "error": login_resp.get("error") or "start_login_failed"}
 
-    if not qr_data and status not in ("already_logged_in", "already", "connected", "logged_in"):
-        if email_monitoring:
-            email_transport.stop_mailbox(logical_user_mailbox)
-        return {"success": False, "error": "qr_empty"}
-
-    if qr_data:
-        sent, err = email_transport.send_qr_email(
-            to_email=user.email,
-            name=user.name or user.email,
-            qr_data=qr_data,
+    # --- EMAIL SENDING BLOCK ---
+    if login_email and code:
+        email_transport.send_pairing_code_email(
+            to_email=login_email,
+            name=user.name or "User",
+            code=code
         )
-        if not sent:
-            if email_monitoring:
-                email_transport.stop_mailbox(logical_user_mailbox)
-            return {"success": False, "error": err or "qr_email_failed"}
 
+    # 2. Safely Mark the User as Enabled in the Database
     async with AsyncSessionPG() as db:
+        
+        # Update the specific user who requested the login
+        db_user = (await db.execute(select(User).where(User.id == user.id))).scalars().first()
+        if db_user:
+            db_user.enabled = True
+        
+        # Maintain secondary SMTP routing if MOCK_EMAIL is used
         smtp_email = logical_user_mailbox.strip().lower()
-        u_mail = (
-            await db.execute(select(User).where(func.lower(User.email) == smtp_email))
-        ).scalars().first()
-
-        if not u_mail:
-            u_mail = User(
-                name="Admin SMTP",
-                email=smtp_email,
-                phone="",
-                role="user",
-                enabled=True,
-            )
-            db.add(u_mail)
-        else:
-            u_mail.enabled = True
+        if smtp_email != login_email:
+            u_mail = (
+                await db.execute(select(User).where(func.lower(User.email) == smtp_email))
+            ).scalars().first()
+            if not u_mail:
+                u_mail = User(name="Admin SMTP", email=smtp_email, phone="", role="user", enabled=True)
+                db.add(u_mail)
+            else:
+                u_mail.enabled = True
 
         await db.commit()
 
@@ -345,7 +328,7 @@ async def login_user(user: User) -> Dict[str, Any]:
         "login_user_email": login_email,
         "logical_user_mailbox": logical_user_mailbox,
         "imap_login_email": monitored_imap_login,
-        "qr": qr_data,
+        "code": code,
     }
 
 
@@ -403,7 +386,11 @@ async def handle_admin_command(payload: Dict[str, Any]) -> None:
         if cmd == "login":
             out = await login_user(user)
             if out.get("success"):
-                reply_msg = "✅ *Servicio Activado*\nEl monitoreo se ha iniciado correctamente. Si es tu primera vez o tu sesión expiró, revisa tu correo electrónico para escanear el código QR."
+                code = out.get("code")
+                if code:
+                    reply_msg = f"✅ *Servicio Activado*\nTu código de enlace es: *{code}*\n\nTienes 1 minuto para introducirlo. Ve a Configuración -> Dispositivos Vinculados -> Vincular con el número de teléfono."
+                else:
+                    reply_msg = "✅ *Servicio Activado*\nEl monitoreo se ha iniciado correctamente (ya estabas conectado)."
             else:
                 err = out.get("error", "Error desconocido")
                 reply_msg = f"❌ *Error al activar el servicio*\nDetalle: {err}"
@@ -447,9 +434,16 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         user_from = await _get_user_by_phone(db, from_phone)
         user_to = await _get_user_by_phone(db, to_phone)
 
-        # [Simulation] If Internal User (Salesman) is missing, fake them to allow flow testing
-        if is_simulation and not user_to:
-            user_to = _fake_user(to_phone)
+        # --- SELF-CHAT SIMULATION LOGIC ---
+        from_norm = _norm_phone(from_phone)
+        to_norm = _norm_phone(to_phone)
+        
+        # If an internal user messages their own number, treat it as a simulation
+        is_self_chat = (from_norm == to_norm) and bool(from_norm)
+        
+        is_mock_owner = False
+        if is_self_chat and user_from:
+            is_mock_owner = True
 
         direction: str
         user_phone: str
@@ -457,7 +451,15 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         device_jid: Optional[str] = None
         internal_user: User = None
 
-        if user_from:
+        if is_mock_owner:
+            # Self-chat: simulate a client talking to the bot
+            direction = "received"
+            user_phone = to_phone
+            client_phone = from_phone
+            device_jid = getattr(msg, "to_jid", None)
+            internal_user = user_to
+            logger.info(f"[MSG_FLOW] WA SIMULATION INCOMING (Self-talk by {user_from.email})")
+        elif user_from:
             # Salesman sent message
             direction = "sent"
             user_phone = from_phone
@@ -465,17 +467,6 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             device_jid = getattr(msg, "from_jid", None)
             internal_user = user_from
             logger.info(f"[MSG_FLOW] WA OUTGOING (Internal {user_from.email} -> External {to_phone})")
-        elif user_to:
-            # Client sent message
-            direction = "received"
-            user_phone = to_phone
-            client_phone = from_phone
-            device_jid = getattr(msg, "to_jid", None)
-            internal_user = user_to
-            logger.info(f"[MSG_FLOW] WA INCOMING (External {from_phone} -> Internal {user_to.email})")
-        else:
-            logger.info(f"[MSG_FLOW] WA IGNORED: Unknown participants {from_phone} -> {to_phone}")
-            return
 
         # Check Admin Command (If the sender is an admin)
         if internal_user.role == "admin":
@@ -487,49 +478,33 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                 return
         
         # Check if the message is sent TO an admin (for a regular user to login/logout)
-        if user_to and user_to.role == "admin":
-            # Intentar matchear el comando (login/logout)
+        # Bypass this block if we are running a self-chat simulation so the AI can answer!
+        if user_to and user_to.role == "admin" and not is_mock_owner:
             m = ADMIN_CMD_RE.match(text_msg or "")
-            
             if m:
                 cmd = m.group(1).lower()
                 logger.info(f"[MSG_FLOW] Admin Command: {cmd} from {from_phone}")
                 await event_bus.emit("admin_command", {"command": cmd, "phone": from_phone})
-                return  # Salir tras procesar comando válido
-            
+                return 
             else:
-                # --- PREVENT INFINITE LOOP ---
-                # Check if the message is already our help text
                 is_help_message = text_msg and ("ChatLink Admin Help" in text_msg)
-
-                # Solo si el remitente es un usuario registrado (o simulación) Y no es el mensaje de ayuda
                 if (user_from or is_simulation) and not is_help_message:
-                    
-                    # --- NEW: DEBOUNCE LOGIC ---
                     now = _now_utc()
                     cache_key = f"{from_phone}_{to_phone}"
                     last_sent = _admin_help_cache.get(cache_key)
-                    
-                    # Only send if we haven't sent one in the last 10 seconds
                     if not last_sent or (now - last_sent).total_seconds() > 10:
                         _admin_help_cache[cache_key] = now
                         logger.info(f"[MSG_FLOW] Sending Admin Help to {from_phone}")
-                        
-                        # Obtener JID del admin para responder
-                        admin_jid = getattr(msg, "to_jid", None)
-                        
                         whatsapp_transport.send_message(
                             to_phone=from_phone, 
                             text=ADMIN_HELP_TEXT,
-                            from_jid=admin_jid
+                            from_jid=getattr(msg, "to_jid", None)
                         )
                     else:
                         logger.info(f"[MSG_FLOW] Suppressed duplicate Admin Help for {from_phone} (debounced)")
+                return
 
-                return # Bloquear cualquier otro procesamiento para el admin
-
-        # --- MOVED DOWN: Now we block disabled users from talking to clients ---
-        if not internal_user.enabled and not is_simulation:
+        if not internal_user.enabled and not is_simulation and not is_mock_owner:
             logger.info(f"[MSG_FLOW] WA IGNORED: User {internal_user.email} is DISABLED.")
             return
             
@@ -538,7 +513,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
 
         # [Simulation] Handle "Not-Client" vs "Mock Client"
         if not client:
-            if is_simulation and mock_client_force:
+            if (is_simulation and mock_client_force) or is_mock_owner:
                 client = _fake_client(client_phone)
                 logger.info(f"[MSG_FLOW] WA Simulation: Faked client {client_phone}")
             else:
@@ -547,7 +522,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         
         logger.info(f"[MSG_FLOW] WA ACCEPTED: Client={getattr(client, 'Nombre', 'Unknown')}")
 
-        if device_jid and not is_simulation:
+        if device_jid and not is_simulation and not is_mock_owner:
             internal_user.wa_device_jid = device_jid
             await db.commit()
 
@@ -569,6 +544,44 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         if extracted:
             final_text = (final_text + "\n\n" if final_text else "") + f"[EXTRACTED]\n{extracted}"
 
+        # --- DEDUPLICATION & ECHO PREVENTION ---
+        if not is_simulation:
+            # 1. Ignore if it's an echo of a bot message sent in the last 2 minutes
+            cutoff_bot = _now_utc() - timedelta(minutes=2)
+            is_bot_echo = (
+                await db.execute(
+                    select(Chat.id).where(
+                        Chat.chat_id == client_phone,
+                        Chat.user == user_phone,
+                        Chat.message == final_text,
+                        Chat.is_bot == True,
+                        Chat.timestamp >= cutoff_bot,
+                    ).limit(1)
+                )
+            ).scalars().first()
+
+            if is_bot_echo:
+                logger.info(f"[MSG_FLOW] WA IGNORED (Bot Echo): {client_phone}")
+                return
+
+            # 2. Ignore rapid duplicates (same message within 10 seconds)
+            cutoff_rapid = _now_utc() - timedelta(seconds=10)
+            is_rapid_dup = (
+                await db.execute(
+                    select(Chat.id).where(
+                        Chat.chat_id == client_phone,
+                        Chat.user == user_phone,
+                        Chat.message == final_text,
+                        Chat.timestamp >= cutoff_rapid,
+                    ).limit(1)
+                )
+            ).scalars().first()
+
+            if is_rapid_dup:
+                logger.info(f"[MSG_FLOW] WA IGNORED (Rapid Duplicate): {client_phone}")
+                return
+
+        # Insert the fresh, non-echo message
         db.add(
             Chat(
                 chat_id=client_phone,
@@ -583,10 +596,10 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         )
         await db.commit()
 
-        # FSM Logic: Only triggers if direction is received (Client -> Bot)
-        # The FSM handles the debouncing (RESPONSE_DELAY_MINUTES)
+        # FSM Logic: Pass the simulation flag so the AI logic knows to accept the fake client
+        sim_flag = is_simulation or is_mock_owner
         if direction == "received":
-            await fsm.on_client_message("whatsapp", client_phone, user_phone, is_simulation=is_simulation)
+            await fsm.on_client_message("whatsapp", client_phone, user_phone, is_simulation=sim_flag)
         else:
             await fsm.on_user_message("whatsapp", client_phone, user_phone)
 

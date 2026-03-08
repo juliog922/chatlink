@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import whatsapp_pb2 as whatsapp__pb2
+from . import whatsapp_pb2 as whatsapp__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
@@ -43,7 +43,7 @@ class WhatsAppServiceStub(object):
                 _registered_method=True)
         self.StartLogin = channel.unary_unary(
                 '/whatsapp.WhatsAppService/StartLogin',
-                request_serializer=whatsapp__pb2.Empty.SerializeToString,
+                request_serializer=whatsapp__pb2.LoginRequest.SerializeToString,
                 response_deserializer=whatsapp__pb2.QRCodeResponse.FromString,
                 _registered_method=True)
         self.SendMessage = channel.unary_unary(
@@ -127,7 +127,7 @@ def add_WhatsAppServiceServicer_to_server(servicer, server):
             ),
             'StartLogin': grpc.unary_unary_rpc_method_handler(
                     servicer.StartLogin,
-                    request_deserializer=whatsapp__pb2.Empty.FromString,
+                    request_deserializer=whatsapp__pb2.LoginRequest.FromString,
                     response_serializer=whatsapp__pb2.QRCodeResponse.SerializeToString,
             ),
             'SendMessage': grpc.unary_unary_rpc_method_handler(
@@ -205,7 +205,7 @@ class WhatsAppService(object):
             request,
             target,
             '/whatsapp.WhatsAppService/StartLogin',
-            whatsapp__pb2.Empty.SerializeToString,
+            whatsapp__pb2.LoginRequest.SerializeToString,
             whatsapp__pb2.QRCodeResponse.FromString,
             options,
             channel_credentials,

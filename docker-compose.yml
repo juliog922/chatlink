@@ -127,7 +127,6 @@ services:
     
   model_puller:
     image: alpine:latest
-    container_name: cudara_model_puller
     env_file:
       - .env
     depends_on:
@@ -159,12 +158,16 @@ services:
             if [ "$$STATUS" = "ready" ]; then
               echo "[OK] Model $$model is ready."
               break # Sale del while, pasa al siguiente modelo del for
+            elif [ "$$STATUS" = "downloading" ]; then
+              echo "[WAIT] Model $$model is downloading in the background. Waiting..."
+              sleep 5
+              continue # Vuelve al inicio del loop sin disparar otro pull
             fi
 
-            # 2. Si no está listo, iniciamos descarga bloqueante
-            echo "[DOWNLOADING] $$model status is \"$$STATUS\". Starting pull (blocking)..."
+            # 2. Si no está listo ni descargando, iniciamos descarga
+            echo "[DOWNLOADING] $$model status is \"$$STATUS\". Starting pull..."
             
-            # stream: false hace que curl espere a que termine (o falle) antes de devolver el control
+            # Disparamos la descarga (background task en el server)
             curl -s -X POST http://cudara:8000/api/pull \
               -H "Content-Type: application/json" \
               -d "{\"name\": \"$$model\", \"stream\": false}"

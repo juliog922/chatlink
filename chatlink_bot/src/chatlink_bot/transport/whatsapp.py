@@ -162,31 +162,24 @@ class WhatsAppTransport:
 
     # ----- Outgoing control -----
 
-    def start_login(self) -> Dict[str, Any]:
-        """
-        Returns a normalized dict so handlers/routes don't need to know proto details.
-        """
+    def start_login(self, phone_number: str) -> Dict[str, Any]:
         if not self.stub:
             return {
                 "success": False,
                 "status": "error",
-                "qr": None,
                 "code": None,
                 "error": "stub_not_ready",
             }
 
         try:
-            resp = self.stub.StartLogin(whatsapp_pb2.Empty())
+            req = whatsapp_pb2.LoginRequest(phone_number=phone_number)
+            resp = self.stub.StartLogin(req)
 
             status = (getattr(resp, "status", "") or "").strip()
             code = getattr(resp, "code", None)
 
-            # Some implementations may return QR in another field; keep compatibility.
-            qr_data = code or getattr(resp, "qr", None) or getattr(resp, "qr_code", None)
-
-            # If server provides an explicit error field, use it; otherwise fallback to status.
             err = (getattr(resp, "error", "") or "").strip()
-            success = status.lower() in ("ok", "success") or bool(qr_data)
+            success = status.lower() in ("ok", "success") or bool(code)
 
             if not success and not err:
                 err = status or "start_login_failed"
@@ -194,27 +187,14 @@ class WhatsAppTransport:
             return {
                 "success": success,
                 "status": status,
-                "qr": qr_data,
-                "code": qr_data,   # backward/sideways compatibility with existing code
+                "code": code,
                 "error": err,
             }
 
         except grpc.RpcError as e:
-            return {
-                "success": False,
-                "status": "error",
-                "qr": None,
-                "code": None,
-                "error": e.details() or str(e),
-            }
+            return {"success": False, "status": "error", "code": None, "error": e.details() or str(e)}
         except Exception as e:
-            return {
-                "success": False,
-                "status": "error",
-                "qr": None,
-                "code": None,
-                "error": str(e),
-            }
+            return {"success": False, "status": "error", "code": None, "error": str(e)}
 
     def send_message(
         self,
