@@ -13,6 +13,8 @@ logger = logging.getLogger("LLM")
 
 CUDARA_URL = os.getenv("CUDARA_URL", "http://cudara:8000")
 TEXT_MODEL = os.getenv("CUDARA_TEXT_MODEL", "Qwen/Qwen2.5-3B-Instruct-GGUF")
+# Default to 4096, matching the llama.cpp standard and your error logs
+CTX_WINDOW = int(os.getenv("CUDARA_CTX_WINDOW", "4096"))
 
 _client: Optional[CudaraClient] = None
 
@@ -78,6 +80,36 @@ def _default_summary() -> Dict[str, Any]:
         "last_interaction_intent": "GREETING",
         "chat_context_summary": "",
     }
+
+
+def _estimate_tokens(text: str) -> int:
+    """Quick and dirty token estimation (approx 4 chars per token)."""
+    return len(str(text)) // 4
+
+
+def _truncate_rag_candidates(candidates: Dict[str, Any], token_budget: int) -> Dict[str, Any]:
+    """Reduces the number of RAG candidates to fit the token budget."""
+    truncated = {}
+    current_tokens = 0
+    
+    for query, items in candidates.items():
+        block_str = json.dumps({query: items}, ensure_ascii=False)
+        block_tokens = _estimate_tokens(block_str)
+        
+        if current_tokens + block_tokens < token_budget:
+            truncated[query] = items
+            current_tokens += block_tokens
+        else:
+            # If the full block doesn't fit, try taking just the top 1 item for this query
+            if items:
+                small_block = json.dumps({query: items[:1]}, ensure_ascii=False)
+                small_tokens = _estimate_tokens(small_block)
+                if current_tokens + small_tokens < token_budget:
+                    truncated[query] = items[:1]
+                    current_tokens += small_tokens
+            break # Stop adding queries once budget is hit
+            
+    return truncated
 
 
 PROMPT_A = """Eres el Analista de Inteligencia de un Asistente de Ventas de Cosmética. Tu misión es procesar la conversación para identificar productos, validar compras y mantener actualizado el estado del carrito.
@@ -211,16 +243,24 @@ def _clean_think_tags(text: str) -> str:
     """
     if not text:
         return ""
-    # Reemplaza <think>...contenido...</think> por una cadena vacía.
-    # re.DOTALL permite que el punto (.) coincida con saltos de línea.
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 def summarize_update(current_summary: Dict[str, Any], new_messages: List[str]) -> Dict[str, Any]:
     client = _get_client()
+    
+    # Pre-flight budget check for prompt A (Summarizer)
+    target_budget = int(CTX_WINDOW * 0.7)
+    
+    # Truncate new_messages if someone pasted a massive block of text
+    new_msgs_text = "\n".join(f"- {m}" for m in new_messages)
+    if _estimate_tokens(new_msgs_text) > (target_budget * 0.4):
+        logger.warning("Summarizer: Truncating massively long new messages to fit context window.")
+        new_msgs_text = new_msgs_text[:int(target_budget * 0.4 * 4)] + "... [TRUNCATED]"
+
     prompt = PROMPT_A.format(
         current_summary=json.dumps(current_summary, ensure_ascii=False),
-        new_messages_text="\n".join(f"- {m}" for m in new_messages),
+        new_messages_text=new_msgs_text,
     )
 
     full_prompt = f"SYSTEM: Return ONLY valid JSON.\nUSER:\n{prompt}"
@@ -239,7 +279,7 @@ def summarize_update(current_summary: Dict[str, Any], new_messages: List[str]) -
     except (CudaraError, json.JSONDecodeError) as e:
         logger.error(f"Summarizer failed: {e}")
         return current_summary
-    
+
 def build_order_reply(
     client_name: str,
     salesman_name: str,
@@ -253,21 +293,63 @@ def build_order_reply(
     logger.info(f"[PROMPT DEBUG] Focus Msg: '{current_message}' | Status: {summary.get('order_status')}")
 
     client = _get_client()
+    
+    # Budget Target: 70% of available context
+    target_budget = int(CTX_WINDOW * 0.7)
 
-    # Extraemos los datos del summary para el prompt
     order_status = summary.get("order_status", "IDLE")
     confirmed_items = summary.get("confirmed_items", [])
+    
+    # Split history into distinct lines/messages
+    history_lines = [line for line in recent_history.split("\n") if line.strip()]
 
-    prompt = PROMPT_B.format(
-        client_name=client_name,
-        salesman_name=salesman_name,
-        order_status=order_status,
-        confirmed_items=json.dumps(confirmed_items, ensure_ascii=False),
-        rag_candidates_json=json.dumps(rag_candidates, ensure_ascii=False, indent=2),
-        recent_history=recent_history,
-        current_message=current_message,
-        is_new_session=str(is_new_session),
-    )
+    # Helper function to dynamically build the prompt string for token estimation
+    def _build_prompt_string(h_lines: List[str], r_cands: Dict[str, Any]) -> str:
+        r_json = json.dumps(r_cands, ensure_ascii=False, indent=2)
+        h_text = "\n".join(h_lines)
+        return PROMPT_B.format(
+            client_name=client_name,
+            salesman_name=salesman_name,
+            order_status=order_status,
+            confirmed_items=json.dumps(confirmed_items, ensure_ascii=False),
+            rag_candidates_json=r_json,
+            recent_history=h_text,
+            current_message=current_message,
+            is_new_session=str(is_new_session),
+        )
+
+    # 1. Initial Build
+    prompt = _build_prompt_string(history_lines, rag_candidates)
+
+    # 2. Iterative Budget Enforcement
+    if _estimate_tokens(prompt) > target_budget:
+        logger.warning(f"Initial prompt too large ({_estimate_tokens(prompt)} tokens). Trimming history first...")
+        
+        # STEP A: Trim history down to a minimum of 3 messages (Drops oldest first)
+        while len(history_lines) > 3 and _estimate_tokens(_build_prompt_string(history_lines, rag_candidates)) > target_budget:
+            history_lines.pop(0) 
+
+        # Re-evaluate
+        prompt = _build_prompt_string(history_lines, rag_candidates)
+
+        # STEP B: If STILL too big, calculate how much room is left and trim RAG
+        if _estimate_tokens(prompt) > target_budget:
+            logger.warning("Still exceeds budget after history trim. Trimming RAG candidates...")
+            
+            prompt_without_rag = _build_prompt_string(history_lines, {})
+            allowed_rag_tokens = target_budget - _estimate_tokens(prompt_without_rag)
+            
+            if allowed_rag_tokens > 200: # Ensure we have at least a tiny bit of space
+                rag_candidates = _truncate_rag_candidates(rag_candidates, allowed_rag_tokens)
+            else:
+                rag_candidates = {} # No space left at all, drop RAG entirely
+                
+            prompt = _build_prompt_string(history_lines, rag_candidates)
+
+        # STEP C: Final Emergency safety net
+        if _estimate_tokens(prompt) > target_budget:
+            logger.error(f"Prompt STILL exceeds {target_budget} budget. Emergency RAG purge.")
+            prompt = _build_prompt_string(history_lines, {})
 
     try:
         resp = client.generate(
@@ -288,6 +370,7 @@ def build_order_reply(
 
 async def summarize_update_async(current_summary: Dict[str, Any], new_messages: List[str]) -> Dict[str, Any]:
     return await asyncio.to_thread(summarize_update, current_summary, new_messages)
+
 
 async def build_order_reply_async(
     client_name: str,
