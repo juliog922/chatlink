@@ -522,7 +522,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         
         logger.info(f"[MSG_FLOW] WA ACCEPTED: Client={getattr(client, 'Nombre', 'Unknown')}")
 
-        if device_jid and not is_simulation and not is_mock_owner:
+        if device_jid and not is_simulation:
             internal_user.wa_device_jid = device_jid
             await db.commit()
 
