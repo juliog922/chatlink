@@ -910,7 +910,7 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                     logger.info(f"[AI_FLOW] No reply generated (Silence requested) for {client_id}")
                     return
                 
-                # --- 4. SEND REPLY ---
+                # --- 4. SEND REPLY TO CLIENT ---
                 if channel == "whatsapp":
                     from_jid = getattr(user_obj, "wa_device_jid", None) if user_obj else None
                     
@@ -921,17 +921,6 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                         logger.info(f"[AI_FLOW] Reply sent/persisted to {client_id}")
                     else:
                         logger.warning(f"WA send failed: {send_res.get('error')}")
-
-                    if COMMERCIAL_EMAIL and updated_summary.get("order_status") == "CLOSED":
-                        items = updated_summary.get("confirmed_items") or []
-                        if items:
-                            xlsx = _xlsx_from_confirmed_items(items)
-                            email_transport.send_email(
-                                to_email=COMMERCIAL_EMAIL,
-                                subject=f"Pedido confirmado ({client_id})",
-                                body=f"Pedido confirmado para {client_id}.\n\nItems: {items}",
-                                attachments=[("order.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx)],
-                            )
 
                 else: # Email Channel
                     ok, err = email_transport.send_email_as(
@@ -944,17 +933,24 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                     if ok or is_simulation:
                         await _persist_bot_reply_email(db, str(client_id), str(user_id), "Re: Pedido", reply)
                         logger.info(f"[AI_FLOW] Email Reply sent/persisted to {client_id}")
-                    
-                    if COMMERCIAL_EMAIL and updated_summary.get("order_status") == "CLOSED":
-                        items = updated_summary.get("confirmed_items") or []
-                        if items:
-                            xlsx = _xlsx_from_confirmed_items(items)
-                            email_transport.send_email(
-                                to_email=COMMERCIAL_EMAIL,
-                                subject=f"Pedido confirmado ({client_id})",
-                                body=f"Pedido confirmado para {client_id}.\n\nItems: {items}",
-                                attachments=[("order.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx)],
-                            )
+                
+                # --- 5. NOTIFY SALESMAN (Independiente del canal) ---
+                target_email = getattr(user_obj, "email", None) if user_obj else None
+                
+                if target_email and updated_summary.get("order_status") == "CLOSED":
+                    items = updated_summary.get("confirmed_items") or []
+                    if items:
+                        logger.info(f"[AI_FLOW] Pedido cerrado. Generando Excel y enviando a comercial: {target_email}")
+                        xlsx = _xlsx_from_confirmed_items(items)
+                        
+                        # Ejecutamos en un hilo para no bloquear el Event Loop de FastAPI
+                        await asyncio.to_thread(
+                            email_transport.send_email,
+                            to_email=target_email,
+                            subject=f"Pedido confirmado ({client_id})",
+                            body=f"Pedido confirmado para {client_id}.\n\nItems: {items}",
+                            attachments=[("order.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx)],
+                        )
 
         finally:
             await fsm.on_ai_done(channel, str(client_id), str(user_id))
