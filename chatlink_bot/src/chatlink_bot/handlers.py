@@ -873,13 +873,33 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 
                 # --- 3. DECISION LOGIC ---
                 
+                # 1. Temas ajenos al trabajo (OFF_TOPIC): Silencio absoluto
                 if intent == "OFF_TOPIC":
                     logger.info(f"[AI_FLOW] Intent is OFF_TOPIC. Silencing reply for {client_id}.")
                     return
                 
-                # Si es CLOSURE o HUMAN_REQUEST, procesamos normalmente (human request generará "el comercial te contactará")
-                # Solo ejecutamos RAG si hay queries y NO es un cierre puro.
+                # 2. Peticiones directas al comercial (HUMAN_REQUEST): Mensaje automático y fin
+                if intent == "HUMAN_REQUEST":
+                    logger.info(f"[AI_FLOW] Intent HUMAN_REQUEST. Sending fallback for {client_id}.")
+                    reply = f"{salesman_name} revisará tu mensaje y se pondrá en contacto contigo a la mayor brevedad."
+                    
+                    # Forzamos el envío directo y cortamos la ejecución para ahorrar llamada al LLM
+                    if channel == "whatsapp":
+                        from_jid = getattr(user_obj, "wa_device_jid", None) if user_obj else None
+                        whatsapp_transport.send_message(to_phone=str(client_id), text=reply, from_jid=from_jid)
+                        await _persist_bot_reply_whatsapp(db, str(client_id), str(user_id), reply)
+                    else:
+                        email_transport.send_email_as(
+                            from_email=str(user_id), to_email=str(client_id), subject="Re: Contacto", body=reply
+                        )
+                        await _persist_bot_reply_email(db, str(client_id), str(user_id), "Re: Contacto", reply)
+                    
+                    await fsm.on_ai_done(channel, str(client_id), str(user_id))
+                    return
+                
+                # 3. GREETING, ORDER_INTENT y CLOSURE continúan hacia el LLM normalmente
                 rag_candidates = {}
+                
                 if intent != "CLOSURE" and search_queries and isinstance(search_queries, list) and len(search_queries) > 0:
                     logger.info(f"[AI_FLOW] Searching for: {search_queries}")
                     rag_candidates = await _build_rag_candidates(search_queries, top_k=3)
