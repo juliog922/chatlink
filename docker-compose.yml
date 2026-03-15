@@ -87,8 +87,6 @@ services:
         condition: service_healthy
       cudara:
         condition: service_healthy
-      model_puller:
-        condition: service_completed_successfully
       qdrant:
         condition: service_healthy
     healthcheck:
