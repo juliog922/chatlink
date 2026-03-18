@@ -841,7 +841,12 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 current_summary = summary_state.get("summary") or {}
                 previous_status = current_summary.get("order_status", "IDLE")
 
-                new_msgs = [h.message or "" for h in history if h.id > last_seen_id]
+                new_msgs = []
+                for h in history:
+                    if h.id > last_seen_id:
+                        sender = "Asistente" if h.is_bot else ("Comercial" if h.direction == "sent" else "Cliente")
+                        msg_clean = (h.message or "").replace("\n", " ").strip()
+                        new_msgs.append(f"{sender}: {msg_clean}")
                 
                 updated_summary = await summarize_update_async(current_summary, new_msgs) if new_msgs else current_summary
                 set_summary_state(client_id, updated_summary, _last_seen_id=last_id)
