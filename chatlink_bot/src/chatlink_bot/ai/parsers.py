@@ -32,9 +32,8 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
     try:
         resp = client.vision(
             model=VISION_MODEL,
-            prompt="Extract all text.",
+            prompt="Extrae todo el texto de esta imagen. Si no hay texto, descríbeme lo que ves.",
             image_bytes=image_bytes,
-            #options=GenerationOptions(temperature=0.0, max_tokens=800),
         )
         return (resp.content or "").strip()
     except CudaraError as e:

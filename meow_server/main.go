@@ -316,10 +316,12 @@ func (s *WhatsAppServer) handleWhatsAppEvent(client *whatsmeow.Client, evt inter
 	}
 
 	// --- 3. Media Handling ---
+	// --- 3. Media Handling ---
 	img := msgEvt.Message.GetImageMessage()
 	doc := msgEvt.Message.GetDocumentMessage()
+	audio := msgEvt.Message.GetAudioMessage() // NUEVO
 
-	if img != nil || doc != nil {
+	if img != nil || doc != nil || audio != nil {
 		var downloadable whatsmeow.DownloadableMessage
 		var fname string
 
@@ -327,6 +329,10 @@ func (s *WhatsAppServer) handleWhatsAppEvent(client *whatsmeow.Client, evt inter
 			fname = fmt.Sprintf("%s.jpg", msgEvt.Info.ID)
 			downloadable = img
 			pbEvent.Text = "[Image] " + img.GetCaption()
+		} else if audio != nil {
+			fname = fmt.Sprintf("%s.ogg", msgEvt.Info.ID)
+			downloadable = audio
+			pbEvent.Text = "[Audio]"
 		} else {
 			fname = doc.GetFileName()
 			if fname == "" {

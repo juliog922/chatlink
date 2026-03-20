@@ -527,8 +527,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             await db.commit()
 
         # Parse Media
-        content_type = getattr(msg, "content_type", "") or ""
-        inferred = _infer_input_type(filename, content_type)
+        inferred = _infer_input_type(filename, "")
         extracted = ""
         if binary:
             try:

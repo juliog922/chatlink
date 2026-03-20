@@ -63,10 +63,23 @@ def _seconds_until_next_daily(hour: int, minute: int) -> float:
 async def _startup_ingest_products() -> None:
     for attempt in range(3):
         try:
-            total = await qdrant_service.ingest_products_from_sqlserver()
-            root_logger.info(f"Startup ingestion done. Upserted: {total}")
-            await rag_service.initialize()
-            break  # Success! Exit the loop.
+            # 1. Asegurar que la colección existe (se inicializa si no)
+            await qdrant_service.ensure_ready()
+            
+            # 2. Comprobar si ya hay productos
+            count = await qdrant_service.get_collection_count()
+            
+            if count > 0:
+                root_logger.info(f"Startup ingestion skipped: Qdrant already contains {count} products.")
+                await rag_service.initialize()
+                break # Success, we can exit the loop
+            else:
+                root_logger.info("Qdrant collection is empty. Starting initial ingestion...")
+                total = await qdrant_service.ingest_products_from_sqlserver()
+                root_logger.info(f"Startup ingestion done. Upserted: {total}")
+                await rag_service.initialize()
+                break  # Success! Exit the loop.
+                
         except Exception as e:
             if attempt < 2:
                 root_logger.warning(f"Startup ingestion failed, retrying in 5s... ({e})")

@@ -133,6 +133,19 @@ class QdrantService:
             except Exception as e:
                 logger.error(f"Critical: Qdrant unavailable: {e}")
                 return False
+    
+    async def get_collection_count(self) -> int:
+        """
+        Retorna el número de puntos (productos) actualmente en la colección.
+        """
+        if not await self.ensure_ready():
+            return 0
+        try:
+            res = await self.client.count(collection_name=self.collection)
+            return int(res.count)
+        except Exception as e:
+            logger.warning(f"Failed to get collection count: {e}")
+            return 0
 
     @staticmethod
     def _build_product_text(a: MSArticle) -> str:
