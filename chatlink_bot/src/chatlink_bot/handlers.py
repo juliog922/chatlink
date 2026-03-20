@@ -469,7 +469,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             logger.info(f"[MSG_FLOW] WA OUTGOING (Internal {user_from.email} -> External {to_phone})")
 
         # Check Admin Command (If the sender is an admin)
-        if internal_user.role == "admin":
+        if internal_user and internal_user.role == "admin":
             m = ADMIN_CMD_RE.match(text_msg or "")
             if m:
                 cmd = m.group(1).lower()
@@ -527,7 +527,8 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             await db.commit()
 
         # Parse Media
-        inferred = _infer_input_type(filename, "")
+        content_type = getattr(msg, "content_type", "") or ""
+        inferred = _infer_input_type(filename, content_type)
         extracted = ""
         if binary:
             try:
@@ -537,12 +538,25 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                     extracted = await transcribe_audio_bytes_async(binary, filename or "audio.wav")
                 else:
                     extracted = await extract_text_from_document_bytes_async(binary, filename or "file.bin")
+
+                if extracted:
+                    logger.info(f"[MEDIA_PARSE] Extracted Text ({inferred.value}):\n{extracted}")
+                else:
+                    logger.warning(f"[MEDIA_PARSE] Cudara do not return text ({inferred.value})")
+                # -----------------------------------------------
+                
             except Exception as e:
                 logger.warning(f"Media parsing failed: {e}")
 
         final_text = text_msg
         if extracted:
-            final_text = (final_text + "\n\n" if final_text else "") + f"[EXTRACTED]\n{extracted}"
+            # Creamos un prefijo ultracorto y claro para el LLM
+            prefix = {
+                InputType.IMAGE: "[Texto en Imagen]:",
+                InputType.AUDIO: "[Audio transcrito]:",
+            }.get(inferred, "[Documento]:")
+            
+            final_text = (final_text + "\n" if final_text else "") + f"{prefix} {extracted}"
 
         # --- DEDUPLICATION & ECHO PREVENTION ---
         if not is_simulation:
