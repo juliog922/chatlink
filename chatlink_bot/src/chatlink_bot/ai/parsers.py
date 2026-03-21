@@ -54,7 +54,14 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as f:
             f.write(audio_bytes)
             f.flush()
-            resp = client.transcribe(model=ASR_MODEL, audio_path=f.name)
+            resp = client.transcribe(
+                model=ASR_MODEL, 
+                audio_path=f.name,
+                generate_kwargs={
+                    "condition_on_prev_tokens": False,
+                    "max_new_tokens": 128
+                }
+            )
             return (resp.text or "").strip()
     except CudaraError as e:
         logger.error(f"Audio transcription failed: {e}")
