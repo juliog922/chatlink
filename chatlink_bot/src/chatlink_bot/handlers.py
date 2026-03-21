@@ -113,7 +113,7 @@ async def _get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
     return res.scalars().first()
 
 
-def _infer_input_type(filename: str, content_type: str = "") -> InputType:
+def _infer_input_type(filename: str, content_type: str = "", data: bytes = b"") -> InputType:
     fn = (filename or "").lower()
     ct = (content_type or "").lower()
 
@@ -129,6 +129,19 @@ def _infer_input_type(filename: str, content_type: str = "") -> InputType:
         return InputType.DOCX
     if fn.endswith((".txt", ".csv", ".md", ".json")):
         return InputType.TEXT
+        
+    # --- THE FIX: Fallback to Magic Bytes for media without extensions ---
+    if data:
+        # Check for JPEG (\xff\xd8\xff), PNG (\x89PNG), or WEBP (RIFF...WEBP)
+        if data.startswith(b'\xff\xd8\xff') or data.startswith(b'\x89PNG\r\n\x1a\n') or (data.startswith(b'RIFF') and data[8:12] == b'WEBP'):
+            return InputType.IMAGE
+        # Check for WhatsApp Audio OGG/Opus (OggS) or MP3 (ID3 or \xff\xfb)
+        if data.startswith(b'OggS') or data.startswith(b'ID3') or data.startswith(b'\xff\xfb'):
+            return InputType.AUDIO
+        # Check for PDF (%PDF)
+        if data.startswith(b'%PDF'):
+            return InputType.PDF
+
     return InputType.TEXT
 
 
@@ -527,7 +540,7 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             await db.commit()
 
         # Parse Media
-        inferred = _infer_input_type(filename, "")
+        inferred = _infer_input_type(filename, "", binary)
         extracted = ""
         if binary:
             try:
@@ -682,7 +695,7 @@ async def handle_new_email(payload: Dict[str, Any]) -> None:
             if not data:
                 continue
 
-            it = _infer_input_type(fn, ct)
+            it = _infer_input_type(fn, ct, data)
             input_type = it if it != InputType.TEXT else input_type
 
             try:
