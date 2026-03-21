@@ -54,11 +54,16 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as f:
             f.write(audio_bytes)
             f.flush()
+            
+            # The Ultimate Whisper Loop Breaker
             resp = client.transcribe(
                 model=ASR_MODEL, 
                 audio_path=f.name,
+                # Force the model to NEVER repeat the same 3 words, and penalize repetition heavily:
                 generate_kwargs={
                     "condition_on_prev_tokens": False,
+                    "no_repeat_ngram_size": 3,
+                    "repetition_penalty": 1.2,
                     "max_new_tokens": 128
                 }
             )
