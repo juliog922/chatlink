@@ -129,29 +129,15 @@ async def _ensure_simulation_actors():
         
         await db.commit()
 
-async def _check_and_pull_model(client: CudaraClient, model: str) -> None:
-    """Helper function to process a single model."""
-    root_logger.info(f">>> Checking model: {model}")
-    error_backoff = 5 
-    
-    while True:
-        try:
-            # tags() returns a dict, extract the model names
-            tags_info = await asyncio.to_thread(client.tags)
-            ready_models = [m.get("name") for m in tags_info.get("models", [])]
-
-            if model in ready_models:
-                root_logger.info(f"[OK] Model {model} is ready.")
-                break
-            
-            # If missing, trigger a blocking pull
-            root_logger.info(f"[DOWNLOADING] Triggering pull for {model}. This may take a while...")
-            await asyncio.to_thread(client.pull, model, stream=False)
-
-        except Exception as e:
-            root_logger.warning(f"[Cudara] Retrying in {error_backoff}s for {model}... ({e})")
-            await asyncio.sleep(error_backoff)
-            error_backoff = min(error_backoff * 2, 30)
+async def _trigger_pull(client: CudaraClient, model: str) -> None:
+    """Fires a pull request and gracefully handles the expected local HTTP timeout."""
+    try:
+        root_logger.info(f"[DOWNLOADING] Sending pull request for {model}...")
+        # stream=False means it blocks until finished, but since our client has a short timeout,
+        # it will throw a ReadTimeout locally while the server keeps downloading in the background.
+        await asyncio.to_thread(client.pull, model, stream=False)
+    except Exception as e:
+        root_logger.debug(f"Pull request for {model} disconnected locally (expected if downloading): {e}")
 
 async def _ensure_models_ready() -> None:
     cudara_models_env = os.getenv("CUDARA_DEFAULT_MODELS", "")
@@ -159,20 +145,39 @@ async def _ensure_models_ready() -> None:
         root_logger.warning("CUDARA_DEFAULT_MODELS not set. Skipping model puller.")
         return
 
-    models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
+    target_models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
     cudara_url = os.getenv("CUDARA_URL", "http://cudara:8000")
     
-    # Standard 10s timeout is fine here, because we handle the timeout gracefully now
-    client = CudaraClient(base_url=cudara_url, timeout=10.0)
-    root_logger.info(f"Starting Concurrent Model Puller for: {models}")
+    # Short timeout (5s) so we don't hang waiting for the massive download to finish on the HTTP connection
+    client = CudaraClient(base_url=cudara_url, timeout=5.0)
+    root_logger.info(f"Starting Batch Model Puller for: {target_models}")
 
-    # Create a parallel task for every model
-    tasks = [_check_and_pull_model(client, model) for model in models]
-    
-    # Execute all tasks at once and wait for them all to complete
-    await asyncio.gather(*tasks)
+    while True:
+        # 1. Check current models on the server
+        try:
+            tags_info = await asyncio.to_thread(client.tags)
+            ready_models = [m.get("name") for m in tags_info.get("models", [])]
+        except Exception as e:
+            root_logger.warning(f"[Cudara] Server unreachable/booting. Retrying tags in 10s... ({e})")
+            await asyncio.sleep(10)
+            continue
 
-    root_logger.info("SUCCESS: All models are downloaded and ready.")
+        # 2. Identify missing models
+        missing_models = [m for m in target_models if m not in ready_models]
+        
+        if not missing_models:
+            root_logger.info("SUCCESS: All required models are downloaded and ready.")
+            break
+
+        root_logger.info(f"Models missing and need pulling: {missing_models}")
+
+        # 3. Fire all pull requests at once (concurrently)
+        pull_tasks = [_trigger_pull(client, m) for m in missing_models]
+        await asyncio.gather(*pull_tasks, return_exceptions=True)
+
+        # 4. Wait exactly 5 minutes doing absolutely nothing
+        root_logger.info("Pull requests fired. Waiting exactly 5 minutes before checking again...")
+        await asyncio.sleep(300)
                 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
