@@ -129,6 +129,31 @@ async def _ensure_simulation_actors():
         
         await db.commit()
 
+async def _check_and_pull_model(client: CudaraClient, model: str) -> None:
+    """Helper function to process a single model."""
+    root_logger.info(f">>> Checking model: {model}")
+    error_backoff = 5 
+    
+    while True:
+        try:
+            # tags() returns a dict, extract the model names
+            tags_info = await asyncio.to_thread(client.tags)
+            ready_models = [m.get("name") for m in tags_info.get("models", [])]
+
+            if model in ready_models:
+                root_logger.info(f"[OK] Model {model} is ready.")
+                break
+            
+            # If missing, trigger a blocking pull
+            root_logger.info(f"[DOWNLOADING] Triggering pull for {model}. This may take a while...")
+            await asyncio.to_thread(client.pull, model, stream=False)
+
+        except Exception as e:
+            root_logger.warning(f"[Cudara] Retrying in {error_backoff}s for {model}... ({e})")
+            await asyncio.sleep(error_backoff)
+            error_backoff = min(error_backoff * 2, 30)
+
+
 async def _ensure_models_ready() -> None:
     cudara_models_env = os.getenv("CUDARA_DEFAULT_MODELS", "")
     if not cudara_models_env:
@@ -138,33 +163,16 @@ async def _ensure_models_ready() -> None:
     models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
     cudara_url = os.getenv("CUDARA_URL", "http://cudara:8000")
     
-    client = CudaraClient(base_url=cudara_url, timeout=10.0)
-    root_logger.info(f"Starting Sequential Model Puller for: {models}")
+    # Increased timeout to prevent the connection from dropping during large downloads
+    client = CudaraClient(base_url=cudara_url, timeout=300.0)
+    root_logger.info(f"Starting Concurrent Model Puller for: {models}")
 
-    for model in models:
-        root_logger.info(f">>> Checking model: {model}")
-        error_backoff = 5 
-        
-        while True:
-            try:
-                # tags() returns a dict, extract the model names
-                tags_info = await asyncio.to_thread(client.tags)
-                ready_models = [m.get("name") for m in tags_info.get("models", [])]
-
-                if model in ready_models:
-                    root_logger.info(f"[OK] Model {model} is ready.")
-                    error_backoff = 5
-                    break
-                
-                # If missing, trigger a blocking pull
-                root_logger.info(f"[DOWNLOADING] Triggering pull for {model}. This may take a while...")
-                await asyncio.to_thread(client.pull, model, stream=False)
-
-            except Exception as e:
-                root_logger.warning(f"[Cudara] Server unreachable/booting. Retrying in {error_backoff}s... ({e})")
-                await asyncio.sleep(error_backoff)
-                error_backoff = min(error_backoff * 2, 30)
+    # Create a parallel task for every model
+    tasks = [_check_and_pull_model(client, model) for model in models]
     
+    # Execute all tasks at once and wait for them all to complete
+    await asyncio.gather(*tasks)
+
     root_logger.info("SUCCESS: All models are downloaded and ready.")
                 
 @asynccontextmanager
