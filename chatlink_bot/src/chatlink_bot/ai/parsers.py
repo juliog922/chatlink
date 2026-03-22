@@ -7,7 +7,7 @@ import tempfile
 from io import BytesIO
 from typing import Optional
 
-from cudara_client import CudaraClient, CudaraError, GenerationOptions
+from cudara_client import CudaraClient
 
 logger = logging.getLogger("Parsers")
 
@@ -39,7 +39,7 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
             images=[b64_img],
         )
         return (resp.content or "").strip()
-    except CudaraError as e:
+    except Exception as e:
         logger.error(f"Vision OCR failed: {e}")
         return ""
 
@@ -65,7 +65,7 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
             )
             # Response text is now stored in .content
             return (resp.content or "").strip()
-    except CudaraError as e:
+    except Exception as e:
         logger.error(f"Audio transcription failed: {e}")
         return ""
 

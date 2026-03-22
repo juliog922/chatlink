@@ -69,11 +69,10 @@ class QdrantService:
         for i in range(max_retries):
             try:
                 resp = await asyncio.to_thread(self._cudara.embed, EMBED_MODEL, ["vector_size_probe"])
-                vec = []
-                if hasattr(resp, "embeddings") and resp.embeddings:
-                    vec = resp.embeddings[0]
-                elif hasattr(resp, "embedding") and resp.embedding:
-                    vec = resp.embedding
+                
+                # Safely extract from the dictionary instead of checking object attributes
+                embeddings = resp.get("embeddings", [])
+                vec = embeddings[0] if embeddings else []
                 
                 if vec:
                     return len(vec)

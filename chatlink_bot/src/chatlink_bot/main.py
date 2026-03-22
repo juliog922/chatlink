@@ -147,7 +147,7 @@ async def _ensure_models_ready() -> None:
         
         while True:
             try:
-                # tags() returns available, ready models
+                # tags() returns a dict, extract the model names
                 tags_info = await asyncio.to_thread(client.tags)
                 ready_models = [m.get("name") for m in tags_info.get("models", [])]
 

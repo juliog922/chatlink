@@ -7,7 +7,7 @@ import re
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from cudara_client import CudaraClient, CudaraError, Message
+from cudara_client import CudaraClient, Message
 
 logger = logging.getLogger("LLM")
 
@@ -286,7 +286,7 @@ def summarize_update(current_summary: Dict[str, Any], new_messages: List[str]) -
         )
         clean_content = _clean_think_tags(resp.content)
         return _extract_json(clean_content)
-    except (CudaraError, json.JSONDecodeError) as e:
+    except (Exception, json.JSONDecodeError) as e:
         logger.error(f"Summarizer failed: {e}")
         return current_summary
 
