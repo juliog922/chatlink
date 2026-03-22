@@ -153,7 +153,6 @@ async def _check_and_pull_model(client: CudaraClient, model: str) -> None:
             await asyncio.sleep(error_backoff)
             error_backoff = min(error_backoff * 2, 30)
 
-
 async def _ensure_models_ready() -> None:
     cudara_models_env = os.getenv("CUDARA_DEFAULT_MODELS", "")
     if not cudara_models_env:
@@ -163,8 +162,8 @@ async def _ensure_models_ready() -> None:
     models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
     cudara_url = os.getenv("CUDARA_URL", "http://cudara:8000")
     
-    # Increased timeout to prevent the connection from dropping during large downloads
-    client = CudaraClient(base_url=cudara_url, timeout=300.0)
+    # Standard 10s timeout is fine here, because we handle the timeout gracefully now
+    client = CudaraClient(base_url=cudara_url, timeout=10.0)
     root_logger.info(f"Starting Concurrent Model Puller for: {models}")
 
     # Create a parallel task for every model
