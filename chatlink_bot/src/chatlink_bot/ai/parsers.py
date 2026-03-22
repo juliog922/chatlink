@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import base64
 import tempfile
 from io import BytesIO
 from typing import Optional
@@ -30,10 +31,12 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
 
     client = _get_client()
     try:
-        resp = client.vision(
+        # Encode to base64 string for the new client payload
+        b64_img = base64.b64encode(image_bytes).decode('utf-8')
+        resp = client.generate(
             model=VISION_MODEL,
             prompt="Extrae todo el texto de esta imagen. Si no hay texto, descríbeme lo que ves.",
-            image_bytes=image_bytes,
+            images=[b64_img],
         )
         return (resp.content or "").strip()
     except CudaraError as e:
@@ -55,19 +58,13 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
             f.write(audio_bytes)
             f.flush()
             
-            # The Ultimate Whisper Loop Breaker
+            # Removed generate_kwargs; the new client handles ASR options natively
             resp = client.transcribe(
                 model=ASR_MODEL, 
-                audio_path=f.name,
-                # Force the model to NEVER repeat the same 3 words, and penalize repetition heavily:
-                generate_kwargs={
-                    "condition_on_prev_tokens": False,
-                    "no_repeat_ngram_size": 3,
-                    "repetition_penalty": 1.2,
-                    "max_new_tokens": 128
-                }
+                audio_path=f.name
             )
-            return (resp.text or "").strip()
+            # Response text is now stored in .content
+            return (resp.content or "").strip()
     except CudaraError as e:
         logger.error(f"Audio transcription failed: {e}")
         return ""

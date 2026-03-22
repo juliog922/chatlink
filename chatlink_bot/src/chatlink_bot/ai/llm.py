@@ -33,7 +33,7 @@ async def health_check() -> Dict[str, Any]:
     """
     Checks if Cudara service is reachable via its /health endpoint.
     """
-    url = f"{CUDARA_URL}/health"
+    url = f"{CUDARA_URL}/api/version" # Updated endpoint
     try:
         def _fetch():
             with urllib.request.urlopen(url, timeout=3) as resp:

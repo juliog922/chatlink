@@ -143,37 +143,24 @@ async def _ensure_models_ready() -> None:
 
     for model in models:
         root_logger.info(f">>> Checking model: {model}")
-        
-        # Connection retry backoff (starts at 5s, caps at 30s)
         error_backoff = 5 
         
         while True:
             try:
-                # 1. Fetch status in a background thread (consumes 0 CPU while waiting for HTTP)
-                models_info = await asyncio.to_thread(client.list_models)
-                model_state = next((m for m in models_info if m.name == model), None)
-                status = model_state.status if model_state else "not_found"
+                # tags() returns available, ready models
+                tags_info = await asyncio.to_thread(client.tags)
+                ready_models = [m.get("name") for m in tags_info.get("models", [])]
 
-                if status == "ready":
+                if model in ready_models:
                     root_logger.info(f"[OK] Model {model} is ready.")
-                    error_backoff = 5  # Reset backoff for the next model
+                    error_backoff = 5
                     break
                 
-                elif status == "downloading":
-                    # Downloading takes a long time. Sleep for 15 seconds to save network/CPU.
-                    root_logger.info(f"[WAIT] Model {model} is downloading. Sleeping for 15s...")
-                    await asyncio.sleep(15)
-                    continue
-                
-                # 2. If missing, trigger the pull
-                root_logger.info(f"[DOWNLOADING] Triggering pull for {model}...")
-                await asyncio.to_thread(client.pull, model)
-                
-                # Give the server 5 seconds to register the download state before checking again
-                await asyncio.sleep(5)
+                # If missing, trigger a blocking pull
+                root_logger.info(f"[DOWNLOADING] Triggering pull for {model}. This may take a while...")
+                await asyncio.to_thread(client.pull, model, stream=False)
 
             except Exception as e:
-                # If Cudara is completely down/booting, wait longer each time (5s, 10s, 20s...)
                 root_logger.warning(f"[Cudara] Server unreachable/booting. Retrying in {error_backoff}s... ({e})")
                 await asyncio.sleep(error_backoff)
                 error_backoff = min(error_backoff * 2, 30)

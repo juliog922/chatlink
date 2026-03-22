@@ -161,13 +161,9 @@ class QdrantService:
         return "\n".join(p.strip() for p in parts if p and p.strip())
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        resp = await asyncio.to_thread(self._cudara.embed, EMBED_MODEL, texts)
-        if hasattr(resp, "embeddings") and resp.embeddings:
-            return resp.embeddings
-        # fallback shape
-        if hasattr(resp, "embedding") and resp.embedding:
-            return [resp.embedding]
-        return []
+        resp = await asyncio.to_thread(self._cudara.embed, model=EMBED_MODEL, input=texts)
+        # It's now a dictionary
+        return resp.get("embeddings", [])
     
     @staticmethod
     def _to_point_id(codigo_empresa: Any, codigo_articulo: Any) -> int | str:

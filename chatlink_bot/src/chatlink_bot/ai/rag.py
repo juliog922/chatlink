@@ -143,22 +143,17 @@ class HybridRetriever:
         return final
 
     async def _embed_query(self, query: str) -> List[float]:
-        resp = await asyncio.to_thread(self._cudara.embed, EMBED_MODEL, [query])
-        if hasattr(resp, "embeddings") and resp.embeddings:
-            return resp.embeddings[0]
-        if hasattr(resp, "embedding") and resp.embedding:
-            return resp.embedding
-        return []
+        resp = await asyncio.to_thread(self._cudara.embed, model=EMBED_MODEL, input=[query])
+        embeddings = resp.get("embeddings", [])
+        return embeddings[0] if embeddings else []
 
     async def _rerank_scores(self, query: str, doc_ids: List[str]) -> Tuple[List[str], List[float]]:
-        """
-        Obtiene scores del modelo Reranker (Cudara).
-        """
         if not RERANK_MODEL or not doc_ids:
             return ([], [])
 
-        packed: List[str] = []
-        kept_ids: List[str] = []
+        # Start the input list with the query
+        input_list = [query]
+        kept_ids = []
 
         for did in doc_ids:
             doc = self.documents_map.get(did)
@@ -169,37 +164,30 @@ class HybridRetriever:
                 continue
             if RAG_RERANK_MAX_CHARS > 0 and len(text) > RAG_RERANK_MAX_CHARS:
                 text = text[:RAG_RERANK_MAX_CHARS].rstrip() + "…"
-            packed.append(f"{query}{PAIR_SEP}{text}")
+                
+            input_list.append(text)
             kept_ids.append(did)
 
-        if not packed:
+        if len(input_list) <= 1:
             return ([], [])
 
-        # Llamada a Cudara (endpoint embeddings actuando como reranker)
+        # Trigger native reranking by using options={"is_rerank": True}
         resp = await asyncio.to_thread(
             self._cudara.embed,
-            RERANK_MODEL,
-            packed,
-            pair_sep=PAIR_SEP,
-            max_length=RAG_RERANK_MAX_LENGTH,
+            model=RERANK_MODEL,
+            input=input_list,
+            options={"is_rerank": True}
         )
 
-        vecs: List[List[float]] = []
-        if hasattr(resp, "embeddings") and resp.embeddings:
-            vecs = resp.embeddings
-        elif hasattr(resp, "embedding") and resp.embedding:
-            vecs = [resp.embedding]
+        # The API returns a 'scores' array natively
+        scores = resp.get("scores", [])
+        
+        # Make sure we map safely
+        final_scores = []
+        for i in range(len(kept_ids)):
+            final_scores.append(float(scores[i]) if i < len(scores) else 0.0)
 
-        scores: List[float] = []
-        for v in vecs[: len(kept_ids)]:
-            if not v:
-                scores.append(0.0)
-            else:
-                # El modelo retorna 1D vector [score]
-                scores.append(float(v[0]))
-
-        # Ordenar descendente por score
-        combined = sorted(zip(kept_ids, scores), key=lambda x: x[1], reverse=True)
+        combined = sorted(zip(kept_ids, final_scores), key=lambda x: x[1], reverse=True)
         return ([x[0] for x in combined], [x[1] for x in combined])
 
     async def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
