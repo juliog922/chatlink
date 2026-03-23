@@ -6,7 +6,6 @@ import base64
 import tempfile
 from io import BytesIO
 from typing import Optional
-from PIL import Image
 
 from cudara_client import CudaraClient, Message
 
@@ -24,34 +23,16 @@ def _get_client() -> CudaraClient:
     if _client is None:
         _client = CudaraClient(CUDARA_URL)
     return _client
-
-def _resize_image(image_bytes: bytes, max_dim: int = 1024) -> bytes:
-    """Resizes large images to prevent VRAM overflow and FP16 NaN errors."""
-    try:
-        with Image.open(BytesIO(image_bytes)) as img:
-            # Convert to RGB to avoid issues with transparency or palettes when saving as JPEG
-            if img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
-            
-            # thumbnail scales down the image while maintaining aspect ratio
-            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-            
-            out = BytesIO()
-            img.save(out, format="JPEG", quality=85)
-            return out.getvalue()
-    except Exception as e:
-        logger.warning(f"Image resize failed, falling back to original: {e}")
-        return image_bytes
     
 def extract_text_from_image_bytes(image_bytes: bytes) -> str:
+    """Sends raw image bytes directly to Cudara, avoiding PIL double-compression artifacts."""
     if not image_bytes:
         return ""
 
     client = _get_client()
     try:
-        # Resize the image before Base64 encoding
-        optimized_bytes = _resize_image(image_bytes, max_dim=1024)
-        b64_img = base64.b64encode(optimized_bytes).decode('utf-8')
+        # Encode raw bytes directly; server handles dynamic pixel capping
+        b64_img = base64.b64encode(image_bytes).decode('utf-8')
         
         resp = client.chat(
             model=VISION_MODEL,
