@@ -107,6 +107,7 @@ services:
       - .env
     volumes:
       - cudara_models:/app/models
+      - cudara_registry:/app/registry.json
     deploy:
       resources:
         reservations:
@@ -126,6 +127,7 @@ services:
 volumes:
   postgres_data:
   cudara_models:
+  cudara_registry:
   qdrant_data:
 
 networks:

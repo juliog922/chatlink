@@ -7,7 +7,7 @@ import tempfile
 from io import BytesIO
 from typing import Optional
 
-from cudara_client import CudaraClient
+from cudara_client import CudaraClient, Message
 
 logger = logging.getLogger("Parsers")
 
@@ -33,10 +33,17 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
     try:
         # Encode to base64 string for the new client payload
         b64_img = base64.b64encode(image_bytes).decode('utf-8')
-        resp = client.generate(
+        
+        # CHANGED: Use .chat() instead of .generate() and pass a Message object
+        resp = client.chat(
             model=VISION_MODEL,
-            prompt="Extrae todo el texto de esta imagen. Si no hay texto, descríbeme lo que ves.",
-            images=[b64_img],
+            messages=[
+                Message(
+                    role="user",
+                    content="Extrae todo el texto de esta imagen. Si no hay texto, descríbeme lo que ves.",
+                    images=[b64_img]
+                )
+            ]
         )
         return (resp.content or "").strip()
     except Exception as e:
