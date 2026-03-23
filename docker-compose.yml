@@ -107,7 +107,6 @@ services:
       - .env
     volumes:
       - models_data:/app/models
-      - registry_data:/app/registry.json
     deploy:
       resources:
         reservations:
@@ -127,7 +126,6 @@ services:
 volumes:
   postgres_data:
   models_data:
-  registry_data:
   qdrant_data:
 
 networks:
