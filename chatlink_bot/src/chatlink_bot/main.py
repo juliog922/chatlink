@@ -25,6 +25,7 @@ from .api.simulation import router as sim_router
 
 from .ai.qdrant import qdrant_service
 from .ai.rag import rag_service
+from .logic.fsm import fsm
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = "app.log"
@@ -197,6 +198,8 @@ async def lifespan(app: FastAPI):
     whatsapp_transport.start()
     email_transport.start()
 
+    fsm.start_cleanup_loop()
+
     # 4) Optional DB sanity checks
     try:
         async with sql_engine.connect() as conn:
@@ -217,6 +220,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     whatsapp_transport.stop()
     email_transport.stop()
+
+    fsm.stop_cleanup_loop()
 
     try:
         app.state.stop_daily_ingest.set()
