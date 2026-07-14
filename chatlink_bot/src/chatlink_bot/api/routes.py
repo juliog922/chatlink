@@ -60,6 +60,10 @@ class ChatResponse(BaseModel):
     client: str
     message: Optional[str]
     direction: str
+    # Without these the UI cannot distinguish the bot's replies from the
+    # salesman's manual messages (they were stored but never serialized).
+    is_bot: bool = False
+    input_type: Optional[str] = None
     timestamp: datetime
 
     class Config:
@@ -118,7 +122,8 @@ async def health_check():
         status = "degraded"
 
     c_health = await llm.health_check()
-    details["cudara"] = c_health
+    details["cima"] = c_health
+    details["cudara"] = c_health  # legacy alias; remove once nothing reads it
     if c_health.get("status") != "ok":
         status = "degraded"
 

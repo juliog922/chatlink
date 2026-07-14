@@ -1,10 +1,14 @@
 # chatlink_bot/src/chatlink_bot/models.py
 from enum import Enum as PyEnum
-from sqlalchemy import Column, Integer, String, Enum, DateTime, Boolean, Text, Numeric, SmallInteger
-from sqlalchemy.sql import func
-from pydantic import BaseModel, EmailStr
 
-from .database import PGBase, MSBase
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import (
+    JSON, Boolean, Column, DateTime, Enum, Integer, Numeric, SmallInteger,
+    String, Text, UniqueConstraint,
+)
+from sqlalchemy.sql import func
+
+from .database import MSBase, PGBase
 
 
 # --- Enums ---
@@ -34,13 +38,8 @@ class User(PGBase):
     email = Column(String, unique=True, index=True, nullable=False)
     phone = Column(String, nullable=False)
     role = Column(Enum(UserRole), default=UserRole.USER)
-
-    # NEW: “turning on that user for the bot app”
-    enabled = Column(Boolean, default=False)
-
-    # NEW: store device jid for safe delete-device on logout
-    wa_device_jid = Column(String, nullable=True)
-
+    enabled = Column(Boolean, default=False)          # bot service on/off for this salesman
+    wa_device_jid = Column(String, nullable=True)     # for safe delete-device on logout
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -53,11 +52,11 @@ class Chat(PGBase):
     __tablename__ = "chats"
 
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(String, index=True, nullable=False)  # Client Phone
-    user = Column(String, nullable=False)                 # Salesman Phone
-    client = Column(String, nullable=False)               # Client Phone
+    chat_id = Column(String, index=True, nullable=False)  # Client phone
+    user = Column(String, nullable=False)                 # Salesman phone
+    client = Column(String, nullable=False)               # Client phone
     message = Column(Text, nullable=True)
-    direction = Column(String, nullable=False)            # sent/received
+    direction = Column(String, nullable=False)            # sent | received
     input_type = Column(Enum(InputType), default=InputType.TEXT, nullable=False)
     is_bot = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), nullable=False)
@@ -68,15 +67,55 @@ class EmailChat(PGBase):
     __tablename__ = "email_chats"
 
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(String, index=True, nullable=False)  # Client Email
-    user = Column(String, nullable=False)                 # Salesman Email
-    client = Column(String, nullable=False)               # Client Email
+    chat_id = Column(String, index=True, nullable=False)  # Client email
+    user = Column(String, nullable=False)                 # Salesman email
+    client = Column(String, nullable=False)               # Client email
     message = Column(Text, nullable=True)
     direction = Column(String, nullable=False)
     input_type = Column(Enum(InputType), default=InputType.TEXT, nullable=False)
     is_bot = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ConversationSession(PGBase):
+    """
+    Persistent per-conversation state, keyed by (channel, client, salesman).
+
+    Replaces the old in-memory `_state` dict in ai/llm.py (keyed by client
+    only, lost on restart). It is the deterministic home for the conversation
+    LIFECYCLE, which the LLM must obey but never decide:
+
+      conv_open          False = the conversation ENDED (order dispatched, or
+                         the client went silent past BOT_SESSION_GAP_HOURS).
+                         The next COMMERCIAL intent starts a new conversation
+                         (fresh cart + self-introduction); pleasantries alone
+                         keep it ended. Set back to True only by real order
+                         activity.
+      bot_enabled        Hard opt-out: bot never replies here when False.
+      bot_introduced_at  When Kapa last introduced itself (None = never).
+      last_closed_cart   Recap of the last DISPATCHED order — context for
+                         "ponme lo mismo que la última vez" and grounding for
+                         repeat-order add_item calls.
+    """
+    __tablename__ = "conversation_sessions"
+    __table_args__ = (UniqueConstraint("channel", "client_id", "user_id"),)
+
+    id = Column(Integer, primary_key=True)
+    channel = Column(String, nullable=False)              # whatsapp | email
+    client_id = Column(String, index=True, nullable=False)
+    user_id = Column(String, nullable=False)              # salesman phone/email
+
+    order_status = Column(String, default="IDLE")         # IDLE | BUILDING | CLOSED
+    cart = Column(JSON, default=list)                     # [{"code": str, "qty": int}]
+    summary = Column(Text, default="")                    # rolling context note
+    last_closed_cart = Column(JSON, default=list)         # last dispatched order
+
+    conv_open = Column(Boolean, default=False)
+    bot_enabled = Column(Boolean, default=True)
+    bot_introduced_at = Column(DateTime(timezone=True), nullable=True)
+    last_client_msg_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 # --- SQL Server Tables (Read-only mapping) ---

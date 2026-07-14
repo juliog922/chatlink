@@ -1,402 +1,546 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ChatLink Console</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <style>
-        [v-cloak] { display: none; }
-        .log-line { font-family: 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.4; }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #1e293b; }
-        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChatLink Console</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: { extend: {
+    colors: {
+      ink:    { 950:'#0B1017', 900:'#0F1620', 800:'#141D29', 700:'#1D2938', 600:'#2A3A4E' },
+      line:   '#223146',
+      paper:  '#D9E1EA',
+      dim:    '#7C8CA0',
+      kapa:   { DEFAULT:'#2DD4BF', dim:'#134E48', ink:'#052E2B' },   // the assistant's color
+      sales:  '#60A5FA',
+      warn:   '#FBBF24',
+      bad:    '#F87171',
+    },
+    fontFamily: {
+      sans: ['"IBM Plex Sans"','system-ui','sans-serif'],
+      mono: ['"IBM Plex Mono"','ui-monospace','monospace'],
+    },
+  }},
+};
+</script>
+<style>
+  [v-cloak]{display:none}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:#0F1620}
+  ::-webkit-scrollbar-thumb{background:#2A3A4E;border-radius:4px}
+  ::-webkit-scrollbar-thumb:hover{background:#3B5068}
+  .bubble{max-width:min(85%,42rem)}
+  @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
 </head>
-<body class="bg-slate-900 text-slate-200 h-screen w-screen overflow-hidden font-sans">
-    <div id="app" v-cloak class="flex h-full">
+<body class="bg-ink-950 text-paper h-screen w-screen overflow-hidden font-sans antialiased">
+<div id="app" v-cloak class="flex h-full">
 
-        <div v-if="!isAuthenticated" class="flex-1 flex items-center justify-center bg-slate-900">
-            <div class="bg-slate-800 p-8 rounded-xl border border-slate-700 shadow-2xl w-96 relative overflow-hidden">
-                <div class="absolute right-0 top-0 p-4 opacity-5"><i class="fas fa-robot text-8xl"></i></div>
-                <div class="flex flex-col items-center mb-6">
-                    <div class="w-12 h-12 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl mb-3 shadow-lg"><i class="fas fa-robot"></i></div>
-                    <h2 class="text-2xl font-bold text-white tracking-wide">ChatLink Pro</h2>
-                    <span class="text-xs text-slate-400">Restricted Access</span>
+  <!-- ============================================================ Login -->
+  <div v-if="!isAuthenticated" class="flex-1 flex items-center justify-center">
+    <div class="bg-ink-900 p-8 rounded-2xl border border-line w-96">
+      <div class="flex items-center gap-3 mb-6">
+        <div class="w-10 h-10 rounded-xl bg-kapa-dim text-kapa flex items-center justify-center text-lg font-bold font-mono">K</div>
+        <div>
+          <h2 class="text-xl font-bold leading-none">ChatLink Console</h2>
+          <span class="text-xs text-dim font-mono">Kapa · order assistant ops</span>
+        </div>
+      </div>
+      <div v-if="loginError" class="bg-bad/10 border border-bad/40 text-bad px-3 py-2 rounded-lg text-sm mb-4">
+        <i class="fas fa-exclamation-triangle mr-1"></i> {{ loginError }}
+      </div>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-dim uppercase tracking-wider mb-1">Username</label>
+          <input v-model="loginUsername" type="text" class="w-full bg-ink-950 border border-line rounded-lg px-4 py-3 text-sm focus:border-kapa outline-none" @keyup.enter="performLogin">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-dim uppercase tracking-wider mb-1">Password</label>
+          <input v-model="loginPassword" type="password" class="w-full bg-ink-950 border border-line rounded-lg px-4 py-3 text-sm focus:border-kapa outline-none" @keyup.enter="performLogin">
+        </div>
+        <button @click="performLogin" class="w-full bg-kapa text-kapa-ink font-bold py-3 rounded-lg hover:brightness-110 transition active:scale-[.98]">
+          Sign in
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <template v-else>
+    <!-- ========================================================= Sidebar -->
+    <aside class="w-60 bg-ink-900 flex flex-col border-r border-line">
+      <div class="p-5 flex items-center gap-3 border-b border-line">
+        <div class="w-9 h-9 rounded-lg bg-kapa-dim text-kapa flex items-center justify-center font-bold font-mono">K</div>
+        <div>
+          <h1 class="font-bold leading-none">ChatLink</h1>
+          <span class="text-[11px] text-dim font-mono">v3.1 · Kapa</span>
+        </div>
+      </div>
+      <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
+        <a v-for="item in navItems" :key="item.id" @click="currentView = item.id"
+           :class="currentView === item.id ? 'bg-kapa-dim text-kapa' : 'text-dim hover:bg-ink-800 hover:text-paper'"
+           class="flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-colors text-sm font-medium">
+          <i :class="item.icon" class="w-5 text-center"></i>{{ item.label }}
+        </a>
+      </nav>
+      <div class="p-3 border-t border-line text-[11px] text-dim font-mono flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full" :class="allHealthy ? 'bg-kapa' : 'bg-warn'"></span>
+        {{ allHealthy ? 'all systems ok' : 'check dashboard' }}
+      </div>
+    </aside>
+
+    <!-- ============================================================ Main -->
+    <div class="flex-1 flex flex-col relative">
+      <header class="h-14 bg-ink-900/80 backdrop-blur border-b border-line flex items-center justify-between px-6">
+        <h2 class="font-bold tracking-wide">{{ pageTitle }}</h2>
+        <div class="flex items-center gap-3">
+          <span v-if="loading" class="text-kapa text-sm"><i class="fas fa-circle-notch fa-spin mr-2"></i>Working…</span>
+          <button @click="refreshAll" class="w-8 h-8 rounded-lg bg-ink-800 hover:bg-ink-700 flex items-center justify-center transition-colors" title="Refresh">
+            <i class="fas fa-rotate text-xs"></i>
+          </button>
+        </div>
+      </header>
+
+      <main class="flex-1 overflow-hidden">
+
+        <!-- Dashboard -->
+        <div v-if="currentView === 'dashboard'" class="p-6 h-full overflow-y-auto">
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div v-for="stat in statusCards" :key="stat.label" class="bg-ink-900 p-5 rounded-xl border border-line">
+              <div class="flex items-start justify-between">
+                <div>
+                  <div class="text-dim text-xs font-semibold uppercase tracking-wider mb-1">{{ stat.label }}</div>
+                  <div class="text-lg font-bold flex items-center gap-2" :class="stat.color">
+                    <i :class="stat.statusIcon" class="text-sm"></i>{{ stat.value }}
+                  </div>
                 </div>
-                
-                <div v-if="loginError" class="bg-red-900/50 border border-red-500/50 text-red-400 px-3 py-2 rounded text-sm mb-4 text-center">
-                    <i class="fas fa-exclamation-triangle mr-1"></i> {{ loginError }}
-                </div>
-                
-                <div class="space-y-4 relative z-10">
-                    <div>
-                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Username</label>
-                        <input v-model="loginUsername" type="text" placeholder="Enter username" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all" @keyup.enter="performLogin">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Password</label>
-                        <input v-model="loginPassword" type="password" placeholder="••••••••" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all" @keyup.enter="performLogin">
-                    </div>
-                    <button @click="performLogin" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-lg mt-2 shadow-lg shadow-blue-900/50 transition-all active:scale-95">
-                        <i class="fas fa-sign-in-alt mr-2"></i> Authenticate
-                    </button>
-                </div>
+                <i :class="stat.icon" class="text-2xl text-ink-600"></i>
+              </div>
+              <div class="text-xs text-dim mt-3 leading-relaxed">{{ stat.desc }}</div>
             </div>
+          </div>
         </div>
 
-        <template v-else>
-            <div class="w-64 bg-slate-800 flex flex-col border-r border-slate-700 shadow-2xl z-20">
-                <div class="p-5 flex items-center gap-3 border-b border-slate-700 bg-slate-900">
-                    <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center text-white font-bold"><i class="fas fa-robot"></i></div>
-                    <div>
-                        <h1 class="font-bold text-lg leading-none">ChatLink</h1>
-                        <span class="text-xs text-slate-500">v3.0.0 Pro</span>
-                    </div>
+        <!-- Users -->
+        <div v-if="currentView === 'users'" class="p-6 h-full flex flex-col">
+          <div class="flex justify-between mb-4">
+            <input v-model="userSearch" placeholder="Search name, email or phone…" class="bg-ink-900 border border-line rounded-lg px-4 py-2 text-sm w-72 focus:border-kapa outline-none">
+            <button @click="showAddUserModal=true" class="bg-kapa text-kapa-ink px-4 py-2 rounded-lg text-sm font-bold hover:brightness-110 transition">
+              <i class="fas fa-plus mr-2"></i>New user
+            </button>
+          </div>
+          <div class="flex-1 bg-ink-900 rounded-xl border border-line overflow-auto">
+            <table class="w-full text-sm text-left text-dim">
+              <thead class="text-xs uppercase bg-ink-950/60 text-dim sticky top-0">
+                <tr>
+                  <th class="px-6 py-3">User</th><th class="px-6 py-3">Role</th>
+                  <th class="px-6 py-3">Status</th><th class="px-6 py-3">Gmail</th>
+                  <th class="px-6 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="user in filteredUsers" :key="user.id" class="border-t border-line/60 hover:bg-ink-800/40">
+                  <td class="px-6 py-3">
+                    <div class="font-semibold text-paper">{{ user.name }}</div>
+                    <div class="text-xs font-mono">{{ user.email }} · {{ user.phone }}</div>
+                  </td>
+                  <td class="px-6 py-3">
+                    <span class="px-2 py-0.5 rounded text-[11px] uppercase font-bold border"
+                          :class="user.role==='admin' ? 'text-warn border-warn/40 bg-warn/10' : 'text-sales border-sales/40 bg-sales/10'">
+                      {{ user.role }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-3">
+                    <span class="inline-flex items-center gap-2">
+                      <span class="w-2 h-2 rounded-full" :class="user.enabled ? 'bg-kapa' : 'bg-ink-600'"></span>
+                      {{ user.enabled ? 'Active' : 'Disabled' }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-3">
+                    <span :class="user.has_gmail_password ? 'text-kapa' : 'text-dim'" class="text-xs">
+                      <i :class="user.has_gmail_password ? 'fas fa-key' : 'fas fa-minus'" class="mr-1"></i>{{ user.has_gmail_password ? 'Configured' : 'No password' }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-3 text-right space-x-1 whitespace-nowrap">
+                    <button @click="loginUser(user)" class="p-2 hover:text-kapa transition-colors" title="Link WhatsApp device"><i class="fas fa-link"></i></button>
+                    <button v-if="user.role === 'user'" @click="openPasswordModal(user)" class="p-2 hover:text-warn transition-colors" title="Set Gmail app password"><i class="fas fa-key"></i></button>
+                    <button @click="deleteUser(user.id)" class="p-2 hover:text-bad transition-colors" title="Delete user"><i class="fas fa-trash"></i></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Connections -->
+        <div v-if="currentView === 'connections'" class="p-6 h-full flex flex-col">
+          <div class="flex-1 bg-ink-900 rounded-xl border border-line overflow-auto">
+            <table class="w-full text-sm text-left text-dim">
+              <thead class="text-xs uppercase bg-ink-950/60 sticky top-0">
+                <tr><th class="px-6 py-3">Salesman</th><th class="px-6 py-3 text-center">WhatsApp device</th><th class="px-6 py-3 text-center">Mailbox polling</th></tr>
+              </thead>
+              <tbody>
+                <tr v-if="connections.length === 0"><td colspan="3" class="px-6 py-10 text-center text-dim italic">No users enabled yet. Link a device from User Management.</td></tr>
+                <tr v-for="conn in connections" :key="conn.user_id" class="border-t border-line/60 hover:bg-ink-800/40">
+                  <td class="px-6 py-3">
+                    <div class="font-semibold text-paper">{{ conn.name }}</div>
+                    <div class="text-xs font-mono">{{ conn.email }} · {{ conn.phone }}</div>
+                  </td>
+                  <td class="px-6 py-3 text-center">
+                    <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border"
+                          :class="conn.whatsapp_connected ? 'text-kapa border-kapa/40 bg-kapa/10' : 'text-dim border-line bg-ink-950'">
+                      <span class="w-1.5 h-1.5 rounded-full" :class="conn.whatsapp_connected ? 'bg-kapa' : 'bg-ink-600'"></span>
+                      {{ conn.whatsapp_connected ? 'Linked' : 'Not linked' }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-3 text-center">
+                    <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border"
+                          :class="conn.email_connected ? 'text-sales border-sales/40 bg-sales/10' : 'text-dim border-line bg-ink-950'">
+                      <span class="w-1.5 h-1.5 rounded-full" :class="conn.email_connected ? 'bg-sales' : 'bg-ink-600'"></span>
+                      {{ conn.email_connected ? 'Listening' : 'Inactive' }}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ====================================================== Simulator -->
+        <div v-if="currentView === 'simulator'" class="h-full flex flex-col md:flex-row md:divide-x divide-line">
+
+          <!-- Settings + conversation state -->
+          <div class="md:w-80 shrink-0 bg-ink-900/60 p-5 overflow-y-auto space-y-5">
+            <div>
+              <h3 class="text-[11px] font-bold uppercase text-dim tracking-widest mb-3">Scenario</h3>
+              <div class="space-y-3">
+                <div>
+                  <label class="block text-xs text-dim mb-1">Mode</label>
+                  <select v-model="sim.mode" class="w-full bg-ink-950 border border-line rounded-lg p-2 text-sm focus:border-kapa outline-none">
+                    <option value="logic">Logic — all fake, instant replies</option>
+                    <option value="channel">Channel — real phone/email as client</option>
+                  </select>
+                  <div class="text-[10px] text-dim mt-1 leading-snug">{{ modeHelp }}</div>
                 </div>
-
-                <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
-                    <template v-for="item in navItems" :key="item.id">
-                        <a @click="currentView = item.id" 
-                           :class="currentView === item.id ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-700 hover:text-white'"
-                           class="flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200 group">
-                            <i :class="item.icon" class="w-5 text-center group-hover:scale-110 transition-transform"></i>
-                            <span class="font-medium">{{ item.label }}</span>
-                        </a>
-                    </template>
-                </nav>
-            </div>
-
-            <div class="flex-1 flex flex-col bg-slate-900 relative">
-                <header class="h-16 bg-slate-800/80 backdrop-blur border-b border-slate-700 flex items-center justify-between px-6">
-                    <h2 class="text-xl font-bold text-white tracking-wide">{{ pageTitle }}</h2>
-                    <div class="flex items-center gap-4">
-                        <span v-if="loading" class="text-blue-400 text-sm animate-pulse"><i class="fas fa-circle-notch fa-spin mr-2"></i>Processing</span>
-                        <button @click="refreshAll" class="w-8 h-8 rounded-full bg-slate-700 hover:bg-blue-600 flex items-center justify-center transition-colors" title="Force Refresh">
-                            <i class="fas fa-sync-alt text-sm"></i>
-                        </button>
-                    </div>
-                </header>
-
-                <main class="flex-1 overflow-hidden relative">
-                    
-                    <div v-if="currentView === 'dashboard'" class="p-6 h-full overflow-y-auto">
-                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
-                            <div v-for="stat in statusCards" :key="stat.label" class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
-                                <div class="absolute right-0 top-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                                    <i :class="stat.icon" class="text-6xl"></i>
-                                </div>
-                                <div class="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">{{ stat.label }}</div>
-                                <div class="text-2xl font-bold flex items-center gap-2" :class="stat.color">
-                                    <i :class="stat.statusIcon"></i> {{ stat.value }}
-                                </div>
-                                <div class="text-xs text-slate-500 mt-2 leading-relaxed">{{ stat.desc }}</div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div v-if="currentView === 'users'" class="p-6 h-full flex flex-col">
-                        <div class="flex justify-between mb-4">
-                            <input v-model="userSearch" placeholder="Search users..." class="bg-slate-800 border border-slate-700 rounded px-4 py-2 text-sm w-64 focus:outline-none focus:border-blue-500">
-                            <button @click="showAddUserModal=true" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-blue-900/20 transition-all">
-                                <i class="fas fa-plus mr-2"></i>New User
-                            </button>
-                        </div>
-                        <div class="flex-1 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
-                            <table class="w-full text-sm text-left text-slate-400">
-                                <thead class="text-xs text-slate-300 uppercase bg-slate-900/50">
-                                    <tr>
-                                        <th class="px-6 py-4">User</th>
-                                        <th class="px-6 py-4">Role</th>
-                                        <th class="px-6 py-4">Status</th>
-                                        <th class="px-6 py-4">Gmail Auth</th> <th class="px-6 py-4 text-right">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr v-for="user in filteredUsers" :key="user.id" class="border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors">
-                                        <td class="px-6 py-4">
-                                            <div class="font-bold text-white">{{ user.name }}</div>
-                                            <div class="text-xs">{{ user.email }} | {{ user.phone }}</div>
-                                        </td>
-                                        <td class="px-6 py-4">
-                                            <span class="px-2 py-1 rounded text-xs uppercase font-bold" 
-                                                  :class="user.role==='admin'?'bg-purple-900/30 text-purple-400 border border-purple-800':'bg-blue-900/30 text-blue-400 border border-blue-800'">
-                                                {{ user.role }}
-                                            </span>
-                                        </td>
-                                        <td class="px-6 py-4">
-                                            <div class="flex items-center gap-2">
-                                                <div class="w-2 h-2 rounded-full" :class="user.enabled ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500'"></div>
-                                                <span>{{ user.enabled ? 'Active' : 'Disabled' }}</span>
-                                            </div>
-                                        </td>
-                                        <td class="px-6 py-4 whitespace-nowrap">
-                                            <span v-if="user.has_gmail_password" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-800">
-                                                <i class="fas fa-key mr-1 mt-0.5"></i> Configured
-                                            </span>
-                                            <span v-else class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-slate-800 text-slate-500 border border-slate-700">
-                                                No Password
-                                            </span>
-                                        </td>
-                                        <td class="px-6 py-4 text-right space-x-2">
-                                            <button @click="loginUser(user)" class="p-2 hover:text-green-400 transition-colors" title="Link Device"><i class="fas fa-link"></i></button>
-                                            <button @click="deleteUser(user.id)" class="p-2 hover:text-red-400 transition-colors" title="Delete"><i class="fas fa-trash"></i></button>
-                                            <button v-if="user.role === 'user'" @click="openPasswordModal(user)" class="text-amber-400 hover:text-amber-300 ml-3" title="Set App Password">
-                                                <i class="fas fa-key"></i>
-                                            </button>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div v-if="currentView === 'connections'" class="p-6 h-full flex flex-col">
-                        <div class="flex justify-between items-center mb-6">
-                            <h3 class="text-xl font-bold text-white">Live Transports</h3>
-                            <button @click="loadConnections" class="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded text-white text-sm transition-colors">
-                                <i class="fas fa-sync-alt mr-2"></i>Refresh Now
-                            </button>
-                        </div>
-                        <div class="flex-1 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
-                            <table class="w-full text-sm text-left text-slate-400">
-                                <thead class="text-xs text-slate-300 uppercase bg-slate-900/50">
-                                    <tr>
-                                        <th class="px-6 py-4">Real Human Users</th>
-                                        <th class="px-6 py-4 text-center">WhatsApp Device Status</th>
-                                        <th class="px-6 py-4 text-center">Email Polling Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr v-if="connections.length === 0" class="border-b border-slate-700/50">
-                                        <td colspan="3" class="px-6 py-8 text-center text-slate-500 italic">No human users currently enabled or active.</td>
-                                    </tr>
-                                    <tr v-for="conn in connections" :key="conn.user_id" class="border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors">
-                                        <td class="px-6 py-4">
-                                            <div class="font-bold text-white">{{ conn.name }}</div>
-                                            <div class="text-xs">{{ conn.email }} | {{ conn.phone }}</div>
-                                        </td>
-                                        <td class="px-6 py-4 text-center">
-                                            <span v-if="conn.whatsapp_connected" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-emerald-900/30 text-emerald-400 border border-emerald-800/50">
-                                                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> Linked
-                                            </span>
-                                            <span v-else class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-500 border border-slate-700">
-                                                <span class="w-1.5 h-1.5 rounded-full bg-slate-600"></span> Disconnected
-                                            </span>
-                                        </td>
-                                        <td class="px-6 py-4 text-center">
-                                            <span v-if="conn.email_connected" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-blue-900/30 text-blue-400 border border-blue-800/50">
-                                                <span class="w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_5px_#3b82f6]"></span> Listening
-                                            </span>
-                                            <span v-else class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-500 border border-slate-700">
-                                                <span class="w-1.5 h-1.5 rounded-full bg-slate-600"></span> Inactive
-                                            </span>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div v-if="currentView === 'simulator'" class="h-full flex flex-col md:flex-row divide-y md:divide-y-0 md:divide-x divide-slate-700">
-                        <div class="md:w-1/3 bg-slate-800/50 p-6 overflow-y-auto space-y-5">
-                            <div class="space-y-4">
-                                <h3 class="text-xs font-bold uppercase text-slate-500 tracking-wider">Simulation Parameters</h3>
-                                
-                                <div class="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">Channel</label>
-                                        <select v-model="sim.channel" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none">
-                                            <option value="whatsapp">WhatsApp</option>
-                                            <option value="email">Email</option>
-                                        </select>
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">Type</label>
-                                        <select v-model="sim.media_type" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none">
-                                            <option value="text">Text Only</option>
-                                            <option value="image">Image (Mock PNG)</option>
-                                            <option value="document">Document (PDF)</option>
-                                            <option value="audio">Audio (WAV)</option>
-                                        </select>
-                                    </div>
-                                </div>
-
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Sender (From)</label>
-                                    <select v-model="sim.sender" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none font-mono">
-                                        <option value="" disabled>Select Actor...</option>
-                                        <optgroup label="Real Clients (SQL Server)">
-                                            <option v-for="a in simActors.filter(x => x.type === 'client')" :value="a.id">
-                                                {{ a.name }} ({{ a.id }})
-                                            </option>
-                                        </optgroup>
-                                        <optgroup label="Common Not-Clients">
-                                            <option v-for="a in simActors.filter(x => x.type === 'non_client')" :value="a.id">
-                                                {{ a.name }}
-                                            </option>
-                                        </optgroup>
-                                        <optgroup label="Internal Staff (Testing)">
-                                            <option v-for="a in simActors.filter(x => ['admin','user'].includes(x.type))" :value="a.id">
-                                                {{ a.name }}
-                                            </option>
-                                        </optgroup>
-                                    </select>
-                                    <div v-if="isNonClientSender" class="text-[10px] text-red-400 mt-1 flex items-center gap-1">
-                                        <i class="fas fa-exclamation-circle"></i> Message will be dropped (Not a Client).
-                                    </div>
-                                </div>
-
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Receiver (To)</label>
-                                    <select v-model="sim.receiver" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm focus:border-blue-500 outline-none font-mono">
-                                        <option value="" disabled>Select Internal User...</option>
-                                        <option v-for="a in availableReceivers" :value="a.id">
-                                            {{ a.name }}
-                                        </option>
-                                    </select>
-                                </div>
-
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Content / Caption</label>
-                                    <textarea v-model="sim.text" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm" placeholder="Type a message..."></textarea>
-                                </div>
-
-                                <button @click="sendSimulation" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded shadow-lg shadow-blue-900/50 transition-all active:scale-95">
-                                    Inject Message
-                                </button>
-                            </div>
-
-                            <div v-if="simState.order_status" class="bg-slate-900 p-4 rounded border border-slate-700 space-y-2 font-mono text-xs">
-                                <div class="font-bold text-blue-400 uppercase border-b border-slate-700 pb-1 mb-2">Internal State</div>
-                                <div class="flex justify-between"><span>Status:</span> <span class="text-yellow-400">{{ simState.order_status }}</span></div>
-                                <div class="flex justify-between"><span>Last Latency:</span> <span class="text-green-400">{{ simState.last_benchmark_ms }}ms</span></div>
-                                <div v-if="simState.confirmed_items.length">
-                                    <div class="mt-2 text-slate-500">Confirmed Items:</div>
-                                    <ul class="list-disc ml-4 text-emerald-300">
-                                        <li v-for="item in simState.confirmed_items">{{ item.qty }}x {{ item.code || item.CodigoArticulo }}</li>
-                                    </ul>
-                                    <button @click="downloadCsv" class="mt-2 w-full bg-emerald-600/20 text-emerald-400 border border-emerald-600/50 py-1 rounded hover:bg-emerald-600/40">
-                                        <i class="fas fa-file-csv mr-1"></i> CSV
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="flex-1 flex flex-col bg-slate-950">
-                            <div class="p-3 border-b border-slate-800 flex justify-between items-center text-xs text-slate-500 uppercase tracking-widest">
-                                <span>Live Feed</span>
-                                <button @click="loadSimChat" class="hover:text-blue-400"><i class="fas fa-sync"></i></button>
-                            </div>
-                            <div id="simChatBox" class="flex-1 overflow-y-auto p-4 space-y-4">
-                                <div v-if="simChat.length === 0" class="h-full flex items-center justify-center text-slate-700 italic">
-                                    No interaction history found.
-                                </div>
-                                <div v-for="msg in simChat" :key="msg.id" class="flex flex-col max-w-[85%]" 
-                                     :class="msg.direction === 'sent' ? 'self-end items-end' : 'self-start items-start'">
-                                    <div class="px-4 py-3 rounded-2xl text-sm shadow-md"
-                                         :class="msg.direction === 'sent' 
-                                            ? (msg.is_bot ? 'bg-purple-600 text-white rounded-br-none' : 'bg-blue-600 text-white rounded-br-none') 
-                                            : 'bg-slate-800 text-slate-200 rounded-bl-none border border-slate-700'">
-                                        
-                                        <div class="flex items-center gap-2 mb-1 text-[10px] opacity-75 font-mono">
-                                            <i :class="msg.channel === 'whatsapp' ? 'fab fa-whatsapp' : 'fas fa-envelope'"></i>
-                                            <span>{{ msg.direction === 'sent' ? (msg.is_bot ? 'BOT' : 'SALESMAN') : 'CLIENT' }}</span>
-                                            <span>•</span>
-                                            <span>{{ formatTime(msg.timestamp) }}</span>
-                                        </div>
-
-                                        <div class="whitespace-pre-wrap leading-relaxed">{{ msg.message }}</div>
-                                        
-                                        <div v-if="msg.input_type !== 'text'" class="mt-2 inline-flex items-center gap-1 bg-black/20 px-2 py-1 rounded text-xs">
-                                            <i class="fas fa-paperclip"></i> {{ msg.input_type }}
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div v-if="currentView === 'logs'" class="h-full flex flex-col p-6">
-                        <div class="flex gap-2 mb-4">
-                            <select v-model="logsFilter.level" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none">
-                                <option value="">All Levels</option>
-                                <option value="INFO">INFO</option>
-                                <option value="WARNING">WARNING</option>
-                                <option value="ERROR">ERROR</option>
-                            </select>
-                            <input v-model="logsFilter.search" placeholder="Grep logs..." class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 text-sm focus:border-blue-500 outline-none font-mono">
-                            <button @click="loadLogs" class="bg-slate-700 hover:bg-slate-600 px-4 rounded text-white"><i class="fas fa-search"></i></button>
-                        </div>
-                        <div class="flex-1 bg-black/50 rounded-lg border border-slate-700 p-4 overflow-y-auto font-mono text-xs shadow-inner">
-                            <div v-for="(log, idx) in logs" :key="idx" class="mb-1 break-words hover:bg-white/5 px-1 rounded transition-colors"
-                                 :class="{
-                                    'text-red-400': log.line.includes('ERROR'),
-                                    'text-yellow-400': log.line.includes('WARNING'),
-                                    'text-slate-400': !log.line.includes('ERROR') && !log.line.includes('WARNING')
-                                 }">
-                                {{ log.line }}
-                            </div>
-                        </div>
-                    </div>
-
-                </main>
-            </div>
-
-            <div v-if="showAddUserModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
-                <div class="bg-slate-800 border border-slate-700 p-6 rounded-xl shadow-2xl w-96">
-                    <h3 class="text-xl font-bold mb-6">Create User</h3>
-                    <div class="space-y-3">
-                        <input v-model="newUser.name" placeholder="Name" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-                        <input v-model="newUser.email" placeholder="Email" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-                        <input v-model="newUser.phone" placeholder="Phone" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-                        <select v-model="newUser.role" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm">
-                            <option value="user">Salesman</option>
-                            <option value="admin">Admin</option>
-                        </select>
-                    </div>
-                    <div class="flex justify-end gap-3 mt-6">
-                        <button @click="showAddUserModal=false" class="px-4 py-2 text-slate-400 hover:text-white">Cancel</button>
-                        <button @click="createUser" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded font-bold">Create</button>
-                    </div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs text-dim mb-1">Channel</label>
+                    <select v-model="sim.channel" class="w-full bg-ink-950 border border-line rounded-lg p-2 text-sm focus:border-kapa outline-none">
+                      <option value="whatsapp">WhatsApp</option>
+                      <option value="email">Email</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block text-xs text-dim mb-1">Attachment</label>
+                    <select v-model="sim.media_type" class="w-full bg-ink-950 border border-line rounded-lg p-2 text-sm focus:border-kapa outline-none">
+                      <option value="text">None</option>
+                      <option value="image">Image (PNG)</option>
+                      <option value="document">Document (PDF)</option>
+                      <option value="audio">Audio (WAV)</option>
+                    </select>
+                  </div>
                 </div>
-            </div>
-
-            <div v-if="showPairCodeModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
-                <div class="bg-white text-slate-900 p-8 rounded-xl shadow-2xl max-w-sm text-center">
-                    <h3 class="text-2xl font-bold mb-2">Link Device</h3>
-                    <p class="text-sm text-slate-500 mb-6">Enter this code in WhatsApp (Linked Devices <i class="fas fa-arrow-right text-[10px] mx-1"></i> Link with phone number)</p>
-                    
-                    <div class="bg-slate-100 p-6 rounded-lg mb-6 flex items-center justify-center min-h-[120px]">
-                        <div v-if="pairCode" class="text-4xl font-mono font-bold tracking-[0.2em] text-blue-600">
-                            {{ pairCode }}
-                        </div>
-                        <div v-else class="text-red-500 font-bold">Session Active / Error</div>
-                    </div>
-                    
-                    <button @click="showPairCodeModal=false" class="bg-slate-900 text-white px-8 py-2 w-full rounded-full hover:bg-slate-700 transition font-bold shadow-lg shadow-slate-900/20">Done</button>
+                <div>
+                  <label class="block text-xs text-dim mb-1">Client (sender)</label>
+                  <select v-model="sim.sender" class="w-full bg-ink-950 border border-line rounded-lg p-2 text-sm font-mono focus:border-kapa outline-none">
+                    <option value="" disabled>Select actor…</option>
+                    <optgroup label="Test clients (cache)" v-if="simClients.length">
+                      <option v-for="c in simClients" :value="c.identifier">{{ c.name }} ({{ c.identifier }})</option>
+                    </optgroup>
+                    <optgroup label="Real clients (SAGE)">
+                      <option v-for="a in simActors.filter(x => x.type === 'client')" :value="a.id">{{ a.name }} ({{ a.id }})</option>
+                    </optgroup>
+                    <optgroup label="Strangers (gatekeeper tests)">
+                      <option v-for="a in simActors.filter(x => x.type === 'non_client')" :value="a.id">{{ a.name }}</option>
+                    </optgroup>
+                    <optgroup label="Internal staff">
+                      <option v-for="a in simActors.filter(x => ['admin','user'].includes(x.type))" :value="a.id">{{ a.name }}</option>
+                    </optgroup>
+                  </select>
+                  <div v-if="isNonClientSender" class="text-[10px] mt-1" :class="sim.mock_client_force ? 'text-kapa' : 'text-bad'">
+                    <i :class="sim.mock_client_force ? 'fas fa-mask' : 'fas fa-shield-halved'" class="mr-1"></i>
+                    {{ sim.mock_client_force ? 'Unknown sender will be faked as a client.' : 'Gatekeeper will DROP this message.' }}
+                  </div>
                 </div>
-            </div>
-
-            <div v-if="showPasswordModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
-                <div class="bg-slate-800 p-8 rounded-xl shadow-2xl max-w-md w-full border border-slate-700">
-                    <h3 class="text-2xl font-bold mb-4 text-white">Set Gmail App Password</h3>
-                    <p class="text-sm text-slate-400 mb-6">Enter the 16-character Google App Password for <b>{{ selectedUserForPassword?.email }}</b>.</p>
-                    <div class="mb-4">
-                        <input v-model="newGmailPassword" type="text" placeholder="abcd efgh ijkl mnop" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all">
-                    </div>
-                    <div class="flex justify-end gap-4 mt-6">
-                        <button @click="showPasswordModal=false" class="text-slate-400 hover:text-white font-bold transition-colors">Cancel</button>
-                        <button @click="saveGmailPassword" class="bg-amber-600 hover:bg-amber-500 text-white px-5 py-2 rounded-lg font-bold shadow-lg shadow-amber-900/20 transition-all">Save Password</button>
-                    </div>
+                <div>
+                  <label class="block text-xs text-dim mb-1">Salesman (receiver) <span class="text-ink-600">optional</span></label>
+                  <select v-model="sim.receiver" class="w-full bg-ink-950 border border-line rounded-lg p-2 text-sm font-mono focus:border-kapa outline-none">
+                    <option value="">Default: Sim Salesman</option>
+                    <option v-for="a in availableReceivers" :value="a.id">{{ a.name }}</option>
+                  </select>
+                  <div v-if="sim.mode === 'channel' && !sim.receiver" class="text-[10px] text-warn mt-1">Channel mode needs a linked receiver for the reply to really send.</div>
                 </div>
+                <label class="flex items-center gap-2 text-xs text-dim cursor-pointer select-none">
+                  <input type="checkbox" v-model="sim.mock_client_force" class="accent-kapa">
+                  Fake client if not in SAGE
+                </label>
+              </div>
             </div>
 
-        </template>
+            <div class="bg-ink-950/70 border border-line rounded-lg p-3 text-[11px] leading-snug">
+              <div class="font-bold text-dim mb-1">
+                <i class="fas fa-mobile-screen mr-1"></i>Full mode (self-chat)
+                <span class="ml-1 font-mono" :class="simModes.full_mode_ready ? 'text-kapa' : 'text-warn'">{{ simModes.full_mode_ready ? 'READY' : 'NO DEVICE' }}</span>
+              </div>
+              <div class="text-dim">{{ simModes.full_mode_hint }}</div>
+            </div>
+
+            <!-- Conversation state (persisted session) -->
+            <div class="bg-ink-950 border border-line rounded-lg p-4 space-y-2 font-mono text-xs">
+              <div class="flex items-center justify-between border-b border-line pb-2 mb-1">
+                <span class="font-bold text-kapa uppercase tracking-wider">Conversation state</span>
+                <button @click="loadSimChat" class="text-dim hover:text-kapa" title="Refresh"><i class="fas fa-rotate"></i></button>
+              </div>
+              <div class="flex justify-between"><span class="text-dim">Order</span>
+                <span :class="{'text-dim': simState.order_status==='IDLE','text-warn': simState.order_status==='BUILDING','text-kapa': simState.order_status==='CLOSED'}">{{ simState.order_status || '—' }}</span>
+              </div>
+              <div class="flex justify-between"><span class="text-dim">Bot</span>
+                <span :class="simState.bot_enabled ? 'text-kapa' : 'text-bad'">{{ simState.bot_enabled ? 'enabled' : 'OPTED OUT' }}</span>
+              </div>
+              <div class="flex justify-between"><span class="text-dim">Last turn</span><span class="text-paper">{{ simState.last_benchmark_ms }} ms</span></div>
+
+              <!-- Context window occupancy: gauge relative to the FULL window,
+                   with a tick at the trim budget (default 70%). Crossing the
+                   tick means history is being trimmed and Memoria is carrying
+                   the older context — exactly the trigger being monitored. -->
+              <div v-if="ctxGauge" class="border-t border-line pt-2">
+                <div class="flex justify-between mb-1">
+                  <span class="text-dim">Context</span>
+                  <span :class="ctxGauge.color">{{ ctxGauge.used }} / {{ ctxGauge.window }} tok · {{ ctxGauge.pct }}%</span>
+                </div>
+                <div class="relative h-2 bg-ink-950 rounded overflow-hidden">
+                  <div class="absolute inset-y-0 left-0 rounded transition-all duration-500"
+                       :class="ctxGauge.bar" :style="{ width: Math.min(ctxGauge.pct, 100) + '%' }"></div>
+                  <div class="absolute inset-y-0 w-px bg-paper/50" :style="{ left: ctxGauge.budgetPct + '%' }"
+                       :title="'Trim budget: ' + ctxGauge.budgetPct + '%'"></div>
+                </div>
+                <div class="flex gap-2 mt-1 text-[10px]">
+                  <span class="text-dim">trim at {{ ctxGauge.budgetPct }}%</span>
+                  <span v-if="simState.ctx.history_trimmed" class="text-warn"><i class="fas fa-scissors mr-1"></i>history trimmed → Memoria</span>
+                  <span v-if="simState.ctx.message_truncated" class="text-warn"><i class="fas fa-crop mr-1"></i>message cut</span>
+                </div>
+              </div>
+
+              <div class="border-t border-line pt-2">
+                <div class="text-dim mb-1"><i class="fas fa-brain mr-1"></i>Memoria (summary)</div>
+                <div :class="simState.chat_context_summary ? 'text-paper' : 'text-dim italic'" class="leading-snug">
+                  {{ simState.chat_context_summary || 'sin memoria todavía' }}
+                </div>
+              </div>
+              <div v-if="simState.confirmed_items.length" class="border-t border-line pt-2">
+                <div class="text-dim mb-1">Cart</div>
+                <div v-for="item in simState.confirmed_items" class="text-kapa">• {{ item.qty }}× {{ item.code || item.CodigoArticulo }}</div>
+                <button @click="downloadCsv" class="mt-2 w-full border border-kapa/40 text-kapa py-1 rounded hover:bg-kapa/10">
+                  <i class="fas fa-file-csv mr-1"></i>Export CSV
+                </button>
+              </div>
+            </div>
+
+            <button @click="flushPending" class="w-full border border-line text-dim hover:text-kapa hover:border-kapa/40 py-2 rounded-lg text-xs transition" title="Fire the pending debounce now (for messages injected without waiting)">
+              <i class="fas fa-forward-fast mr-1"></i>Flush pending debounce
+            </button>
+          </div>
+
+          <!-- Chat with Kapa -->
+          <div class="flex-1 flex flex-col bg-ink-950 min-w-0">
+            <div class="px-4 py-2.5 border-b border-line flex justify-between items-center">
+              <div class="flex items-center gap-2 text-xs">
+                <div class="w-7 h-7 rounded-full bg-kapa-dim text-kapa flex items-center justify-center font-mono font-bold">K</div>
+                <div>
+                  <div class="font-semibold text-paper leading-none">Kapa</div>
+                  <div class="text-[10px] text-dim font-mono">{{ sim.channel }} · {{ sim.sender || 'no client selected' }}</div>
+                </div>
+              </div>
+              <div class="text-[10px] text-dim font-mono uppercase tracking-widest">replies are the real pipeline</div>
+            </div>
+
+            <div id="simChatBox" class="flex-1 overflow-y-auto p-4 space-y-3">
+              <div v-if="simFeed.length === 0" class="h-full flex flex-col items-center justify-center text-dim gap-2">
+                <i class="fas fa-comments text-3xl text-ink-600"></i>
+                <p class="text-sm">Pick a client and say something — Kapa answers through the full pipeline.</p>
+                <p class="text-xs text-ink-600 font-mono">gatekeeper → FSM → agent → RAG → reply</p>
+              </div>
+              <template v-for="msg in simFeed" :key="msg.key">
+                <!-- system notices (drops, silence) -->
+                <div v-if="msg.system" class="text-center">
+                  <span class="inline-block text-[11px] font-mono px-3 py-1 rounded-full border"
+                        :class="msg.tone === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-dim border-line bg-ink-900'">
+                    {{ msg.text }}
+                  </span>
+                </div>
+                <!-- chat bubbles -->
+                <div v-else class="flex flex-col" :class="msg.mine ? 'items-start' : 'items-end'">
+                  <div class="bubble px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
+                       :class="msg.mine ? 'bg-ink-800 border border-line rounded-bl-md'
+                              : (msg.bot ? 'bg-kapa-dim text-teal-100 rounded-br-md' : 'bg-sales/20 border border-sales/30 rounded-br-md')">
+                    <div class="flex items-center gap-2 mb-1 text-[10px] font-mono opacity-70">
+                      <i :class="msg.channel === 'email' ? 'fas fa-envelope' : 'fab fa-whatsapp'"></i>
+                      <span>{{ msg.mine ? 'CLIENT' : (msg.bot ? 'KAPA' : 'SALESMAN') }}</span>
+                      <span v-if="msg.time">· {{ msg.time }}</span>
+                    </div>
+                    {{ msg.text }}
+                    <div v-if="msg.attachment" class="mt-1.5 inline-flex items-center gap-1 bg-black/25 px-2 py-0.5 rounded text-[11px] font-mono">
+                      <i class="fas fa-paperclip"></i>{{ msg.attachment }}
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <div v-if="loading" class="flex items-end gap-2 justify-end">
+                <div class="bg-kapa-dim px-4 py-2.5 rounded-2xl rounded-br-md text-teal-100 text-sm">
+                  <i class="fas fa-ellipsis fa-fade"></i>
+                </div>
+              </div>
+            </div>
+
+            <!-- Composer -->
+            <div class="p-3 border-t border-line bg-ink-900/60">
+              <div class="flex items-end gap-2">
+                <textarea v-model="sim.text" rows="1" @keydown.enter.exact.prevent="sendTurn"
+                          placeholder="Message as the client…  (Enter to send, Shift+Enter for newline)"
+                          class="flex-1 bg-ink-950 border border-line rounded-xl px-4 py-3 text-sm resize-none focus:border-kapa outline-none max-h-32"
+                          @input="autoGrow"></textarea>
+                <button @click="sendTurn" :disabled="loading || !sim.sender"
+                        class="h-11 w-11 shrink-0 rounded-xl bg-kapa text-kapa-ink font-bold disabled:opacity-40 hover:brightness-110 transition active:scale-95" title="Send and get Kapa's reply">
+                  <i class="fas fa-paper-plane"></i>
+                </button>
+              </div>
+              <div class="flex items-center justify-between mt-1.5 px-1 text-[10px] text-dim font-mono">
+                <span v-if="sim.media_type !== 'text'"><i class="fas fa-paperclip mr-1"></i>sample {{ sim.media_type }} attached to next message</span>
+                <span v-else>&nbsp;</span>
+                <button @click="sendInjectOnly" class="hover:text-warn" title="Inject without waiting: the real debounce (RESPONSE_DELAY_MINUTES) will run; use Flush to fire it early.">
+                  inject only (real debounce) <i class="fas fa-hourglass-half ml-1"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Logs -->
+
+        <!-- Test clients (simulation cache) -->
+        <div v-if="currentView === 'simclients'" class="p-6 h-full flex flex-col">
+          <div class="bg-ink-900 rounded-xl border border-line p-4 mb-4">
+            <div class="flex items-start gap-2 text-xs text-dim mb-3 leading-snug">
+              <i class="fas fa-flask text-kapa mt-0.5"></i>
+              <span>In-memory test clients, checked <b class="text-paper">before SAGE</b> in every lookup and treated
+              exactly like real clients (gatekeeper, greeting name, order code). Nothing is written to any database
+              — a bot restart clears this list.</span>
+            </div>
+            <div class="grid md:grid-cols-5 gap-3">
+              <input v-model="newSimClient.identifier" placeholder="Phone or email *" class="bg-ink-950 border border-line rounded-lg px-3 py-2 text-sm font-mono focus:border-kapa outline-none md:col-span-2">
+              <input v-model="newSimClient.name" placeholder="Name (optional)" class="bg-ink-950 border border-line rounded-lg px-3 py-2 text-sm focus:border-kapa outline-none">
+              <input v-model="newSimClient.code" placeholder="Client code (optional)" class="bg-ink-950 border border-line rounded-lg px-3 py-2 text-sm font-mono focus:border-kapa outline-none">
+              <button @click="addSimClient" class="bg-kapa text-kapa-ink px-4 py-2 rounded-lg text-sm font-bold hover:brightness-110 transition">
+                <i class="fas fa-plus mr-2"></i>Add / update
+              </button>
+            </div>
+          </div>
+          <div class="flex-1 bg-ink-900 rounded-xl border border-line overflow-auto">
+            <table class="w-full text-sm text-left text-dim">
+              <thead class="text-xs uppercase bg-ink-950/60 text-dim sticky top-0">
+                <tr>
+                  <th class="px-6 py-3">Identifier</th><th class="px-6 py-3">Name</th>
+                  <th class="px-6 py-3">Code</th><th class="px-6 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="!simClients.length"><td colspan="4" class="px-6 py-8 text-center text-dim">
+                  No test clients. Add a phone or email above to let it through the gatekeeper without touching SAGE.
+                </td></tr>
+                <tr v-for="c in simClients" :key="c.key" class="border-t border-line/60 hover:bg-ink-800/40">
+                  <td class="px-6 py-3 font-mono text-paper">{{ c.identifier }}</td>
+                  <td class="px-6 py-3">{{ c.name }}</td>
+                  <td class="px-6 py-3 font-mono text-xs">{{ c.code }}</td>
+                  <td class="px-6 py-3 text-right">
+                    <button @click="deleteSimClient(c.identifier)" class="p-2 hover:text-bad transition-colors" title="Remove"><i class="fas fa-trash"></i></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="mt-3 text-right">
+            <button v-if="simClients.length" @click="clearSimClients" class="text-xs text-dim hover:text-bad transition-colors">
+              <i class="fas fa-broom mr-1"></i>Clear all test clients
+            </button>
+          </div>
+        </div>
+
+                <div v-if="currentView === 'logs'" class="h-full flex flex-col p-6">
+          <div class="flex gap-2 mb-4">
+            <select v-model="logsFilter.level" class="bg-ink-900 border border-line rounded-lg px-3 py-2 text-sm focus:border-kapa outline-none">
+              <option value="">All levels</option><option value="INFO">INFO</option>
+              <option value="WARNING">WARNING</option><option value="ERROR">ERROR</option>
+            </select>
+            <input v-model="logsFilter.search" @keyup.enter="loadLogs" placeholder="Filter logs… (Enter)" class="flex-1 bg-ink-900 border border-line rounded-lg px-3 text-sm font-mono focus:border-kapa outline-none">
+            <button @click="loadLogs" class="bg-ink-800 hover:bg-ink-700 px-4 rounded-lg transition"><i class="fas fa-magnifying-glass"></i></button>
+          </div>
+          <div class="flex-1 bg-black/40 rounded-xl border border-line p-4 overflow-y-auto font-mono text-xs">
+            <div v-for="(log, idx) in logs" :key="idx" class="mb-0.5 break-words hover:bg-white/5 px-1 rounded"
+                 :class="log.line.includes('ERROR') ? 'text-bad' : log.line.includes('WARNING') ? 'text-warn' : 'text-dim'">
+              {{ log.line }}
+            </div>
+          </div>
+        </div>
+      </main>
     </div>
-    <script src="/static/app.js?v=2.0"></script>
+
+    <!-- ========================================================== Modals -->
+    <div v-if="showAddUserModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+      <div class="bg-ink-900 border border-line p-6 rounded-2xl w-96">
+        <h3 class="text-lg font-bold mb-5">Create user</h3>
+        <div class="space-y-3">
+          <input v-model="newUser.name" placeholder="Name" class="w-full bg-ink-950 border border-line rounded-lg p-2.5 text-sm focus:border-kapa outline-none">
+          <input v-model="newUser.email" placeholder="Email" class="w-full bg-ink-950 border border-line rounded-lg p-2.5 text-sm focus:border-kapa outline-none">
+          <input v-model="newUser.phone" placeholder="Phone (34600111222)" class="w-full bg-ink-950 border border-line rounded-lg p-2.5 text-sm focus:border-kapa outline-none">
+          <select v-model="newUser.role" class="w-full bg-ink-950 border border-line rounded-lg p-2.5 text-sm focus:border-kapa outline-none">
+            <option value="user">Salesman</option><option value="admin">Admin</option>
+          </select>
+        </div>
+        <div class="flex justify-end gap-3 mt-6">
+          <button @click="showAddUserModal=false" class="px-4 py-2 text-dim hover:text-paper">Cancel</button>
+          <button @click="createUser" class="bg-kapa text-kapa-ink px-4 py-2 rounded-lg font-bold hover:brightness-110">Create user</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="showPairCodeModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+      <div class="bg-ink-900 border border-line p-8 rounded-2xl max-w-sm text-center">
+        <h3 class="text-xl font-bold mb-2">Link WhatsApp device</h3>
+        <p class="text-sm text-dim mb-6">In WhatsApp: Linked devices → Link with phone number → enter this code.</p>
+        <div class="bg-ink-950 border border-line p-6 rounded-xl mb-6 min-h-[100px] flex items-center justify-center">
+          <div v-if="pairCode" class="text-3xl font-mono font-bold tracking-[0.25em] text-kapa">{{ pairCode }}</div>
+          <div v-else class="text-warn font-bold text-sm">Session already active — no code needed</div>
+        </div>
+        <button @click="showPairCodeModal=false" class="bg-kapa text-kapa-ink px-8 py-2.5 w-full rounded-xl font-bold hover:brightness-110">Done</button>
+      </div>
+    </div>
+
+    <div v-if="showPasswordModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
+      <div class="bg-ink-900 border border-line p-6 rounded-2xl max-w-md w-full">
+        <h3 class="text-lg font-bold mb-2">Gmail app password</h3>
+        <p class="text-sm text-dim mb-5">16-character Google App Password for <b class="text-paper">{{ selectedUserForPassword?.email }}</b>.</p>
+        <input v-model="newGmailPassword" type="text" placeholder="abcd efgh ijkl mnop" class="w-full bg-ink-950 border border-line rounded-lg p-3 text-sm font-mono focus:border-kapa outline-none">
+        <div class="flex justify-end gap-3 mt-6">
+          <button @click="showPasswordModal=false" class="px-4 py-2 text-dim hover:text-paper">Cancel</button>
+          <button @click="saveGmailPassword" class="bg-kapa text-kapa-ink px-4 py-2 rounded-lg font-bold hover:brightness-110">Save password</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toasts -->
+    <div class="fixed bottom-4 right-4 z-50 space-y-2">
+      <div v-for="t in toasts" :key="t.id" class="px-4 py-2.5 rounded-lg text-sm border shadow-lg font-medium"
+           :class="t.type === 'error' ? 'bg-bad/10 border-bad/40 text-bad' : 'bg-kapa/10 border-kapa/40 text-kapa'">
+        {{ t.text }}
+      </div>
+    </div>
+  </template>
+</div>
+<script src="/static/app.js?v=3.1"></script>
 </body>
 </html>

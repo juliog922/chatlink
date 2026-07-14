@@ -85,7 +85,7 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
-      cudara:
+      cima:
         condition: service_healthy
       qdrant:
         condition: service_healthy
@@ -97,16 +97,25 @@ services:
     networks:
       - chatlink-net
   
-  cudara:
-    image: ghcr.io/juliog922/cudara:latest
-    container_name: cudara
+  cima:
+    image: ghcr.io/juliog922/cima:latest
+    container_name: cima
     restart: unless-stopped
     ports:
       - "8001:8000"
     env_file:
       - .env
+    environment:
+      # Bind on 0.0.0.0:8000 so the internal `cima:8000` URL the bot already
+      # uses keeps working unchanged (cima's native port is 11435).
+      CIMA_HOST: 0.0.0.0
+      CIMA_PORT: "8000"
+      # One GGUF model does everything: text + vision + audio + embed.
+      # Pulled on first startup into the models volume (~3 GB → the long
+      # start_period below covers the download).
+      CIMA_PULL_AT_STARTUP: unsloth/gemma-4-E2B-it-GGUF:Q8_0
     volumes:
-      - models_data:/app/models
+      - models_data:/data/models
     deploy:
       resources:
         reservations:
@@ -115,7 +124,10 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/version', timeout=5).read()\""]
+      # /api/ready returns 503 until the startup pull finishes, then 200 —
+      # so `depends_on: condition: service_healthy` correctly waits for the
+      # model to be present before the bot starts talking to it.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/ready || exit 1"]
       interval: 300s
       timeout: 5s
       retries: 30

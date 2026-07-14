@@ -14,6 +14,7 @@ WORKDIR /app
 # 1. Install System Dependencies
 # 'unixodbc-dev': Required for compiling/linking ODBC drivers (referenced in database.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     unixodbc \
     unixodbc-dev \
     ca-certificates \

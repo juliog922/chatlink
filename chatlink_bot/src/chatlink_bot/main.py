@@ -4,44 +4,41 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from cudara_client import CudaraClient
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 
-from .database import pg_engine, sql_engine, PGBase, AsyncSessionPG
-from .events import event_bus
-from .transport.whatsapp import whatsapp_transport
-from .transport.email import email_transport
-from .handlers import (
-    handle_new_message,
-    handle_new_email,
-    handle_admin_command,
-    handle_ai_trigger,
-)
-from .models import User
-from .api.routes import router as api_router
-from .api.simulation import router as sim_router
-
+from .ai.cima_client import CimaClient
 from .ai.qdrant import qdrant_service
 from .ai.rag import rag_service
+from .api.routes import router as api_router
+from .api.simulation import router as sim_router
+from sqlalchemy import text
+from .database import AsyncSessionPG, PGBase, pg_engine, sql_engine
+from .events import event_bus
+from .handlers import (
+    handle_admin_command,
+    handle_ai_trigger,
+    handle_new_email,
+    handle_new_message,
+)
 from .logic.fsm import fsm
+from .models import User
+from .transport.email import email_transport
+from .transport.whatsapp import whatsapp_transport
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = "app.log"
 
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-# Root Logger
 root_logger = logging.getLogger()
 root_logger.setLevel(LOG_LEVEL)
 
-# Console Handler
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 root_logger.addHandler(stream_handler)
 
-# File Handler
 file_handler = logging.FileHandler(LOG_FILE)
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
@@ -57,30 +54,30 @@ def _seconds_until_next_daily(hour: int, minute: int) -> float:
     now = datetime.now(timezone.utc)
     nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if nxt <= now:
-        nxt = nxt + timedelta(days=1)
+        nxt += timedelta(days=1)
     return (nxt - now).total_seconds()
+
+
+async def _sync_catalog(reason: str) -> None:
+    """
+    Incremental SAGE -> Qdrant sync (hash-diff: only new/changed products are
+    embedded, stale ones deleted — see ai/qdrant.py). Cheap when nothing
+    changed, so it runs at EVERY startup: the old count>0 skip meant products
+    added to SAGE were invisible until the next 3AM job. The BM25 index is
+    rebuilt only when the catalog actually changed (or on first load).
+    """
+    written = await qdrant_service.ingest_products_from_sqlserver()
+    root_logger.info(f"[Ingest:{reason}] Sync finished: {written} points written.")
+    if written > 0 or rag_service.bm25 is None:
+        await rag_service.initialize()
 
 
 async def _startup_ingest_products() -> None:
     for attempt in range(3):
         try:
-            # 1. Asegurar que la colección existe (se inicializa si no)
             await qdrant_service.ensure_ready()
-            
-            # 2. Comprobar si ya hay productos
-            count = await qdrant_service.get_collection_count()
-            
-            if count > 0:
-                root_logger.info(f"Startup ingestion skipped: Qdrant already contains {count} products.")
-                await rag_service.initialize()
-                break # Success, we can exit the loop
-            else:
-                root_logger.info("Qdrant collection is empty. Starting initial ingestion...")
-                total = await qdrant_service.ingest_products_from_sqlserver()
-                root_logger.info(f"Startup ingestion done. Upserted: {total}")
-                await rag_service.initialize()
-                break  # Success! Exit the loop.
-                
+            await _sync_catalog("startup")
+            return
         except Exception as e:
             if attempt < 2:
                 root_logger.warning(f"Startup ingestion failed, retrying in 5s... ({e})")
@@ -94,113 +91,83 @@ async def _daily_ingest_loop(stop_evt: asyncio.Event) -> None:
         try:
             sleep_s = _seconds_until_next_daily(DAILY_INGEST_HOUR_UTC, DAILY_INGEST_MINUTE_UTC)
             root_logger.info(
-                f"Next daily ingestion scheduled in {int(sleep_s)}s "
-                f"(UTC {DAILY_INGEST_HOUR_UTC:02d}:{DAILY_INGEST_MINUTE_UTC:02d})"
-            )
+                f"Next daily ingestion in {int(sleep_s)}s "
+                f"(UTC {DAILY_INGEST_HOUR_UTC:02d}:{DAILY_INGEST_MINUTE_UTC:02d})")
             try:
                 await asyncio.wait_for(stop_evt.wait(), timeout=sleep_s)
-                break  # stop requested
+                return  # stop requested
             except asyncio.TimeoutError:
                 pass  # time to run
-
-            total = await qdrant_service.ingest_products_from_sqlserver()
-            root_logger.info(f"Daily ingestion done. Upserted: {total}")
-            await rag_service.initialize()
+            await _sync_catalog("daily")
         except Exception as e:
             root_logger.error(f"Daily ingestion loop error: {e}")
-            # backoff a bit
             try:
                 await asyncio.wait_for(stop_evt.wait(), timeout=60)
-                break
+                return
             except asyncio.TimeoutError:
                 continue
 
-async def _ensure_simulation_actors():
-    """Ensures a default Salesman and Admin exist for simulation purposes."""
+
+async def _ensure_simulation_actors() -> None:
+    """Ensure the default sim Salesman and Admin exist."""
     async with AsyncSessionPG() as db:
-        # 1. Sim Salesman
         sales = (await db.execute(select(User).where(User.email == "sales@sim.com"))).scalars().first()
         if not sales:
-            db.add(User(name="Sim Salesman", email="sales@sim.com", phone="34600999001", role="user", enabled=True))
-        
-        # 2. Sim Admin
+            db.add(User(name="Sim Salesman", email="sales@sim.com", phone="34600999001",
+                        role="user", enabled=True))
         admin = (await db.execute(select(User).where(User.email == "admin@sim.com"))).scalars().first()
         if not admin:
-            db.add(User(name="Sim Admin", email="admin@sim.com", phone="34600999002", role="admin", enabled=True))
-        
+            db.add(User(name="Sim Admin", email="admin@sim.com", phone="34600999002",
+                        role="admin", enabled=True))
         await db.commit()
 
-async def _trigger_pull(client: CudaraClient, model: str) -> None:
-    """Fires a pull request and gracefully handles the expected local HTTP timeout."""
-    try:
-        root_logger.info(f"[DOWNLOADING] Sending pull request for {model}...")
-        # stream=False means it blocks until finished, but since our client has a short timeout,
-        # it will throw a ReadTimeout locally while the server keeps downloading in the background.
-        await asyncio.to_thread(client.pull, model, stream=False)
-    except Exception as e:
-        root_logger.debug(f"Pull request for {model} disconnected locally (expected if downloading): {e}")
 
 async def _ensure_models_ready() -> None:
-    cudara_models_env = os.getenv("CUDARA_DEFAULT_MODELS", "")
-    if not cudara_models_env:
-        root_logger.warning("CUDARA_DEFAULT_MODELS not set. Skipping model puller.")
-        return
+    """
+    Wait for cima to finish its startup model pull (compose sets
+    CIMA_PULL_AT_STARTUP; /api/ready returns 503 until the model is on disk).
+    """
+    cima_url = os.getenv("CIMA_URL", "http://cima:8000")
+    model = os.getenv("CIMA_MODEL", "unsloth/gemma-4-E2B-it-GGUF:Q8_0")
+    client = CimaClient(base_url=cima_url, timeout=10.0)
+    root_logger.info(f"Waiting for cima to be ready with model: {model}")
 
-    target_models = [m.strip() for m in cudara_models_env.split(",") if m.strip()]
-    cudara_url = os.getenv("CUDARA_URL", "http://cudara:8000")
-    
-    # Short timeout (5s) so we don't hang waiting for the massive download to finish on the HTTP connection
-    client = CudaraClient(base_url=cudara_url, timeout=5.0)
-    root_logger.info(f"Starting Batch Model Puller for: {target_models}")
-
-    while True:
-        # 1. Check current models on the server
+    max_wait_s = int(os.getenv("CIMA_READY_MAX_WAIT_S", "1800"))
+    waited, poll_s = 0, 10
+    while waited < max_wait_s:
         try:
-            tags_info = await asyncio.to_thread(client.tags)
-            ready_models = [m.get("name") for m in tags_info.get("models", [])]
+            info = await asyncio.to_thread(client.ready, [model])
+            if info.get("ready"):
+                root_logger.info("SUCCESS: cima is ready and the model is loaded.")
+                return
+            root_logger.info(f"cima not ready yet (model still loading). Waited {waited}s.")
         except Exception as e:
-            root_logger.warning(f"[Cudara] Server unreachable/booting. Retrying tags in 10s... ({e})")
-            await asyncio.sleep(10)
-            continue
+            root_logger.warning(f"[cima] Not reachable yet (booting?). Retrying in {poll_s}s... ({e})")
+        await asyncio.sleep(poll_s)
+        waited += poll_s
 
-        # 2. Identify missing models
-        missing_models = [m for m in target_models if m not in ready_models]
-        
-        if not missing_models:
-            root_logger.info("SUCCESS: All required models are downloaded and ready.")
-            break
+    root_logger.error(f"cima not ready within {max_wait_s}s; continuing (AI calls may fail).")
 
-        root_logger.info(f"Models missing and need pulling: {missing_models}")
 
-        # 3. Fire all pull requests at once (concurrently)
-        pull_tasks = [_trigger_pull(client, m) for m in missing_models]
-        await asyncio.gather(*pull_tasks, return_exceptions=True)
-
-        # 4. Wait exactly 5 minutes doing absolutely nothing
-        root_logger.info("Pull requests fired. Waiting exactly 5 minutes before checking again...")
-        await asyncio.sleep(300)
-                
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1) Create Postgres tables
+    # 1) Postgres tables
     async with pg_engine.begin() as conn:
         await conn.run_sync(PGBase.metadata.create_all)
-
     await _ensure_simulation_actors()
 
-    # 2) Subscribe handlers
+    # 2) Event handlers
     await event_bus.subscribe("message_received", handle_new_message)
     await event_bus.subscribe("email_received", handle_new_email)
     await event_bus.subscribe("admin_command", handle_admin_command)
     await event_bus.subscribe("trigger_ai_processing", handle_ai_trigger)
 
-    # 3) Start transports
+    # 3) Transports + FSM janitor
     whatsapp_transport.start()
     email_transport.start()
-
     fsm.start_cleanup_loop()
 
-    # 4) Optional DB sanity checks
+    # 4) DB sanity check
     try:
         async with sql_engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -210,7 +177,7 @@ async def lifespan(app: FastAPI):
 
     await _ensure_models_ready()
 
-    # 5) Start background ingestion tasks
+    # 5) Catalog sync: incremental at startup + daily
     app.state.stop_daily_ingest = asyncio.Event()
     app.state.startup_ingest_task = asyncio.create_task(_startup_ingest_products())
     app.state.daily_ingest_task = asyncio.create_task(_daily_ingest_loop(app.state.stop_daily_ingest))
@@ -220,38 +187,36 @@ async def lifespan(app: FastAPI):
     # Shutdown
     whatsapp_transport.stop()
     email_transport.stop()
-
     fsm.stop_cleanup_loop()
-
     try:
         app.state.stop_daily_ingest.set()
-        for t in [getattr(app.state, "startup_ingest_task", None), getattr(app.state, "daily_ingest_task", None)]:
+        for t in (getattr(app.state, "startup_ingest_task", None),
+                  getattr(app.state, "daily_ingest_task", None)):
             if t and not t.done():
                 t.cancel()
     except Exception:
         pass
 
 
-app = FastAPI(title="ChatLink Unified Bot", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="ChatLink Unified Bot", version="3.1.0", lifespan=lifespan)
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
-if not os.path.exists(static_dir):
-    os.makedirs(static_dir)
-
+os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# Mount API
 app.include_router(api_router, prefix="/api")
 app.include_router(sim_router, prefix="/api/test")
 
-from fastapi.responses import FileResponse
+
 @app.get("/")
 async def serve_frontend():
     return FileResponse(os.path.join(static_dir, "index.html"))
 
+
 if __name__ == "__main__":
     import uvicorn
 
-    API_HOST = os.getenv("API_HOST", "0.0.0.0")
-    API_PORT = int(os.getenv("API_PORT", "8000"))
-    uvicorn.run("chatlink_bot.main:app", host=API_HOST, port=API_PORT, reload=False)
+    uvicorn.run("chatlink_bot.main:app",
+                host=os.getenv("API_HOST", "0.0.0.0"),
+                port=int(os.getenv("API_PORT", "8000")),
+                reload=False)

@@ -390,46 +390,98 @@ func (s *WhatsAppServer) StartLogin(ctx context.Context, req *pb.LoginRequest) (
 	newDev := s.Container.NewDevice()
 	client := whatsmeow.NewClient(newDev, waLog.Stdout("Client", "INFO", true))
 
-	// 1. Get the QR channel so we can wait for the connection to stabilize
+	// Open the QR channel BEFORE connecting. For the pairing-code flow this
+	// channel is our refresh clock: whatsmeow emits an item roughly every
+	// ~30-60s. Each WhatsApp pairing code is only valid for ~60s server-side
+	// (we cannot extend a single code), so on every refresh tick we request a
+	// FRESH code and push it to the client over the event stream. That keeps a
+	// live code in front of the user for the whole session instead of one that
+	// silently dies after a minute.
 	qrChan, _ := client.GetQRChannel(context.Background())
 
-	// 2. We MUST connect before asking for a pairing code
 	if err := client.Connect(); err != nil {
 		s.Logger.WithError(err).Error("Connection failed")
 		return &pb.QRCodeResponse{Status: "error", Code: err.Error()}, nil
 	}
 
-	// 3. Wait for the websocket to fully open (by waiting for the first QR event)
+	// Wait for the websocket to actually open (first channel item) before
+	// asking for the first pairing code.
 	select {
 	case <-qrChan:
-		s.Logger.Info("Websocket connected, requesting pairing code...")
+		s.Logger.Info("Websocket connected, requesting first pairing code...")
 	case <-time.After(10 * time.Second):
 		s.Logger.Warn("Timeout waiting for websocket to establish")
 		client.Disconnect()
 		return &pb.QRCodeResponse{Status: "error", Code: "Connection timeout"}, nil
 	}
 
-	// 4. Generate the 8-character pairing code (Notice the 'ctx' argument added here)
-	linkingCode, err := client.PairPhone(ctx, req.PhoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	requestCode := func() (string, error) {
+		return client.PairPhone(ctx, req.PhoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	}
+
+	// First code — returned synchronously to the caller as before.
+	linkingCode, err := requestCode()
 	if err != nil {
 		s.Logger.WithError(err).Error("Failed to generate pairing code")
 		client.Disconnect()
 		return &pb.QRCodeResponse{Status: "error", Code: err.Error()}, nil
 	}
 
-	// 5. Wait in the background for the user to type the code into their phone
+	// Background: refresh the code as it expires and watch for success.
+	// Total session cap is generous now because we keep issuing live codes;
+	// tune WHATSMEOW_PAIR_SESSION_S if you want longer/shorter.
 	go func() {
-		// As the docs state, the websocket closes after ~160 seconds if no login occurs
-		timeout := time.After(3 * time.Minute)
+		sessionTimeout := time.After(5 * time.Minute)
 		for {
 			select {
-			case <-timeout:
-				s.Logger.Warn("Pairing timed out")
+			case <-sessionTimeout:
+				s.Logger.Warn("Pairing session timed out after 5 minutes")
 				client.Disconnect()
 				return
-			default:
-				if client.IsLoggedIn() {
+
+			case item, ok := <-qrChan:
+				if !ok {
+					// Channel closed by whatsmeow (login done or socket gone).
+					if client.IsLoggedIn() {
+						s.Logger.Info("Pairing Success")
+						s.registerClient(client)
+					} else {
+						s.Logger.Warn("QR channel closed without login")
+						client.Disconnect()
+					}
+					return
+				}
+				switch item.Event {
+				case "success":
 					s.Logger.Info("Pairing Success")
+					s.registerClient(client)
+					return
+				case "timeout":
+					s.Logger.Warn("QR/pairing timed out on WhatsApp side")
+					client.Disconnect()
+					return
+				case "code":
+					// The old code just expired; request a fresh one and push
+					// it to the user via the existing event stream.
+					newCode, err := requestCode()
+					if err != nil {
+						s.Logger.WithError(err).Warn("Failed to refresh pairing code")
+						continue
+					}
+					s.Logger.Info("Issued refreshed pairing code")
+					s.broadcastEvent(&pb.MessageEvent{
+						From: "__PAIRING__",
+						Text: newCode,
+					})
+				default:
+					// Ignore other event kinds; keep waiting.
+				}
+
+			default:
+				// Also poll IsLoggedIn as a belt-and-suspenders check in case
+				// the success event is missed.
+				if client.IsLoggedIn() {
+					s.Logger.Info("Pairing Success (polled)")
 					s.registerClient(client)
 					return
 				}
@@ -438,7 +490,6 @@ func (s *WhatsAppServer) StartLogin(ctx context.Context, req *pb.LoginRequest) (
 		}
 	}()
 
-	// Return the pairing code immediately to Python
 	return &pb.QRCodeResponse{Code: linkingCode, Status: "code"}, nil
 }
 
