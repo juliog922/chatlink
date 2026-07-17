@@ -638,8 +638,21 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                     pending.append((h.message or "").strip())
                 else:
                     break
-            current_message = "\n".join(reversed(pending)).strip() or (
-                getattr(last_client_msg, "message", "") or "")
+            # BATCHING: `pending` is the whole trailing run of client messages
+            # since the last bot/salesman turn — every message that arrived
+            # during the debounce window is answered together, in ONE turn.
+            # If it is empty, there is nothing NEW to answer: a spurious or
+            # duplicate trigger (e.g. a re-debounce after a message that the
+            # previous turn already folded in). Answering the old last message
+            # again is exactly the "responds twice" bug — stay silent instead.
+            if not pending:
+                logger.info(f"[AI_FLOW] No new client messages since last reply for "
+                            f"{channel}/{client_id}; nothing to answer, staying silent.")
+                return
+            if len(pending) > 1:
+                logger.info(f"[AI_FLOW] Batching {len(pending)} client messages into one turn "
+                            f"for {channel}/{client_id}.")
+            current_message = "\n".join(reversed(pending)).strip()
 
             # LOOP BREAKER (last resort): if the newest "client" text is
             # byte-identical to the bot's own last reply, an echo leaked past
@@ -668,6 +681,12 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
             working_status = "IDLE" if ended else (session.order_status or "IDLE")
             working_cart: List[Dict[str, Any]] = [] if ended else (session.cart or [])
             working_summary = "" if ended else (session.summary or "")
+            # The multi-item enrichment queue and the one-time capability
+            # guide are per-conversation: an ended conversation starts clean.
+            # getattr fallbacks: tolerate a ConversationSession row that
+            # predates the open_items / guide_shown columns (stale schema).
+            working_open_items: List[Dict[str, Any]] = [] if ended else (getattr(session, "open_items", None) or [])
+            working_guide_shown = False if ended else bool(getattr(session, "guide_shown", False))
 
             client_obj = await (_find_client_by_phone(client_id) if channel == "whatsapp"
                                 else _find_client_by_email(client_id))
@@ -681,6 +700,8 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 salesman_name=salesman_name,
                 session={"order_status": working_status, "cart": working_cart,
                          "summary": working_summary,
+                         "open_items": working_open_items,
+                         "guide_shown": working_guide_shown,
                          "last_closed_cart": session.last_closed_cart or []},
                 recent_history=_history_lines(history),
                 current_message=current_message,
@@ -693,11 +714,15 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
             if result.opt_out:
                 reply = OPTOUT_TEXT.format(salesman=salesman_name)
             elif result.handoff:
-                # handoff=True now means PURE escalation (mixed order+price
-                # turns clear the flag in the agent and answer verbally): the
-                # canned referral goes out and the bot stands down until the
-                # salesman replies. No notification email — product decision.
-                reply = result.reply.strip() or HANDOFF_TEXT.format(salesman=salesman_name)
+                # handoff + silent = Pass-1 triage ESC_HANDOFF (explicit human
+                # demand / anger / uncommercial dispute): strict silence — no
+                # canned line, no LLM text — the salesman takes over clean.
+                # handoff without silent keeps the previous semantics: PURE
+                # escalation decided in the agent loop -> canned referral.
+                if result.silent:
+                    reply = ""
+                else:
+                    reply = result.reply.strip() or HANDOFF_TEXT.format(salesman=salesman_name)
             else:
                 reply = result.reply.strip()
             spoke_as_kapa = bool(reply) and not (result.opt_out or (result.handoff and not result.reply.strip()))
@@ -711,8 +736,13 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 handoff=result.handoff, opt_out=result.opt_out,
             )
             session.order_status, session.cart, session.summary = result.order_status, result.cart, result.summary
-            session.open_items = result.open_items
-            session.guide_shown = bool(result.guide_shown)
+            # These two columns may be absent on an out-of-date table; only
+            # assign when the mapper actually has them (a bare setattr on an
+            # ORM object without the column would silently never persist).
+            if hasattr(type(session), "open_items"):
+                session.open_items = result.open_items
+            if hasattr(type(session), "guide_shown"):
+                session.guide_shown = bool(result.guide_shown)
             if result.order_status == "CLOSED":
                 session.last_closed_cart = result.cart
             if result.opt_out:
@@ -736,26 +766,39 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 sim_capture.record((channel, client_id, user_id), reply,
                                    meta={"ctx": getattr(result, "ctx", {})})
 
-            # 7. Salesman notifications (skipped in simulation: deterministic,
-            #    fast test turns — channel mode verifies transports via the
-            #    client-facing reply). A closed order ships as xlsx. Handoffs
-            #    do NOT email the salesman anymore (per product decision: he
-            #    sees the conversation on his own WhatsApp; the mails were
-            #    noise) — the handoff only silences the bot until he replies.
+            # 7. Salesman notifications. A closed order ships as xlsx. Handoffs
+            #    do NOT email the salesman (he sees the conversation on his own
+            #    WhatsApp). The email goes out for any REAL salesman inbox —
+            #    including full-mode self-talk, which exists precisely to verify
+            #    end-to-end delivery. Only the fake simulation fixtures
+            #    (sales@sim.com / admin@sim.com) have no inbox and are skipped.
             target_email = getattr(user_obj, "email", None)
-            if target_email and not is_simulation:
-                if result.order_status == "CLOSED" and result.cart:
+            is_fake_sim_actor = bool(target_email) and \
+                target_email.strip().lower().endswith("@sim.com")
+            if result.order_status == "CLOSED" and result.cart:
+                if not target_email:
+                    logger.error(f"[AI_FLOW] Order CLOSED for {client_id} but salesman has no "
+                                 "email on file; cannot deliver the xlsx.")
+                elif is_fake_sim_actor:
+                    logger.info(f"[AI_FLOW] Order CLOSED; salesman {target_email} is a sim "
+                                "fixture with no inbox — xlsx email skipped.")
+                else:
                     logger.info(f"[AI_FLOW] Order CLOSED; emailing xlsx to {target_email} with "
                                 f"{len(result.cart)} rows: {[i.get('code') for i in result.cart]}")
-                    await asyncio.to_thread(
+                    ok, err = await asyncio.to_thread(
                         email_transport.send_email,
                         to_email=target_email,
                         subject=f"Pedido confirmado ({client_id})",
-                        body=f"Pedido confirmado para {client_id} ({client_name}).\n\nItems: {result.cart}",
+                        body=f"Pedido confirmado para {client_id} ({client_name}).\n\n"
+                             f"Items: {result.cart}",
                         attachments=[("order.xlsx",
                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                       _xlsx_from_cart(result.cart))],
                     )
+                    if ok:
+                        logger.info(f"[AI_FLOW] Order xlsx delivered to {target_email}.")
+                    else:
+                        logger.error(f"[AI_FLOW] Order xlsx FAILED to send to {target_email}: {err}")
     except Exception as e:
         logger.exception(f"[AI_FLOW] Unhandled error for {channel}/{client_id}: {e}")
     finally:

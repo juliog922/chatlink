@@ -191,23 +191,27 @@ _OCR_SYSTEM_PROMPT = (
     "listas manuscritas, etiquetas de productos, fotos de envases o estanterías, "
     "capturas de pedidos anteriores.\n"
     "TAREA, en este orden:\n"
-    "1) Transcribe fielmente TODO el texto visible, preservando estructura "
+    "1) SIEMPRE empieza con una línea:\n"
+    "DESCRIPCIÓN: <una frase diciendo QUÉ es la imagen (lista manuscrita, foto de "
+    "envase, captura de chat, etiqueta, estantería…) y QUÉ TAN LEGIBLE es "
+    "(clara / cuesta leerla / manuscrita difícil / borrosa / casi ilegible)>.\n"
+    "2) Transcribe fielmente TODO el texto visible, preservando estructura "
     "(saltos de línea, listas, tablas). No corrijas ortografía; mantén el idioma "
     "original; marca lo dudoso como [ilegible].\n"
-    "2) Si detectas productos, termina con una sección:\n"
+    "3) Si detectas productos, termina con una sección:\n"
     "PRODUCTOS DETECTADOS:\n"
     "- <cantidad si se ve> <producto> <marca si se ve> <código/referencia si se ve> "
     "<color/variante si se ve>\n"
     "(una línea por producto; omite la sección si no hay productos).\n"
-    "3) Si la imagen NO contiene texto: describe en 1-2 frases centrándote en los "
-    "productos cosméticos visibles (tipo de producto, marca, color del envase o "
-    "etiqueta), no en el fondo ni la escena."
+    "4) Si la imagen NO contiene texto: en la DESCRIPCIÓN céntrate en los productos "
+    "cosméticos visibles (tipo de producto, marca, color del envase o etiqueta), "
+    "no en el fondo ni la escena."
 )
 
 _OCR_USER_PROMPT = (
-    "Extrae el texto de esta imagen y, si contiene productos de cosmética, "
-    "añade al final la sección PRODUCTOS DETECTADOS con cada producto, cantidad, "
-    "marca y código visibles."
+    "Describe primero la imagen (qué es y cómo de legible), luego extrae el texto, "
+    "y si contiene productos de cosmética añade al final la sección PRODUCTOS "
+    "DETECTADOS con cada producto, cantidad, marca y código visibles."
 )
 
 

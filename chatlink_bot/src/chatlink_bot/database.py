@@ -2,6 +2,7 @@ import os
 import urllib.parse
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 # --- Postgres Configuration (Write Access) ---
 PG_USER = os.getenv("POSTGRES_USER", "postgres")
@@ -12,7 +13,7 @@ PG_PORT = os.getenv("POSTGRES_PORT", "5432")
 
 PG_URL = f"postgresql+asyncpg://{PG_USER}:{PG_PASS}@{PG_HOST}:{PG_PORT}/{PG_DB}"
 
-pg_engine = create_async_engine(PG_URL, echo=False)
+pg_engine = create_async_engine(PG_URL, echo=False, pool_pre_ping=True, pool_recycle=1800)
 AsyncSessionPG = async_sessionmaker(pg_engine, expire_on_commit=False, class_=AsyncSession)
 
 # --- SQL Server Configuration (Read Access) ---
@@ -35,7 +36,18 @@ params = urllib.parse.quote_plus(
 
 SQLSERVER_URL = f"mssql+aioodbc:///?odbc_connect={params}"
 
-sql_engine = create_async_engine(SQLSERVER_URL, echo=False)
+sql_engine = create_async_engine(
+    SQLSERVER_URL,
+    echo=False,
+    # The SQL Server (SAGE) link is read-only, low-frequency, and often behind
+    # a VPN that drops idle connections. A pooled connection killed mid-idle
+    # is what the GC later reports as "non-checked-in ... cannot be safely
+    # terminated". NullPool opens a fresh aioodbc connection per use and
+    # closes it on release, so there is nothing pooled to go stale or leak;
+    # pre_ping still verifies the socket before the query runs.
+    poolclass=NullPool,
+    pool_pre_ping=True,
+)
 AsyncSessionSQL = async_sessionmaker(sql_engine, expire_on_commit=False, class_=AsyncSession)
 
 

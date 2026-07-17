@@ -110,6 +110,11 @@ class ConversationSession(PGBase):
     cart = Column(JSON, default=list)                     # [{"code": str, "qty": int}]
     summary = Column(Text, default="")                    # rolling context note
     last_closed_cart = Column(JSON, default=list)         # last dispatched order
+    # Multi-item work queue: unresolved products with their option snapshots,
+    # or estado="enriquecer" items (Pass-1 AMBIGUOUS) awaiting client detail.
+    open_items = Column(JSON, default=list)
+    # One-time "how I work best" capability guidance delivered flag.
+    guide_shown = Column(Boolean, default=False)
 
     conv_open = Column(Boolean, default=False)
     bot_enabled = Column(Boolean, default=True)

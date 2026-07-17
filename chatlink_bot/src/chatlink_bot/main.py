@@ -154,6 +154,16 @@ async def lifespan(app: FastAPI):
     # 1) Postgres tables
     async with pg_engine.begin() as conn:
         await conn.run_sync(PGBase.metadata.create_all)
+        # create_all never ALTERs an existing table, so columns added to a
+        # model after its table was first created are missing on upgrade.
+        # These IF NOT EXISTS statements are idempotent and cheap; they bring
+        # conversation_sessions up to the current model without Alembic.
+        await conn.execute(text(
+            "ALTER TABLE conversation_sessions "
+            "ADD COLUMN IF NOT EXISTS open_items JSONB DEFAULT '[]'::jsonb"))
+        await conn.execute(text(
+            "ALTER TABLE conversation_sessions "
+            "ADD COLUMN IF NOT EXISTS guide_shown BOOLEAN DEFAULT FALSE"))
     await _ensure_simulation_actors()
 
     # 2) Event handlers
