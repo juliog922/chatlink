@@ -304,8 +304,11 @@ lo más exacto); si confirma que se llama así tal cual, búscalo.
 síguelas; UNA sola pregunta por turno. Tras resolver un pendiente, sigue \
 con el siguiente de "Pendientes de identificar" (ya tienes sus opciones).
 - El mensaje continúa el historial: hablabais de delineadores y "los \
-quiero de Gelfix" → ["delineador gelfix", "gelfix"]. Una marca sola se busca; \
-un color o atributo solo NUNCA: "el negro" tras Gelfix → ["gelfix negro"]. No preguntes "¿qué tipo?" si el historial lo dice.
+quiero de Gelfix" → ["delineador gelfix", "gelfix"]. Pero una MARCA sola, sin \
+producto ("gelfix", "¿qué tienes de Lamel?"), NO se busca: el cliente tiene el \
+catálogo, así que pídele QUÉ producto de esa marca quiere (o el código). Un \
+color o atributo solo NUNCA: "el negro" tras Gelfix → ["gelfix negro"]. No \
+preguntes "¿qué tipo?" si el historial lo dice.
 - "la 2" → el código de esa línea de TU última lista.
 - Nunca digas "un momento" / "voy a mirar": busca YA o responde con lo que sabes.
 
@@ -658,9 +661,12 @@ facturas, pagos, incidencias, reclamaciones, devoluciones, estado o envío de \
 un pedido, o consejo sobre productos (para qué sirve, cuál es mejor). PEDIR \
 productos ("quiero 4 champús", "ponme 2 cremas") NO es derivacion: eso es un \
 pedido normal, va en "articulos". Preguntar "¿qué productos tienes?" o pedir \
-ver el catálogo TAMPOCO es derivacion: el asistente lo resuelve él mismo \
-(busca por nombre/código), así que marca "saludo" en su lugar. El asistente \
-NO se calla en derivacion: dirá que eso se lo confirma el comercial.
+ver el catálogo (SIN nombrar marca ni tipo) TAMPOCO es derivacion: márcalo \
+"saludo" (el asistente lo resuelve él mismo). Y si preguntan qué hay de una \
+MARCA o TIPO concretos ("¿qué productos tienes de Gelfix?", "¿qué champús \
+tienes?"), eso es una BÚSQUEDA: NO es derivacion — pon esa marca/tipo en \
+"articulos" (ej. consulta "gelfix" o "champú"). El asistente NO se calla en \
+derivacion: dirá que eso se lo confirma el comercial.
 - "saludo": el mensaje es un saludo o una apertura de conversación ("hola", \
 "buenas", "hey", "¿estás?", "buenos días") o dice que quiere hacer/empezar un \
 pedido SIN concretar productos todavía ("quiero hacer un pedido", "necesito \
@@ -679,13 +685,16 @@ REGLAS DE "articulos" (una entrada por producto mencionado; [] si no hay):
 - "consulta": términos de búsqueda cortos: producto + marca/atributos/medida. \
 Sin cantidades, sin verbos, sin frases enteras.
 - "cantidad": el número pedido (1 si no lo dice).
-- "clase" = "WORTHY" si lleva marca (L'Action, Nivea, Katai…), medida exacta \
-(8 grs, 150 ml, nº 3), atributos concretos de línea (antiedad, waterproof, \
-tono nude…) o un código alfanumérico (KG001399, 14-1127) — con eso ya se \
-puede buscar en el catálogo.
-- "clase" = "AMBIGUOUS" si es categoría genérica sin marca ni medida ni \
-atributo distintivo ("una crema de cara", "unos delineadores", "algo para \
-el pelo") — buscar eso a ciegas devolvería ruido.
+- "clase" = "WORTHY" si nombra un PRODUCTO (tipo o nombre) y además lleva \
+marca (L'Action, Nivea, Katai…), medida exacta (8 grs, 150 ml, nº 3), \
+atributos concretos de línea (antiedad, waterproof, tono nude…) o un código \
+alfanumérico (KG001399, 14-1127) — con eso ya se puede buscar en el catálogo. \
+Tiene que haber un PRODUCTO: una marca sola ("gelfix", "de nivea") NO es \
+WORTHY.
+- "clase" = "AMBIGUOUS" si es genérico: categoría sin más ("una crema de \
+cara", "unos delineadores"), SOLO una marca sin producto ("algo de gelfix", \
+"qué tienes de lamel"), o "algo para el pelo" — buscar eso a ciegas devolvería \
+ruido; hay que pedir el producto concreto o el código.
 - "clase" = "ATTRIBUTE" si la mención es SOLO un atributo o variante — un \
 color, un tamaño, un acabado, un número de la lista — del producto del que \
 se venía hablando en el historial ("el negro", "la grande", "el mate").
@@ -940,10 +949,16 @@ JSON, con esta forma exacta:
 Repite cada consulta EXACTAMENTE como te llega, una entrada por consulta.
 
 CLASES:
-- "SEARCHABLE": identifica un producto concreto — nombre distintivo, marca, \
-línea, medida o código ("crema kerapro", "delineador katai", "14-1127").
-- "GENERIC": solo una categoría o palabras vacías que devolverían cientos de \
-resultados ("crema", "productos", "esmaltes", "algo barato", "el catálogo").
+- "SEARCHABLE": nombra un PRODUCTO concreto (tipo de producto o su nombre \
+distintivo), a veces con marca/línea/medida, o un código: "crema kerapro", \
+"delineador katai", "mascarilla antiedad 8gr", "14-1127". La clave es que hay \
+un PRODUCTO, no solo una marca o una categoría.
+- "GENERIC": NO identifica un producto: solo una categoría ("crema", \
+"esmaltes", "champú"), solo una MARCA sin producto ("gelfix", "lamel", "de \
+nivea"), preguntar qué hay de una marca o en general ("qué productos tienes", \
+"qué tienes de gelfix", "el catálogo"), o palabras vacías ("algo barato"). \
+Buscar esto devolvería cientos de resultados o ninguno útil: hay que pedir al \
+cliente el producto o el código.
 - "ATTRIBUTE": solo un atributo o variante — color, tamaño, acabado, número \
 — que depende del producto del que se venía hablando ("negro", "el mate", \
 "la grande", "la 2")."""
@@ -1535,24 +1550,39 @@ class _ToolExecutor:
 
 
 def _clean(text: str) -> str:
-    """Strip reasoning tags and the silence token from model output."""
+    """Strip reasoning tags, the silence token, and sentences where the model
+    leaks its OWN internal process into the client reply."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
     if "<NO_REPLY>" in text:
         return ""
-    # Small models sometimes ACKNOWLEDGE our internal nudges in the client
-    # reply ("...basándome en esa instrucción interna", "interpreto que me
-    # pides que reformule..."). Those references are to OUR machinery, never
-    # to anything the client wrote — drop any sentence that mentions the
-    # internal-instruction marker or narrates a reformulation request. This is
-    # structural (our own marker words), not client-intent vocabulary.
+    # Small models leak their machinery into the reply in a few recurring ways,
+    # all about the BOT's own process (never anything the client wrote):
+    #   - acknowledging our internal nudges ("...esa instrucción interna",
+    #     "interpreto que me pides que reformule");
+    #   - apologizing for a technical delay / narrating that it is waiting on a
+    #     search ("disculpa, estaba esperando la respuesta de la búsqueda");
+    #   - promising to go look instead of having looked ("dame un segundo
+    #     mientras lo reviso", "voy a buscar", "un momento").
+    # Drop whole sentences that match — these are structural signatures of the
+    # bot malfunctioning, not client-intent vocabulary. Runs on EVERY exit
+    # path (loop and forced answers) because every reply passes through here.
+    leak = re.compile(
+        r"instruccion interna|reformul\w+ mi respuesta|"
+        r"me estas pidiendo que (reformul|reescrib|reh[ai]c)|"
+        r"(disculpa|perdona|lo siento|te pido disculpas)[^.!?]*"
+        r"(busqued|esperando|sistema|proceso|resultado|interno)|"
+        r"estaba esperando|esperando (la|el|los|las) (respuesta|resultado|busqued)|"
+        r"(dame|espera|deja(me)?) un (momento|segundo|segundito|instante)|"
+        r"un (momento|segundo|segundito|instante)(,| )|"
+        r"(mientras|ahora mismo) (lo |las |los )?(reviso|busco|miro|consulto|localizo)|"
+        r"voy a (buscar|mirar|revisar|consultar|localizar|enfocarme)|"
+        r"estoy (buscando|mirando|revisando|consultando)|"
+        r"enseguida (te )?(digo|miro|busco|reviso|localizo)")
     parts = re.split(r"(?<=[.!?\n])\s+", text)
-    kept = [p for p in parts if not re.search(
-        r"instrucci[oó]n interna|reformul\w+ mi respuesta|"
-        r"me est[aá]s pidiendo que (reformul|reescrib|reh[ai]c)",
-        _strip_accents_lower(p).replace("ó", "o"))]
+    kept = [p for p in parts if not leak.search(_strip_accents_lower(p))]
     cleaned = " ".join(kept).strip()
     if cleaned != text:
-        logger.info("[AGENT] Stripped a leaked internal-instruction reference from the reply.")
+        logger.info("[AGENT] Stripped a leaked internal/process reference from the reply.")
     return cleaned
 
 
@@ -2008,6 +2038,11 @@ async def run_agent(
             except Exception as e:
                 logger.error(f"[AGENT] Forced capability reply failed: {e}")
                 forced = ""
+            if not forced:
+                # Never leave a redirect turn empty: a plain, leak-free line.
+                forced = (f"Puedo localizarte productos por su nombre completo o su código de "
+                          f"producto y montarte el pedido aquí mismo. Para precios, stock o "
+                          f"incidencias, eso te lo confirma {salesman_name}. ¿Qué producto buscas?")
             return await _finish(forced)
         # A demoted mixed turn falls through as a normal order turn: the reply
         # still passes the grounding/humility/parroting guards. If the model
@@ -2250,8 +2285,11 @@ async def run_agent(
         messages.append(Message(role="user", content=_internal(
             "Se acabaron los pasos. Escribe AHORA la respuesta final al cliente siguiendo tus "
             "reglas: confirma con naturalidad lo que has apuntado (con sus códigos y cantidades), "
-            "y si pidió un resumen, dáselo a partir del carrito actual. NO llames a ninguna "
-            "herramienta; responde solo con el texto para el cliente.")))
+            "y si pidió un resumen, dáselo a partir del carrito actual. PROHIBIDO prometer que "
+            "vas a buscar, pedir que espere ('un momento', 'dame un segundo'), disculparte por "
+            "demoras o mencionar búsquedas, sistemas o procesos internos: la búsqueda ya ha "
+            "terminado, responde con lo que TIENES. NO llames a ninguna herramienta; responde "
+            "solo con el texto para el cliente.")))
         try:
             resp = await asyncio.to_thread(
                 llm.chat, CIMA_MODEL, messages,   # NO tools: text is the only valid output
@@ -2261,12 +2299,14 @@ async def run_agent(
             reply = _clean(resp.content)
         except Exception as e:
             logger.error(f"[AGENT] Forced final-answer call failed: {e}")
-        if not reply:
+        if len(reply.strip()) < 20:
+            # Empty, or cleaned down to a stub like "Entendido." after a leak
+            # was stripped — a deterministic state summary is more useful.
             greet = intro_mode == "new" or (
                 intro_mode == "renew" and (executor.order_activity or executor.results_this_turn))
             reply = _fallback_reply(list(executor.cart.values()), executor.open_items,
                                     client_name, salesman_name, greet)
-            logger.warning("[AGENT] Model still silent; using deterministic fallback reply.")
+            logger.warning("[AGENT] Forced reply empty/stub; using deterministic fallback.")
 
     reply, leaked_note = _split_leaked_note(reply)
     if leaked_note and not executor.summary_touched:
