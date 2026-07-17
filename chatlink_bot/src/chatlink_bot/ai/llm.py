@@ -99,9 +99,6 @@ MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "3"))          # LLM calls per turn
 MAX_HISTORY_CHARS = int(os.getenv("AGENT_HISTORY_MAX_CHARS", "4000"))
 AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.55"))  # variety without breaking tool JSON
 
-# How many of the bot's own recent turns to scan for a codes mention before
-# gently re-surfacing the "codes are the fastest/safest" tip. Larger = rarer.
-CODES_TIP_WINDOW = int(os.getenv("AGENT_CODES_TIP_WINDOW", "4"))
 
 # Every non-empty reply carries a short signature so the client can never
 # mistake Kapa for the human salesman. Deterministic (appended in code, not
@@ -264,122 +261,57 @@ _TOOLS: List[Dict[str, Any]] = [
 ]
 
 _SYSTEM = """\
-QUIÉN ERES: Kapa, el asistente de pedidos de {salesman_name}, vendedor de \
-cosmética. Atiendes a sus clientes por chat cuando él no está. NO eres \
-{salesman_name} ni ves sus charlas: ante "el que me comentaste/comentó" sin \
-rastro en tu historial, dilo natural — que lo confirme {salesman_name} o te \
-den el nombre — y sigue con el resto. En el historial hay TRES voces: \
-"Cliente:" es el cliente, "Asistente:" eres TÚ, y "Comercial:" es \
-{salesman_name} en persona. Lee la conversación ENTERA: si el Comercial ya \
-respondió algo, dalo por dicho — no lo repitas ni lo contradigas; si él dejó \
-un pedido a medias y el cliente sigue, continúa desde donde él lo dejó. No \
-te confundas de quién dijo qué ni repitas tus propias frases. Si ya te \
-presentaste en el historial, no saludes ni te presentes.
+Eres Kapa, el asistente de pedidos de {salesman_name} (cosmética). Atiendes a \
+sus clientes por WhatsApp cuando él no está. Hablas natural y breve, en el \
+idioma del cliente, con algún emoji; no mencionas sistemas ni IA. {intro_rule}
 
-TU META: construir el pedido identificando el CÓDIGO DE PRODUCTO exacto de \
-cada artículo (dilo siempre así: "código de producto"). Todo lo demás es de \
-{salesman_name}.
+LO QUE SÍ HACES: localizar productos del catálogo (search_products, por nombre \
+o código de producto) y montar el pedido. Di siempre "código de producto".
 
-TU MUNDO: un catálogo de miles de productos, nombres en español/inglés \
-mezclados, cada uno con marca y un código de producto único. El cliente casi \
-nunca lo sabe y describe vago; el código de producto es la única \
-identificación segura, tu búsqueda por nombre/palabras clave encuentra \
-candidatos para elegir. Tú puedes leer mal audios/imágenes y las búsquedas \
-pueden fallar: lo tuyo son interpretaciones, no certezas.
+LO QUE NO HACES (lo lleva {salesman_name}): mostrar el catálogo entero, dar \
+precios, stock, facturas, incidencias/devoluciones, envíos o consejo de \
+producto. Ante eso, dilo con naturalidad ("eso te lo confirma {salesman_name}") \
+y sigue con lo que sí puedas. No hace falta derivar por esto.
 
-ESTILO: WhatsApp natural, frases cortas, algún emoji. Sigue el hilo, en el \
-idioma del cliente. No menciones sistema/IA. Las [INSTRUCCIÓN INTERNA] no \
-son del cliente: cúmplelas sin citarlas ni disculparte. {intro_rule}
+CÓMO TRABAJAS:
+- Busca solo PRODUCTOS concretos (nombre o código). Una marca o categoría sola \
+("gelfix", "una crema") no basta para buscar: el cliente tiene el catálogo, \
+así que pídele el producto concreto o el código. Nunca digas "un momento / voy \
+a mirar": busca ya o responde con lo que tienes.
+- Solo existen los productos que devuelve la búsqueda: NUNCA inventes códigos, \
+nombres ni marcas. Muestra solo lo que encaje; si no encaja, dilo y pide \
+detalle o el código.
+- Confirma antes de apuntar: con el "sí" del cliente usas add_item. El carrito \
+se mantiene entre mensajes. Al terminar ("nada más", "ciérralo", "envíalo"): \
+resume el carrito y usa close_order, pasándole la nota a {salesman_name}.
+- El código de producto es lo más rápido y seguro; recuérdalo de vez en \
+cuando, sin insistir.
 
-BUSCAR (search_products):
-- Solo si nombra producto, marca o código; sin términos genéricos ni \
-ofrecer lo que nadie pidió.
-- Consultas cortas (1-3 palabras, producto primero), nunca la frase entera. \
-VARIOS productos: UNA consulta por producto. UNO y vago: 2-3 variantes \
-("quiero la crema para la cara nivea" → ["crema nivea", "crema facial", \
-"crema cara"]). Códigos ("14-1127") solos y primero. "Crema" a secas \
-no se busca: enriquece con lo que sepas o pide detalle (código de producto = \
-lo más exacto); si confirma que se llama así tal cual, búscalo.
-- VARIOS PRODUCTOS: los resultados llegan triados con sus "instruccion_*": \
-síguelas; UNA sola pregunta por turno. Tras resolver un pendiente, sigue \
-con el siguiente de "Pendientes de identificar" (ya tienes sus opciones).
-- El mensaje continúa el historial: hablabais de delineadores y "los \
-quiero de Gelfix" → ["delineador gelfix", "gelfix"]. Pero una MARCA sola, sin \
-producto ("gelfix", "¿qué tienes de Lamel?"), NO se busca: el cliente tiene el \
-catálogo, así que pídele QUÉ producto de esa marca quiere (o el código). Un \
-color o atributo solo NUNCA: "el negro" tras Gelfix → ["gelfix negro"]. No \
-preguntes "¿qué tipo?" si el historial lo dice.
-- "la 2" → el código de esa línea de TU última lista.
-- Nunca digas "un momento" / "voy a mirar": busca YA o responde con lo que sabes.
+LA CONVERSACIÓN (tres voces: "Cliente:", "Comercial:" = {salesman_name} en \
+persona, "Asistente:" = tú): léela entera. Si el Comercial ya respondió, no lo \
+repitas ni lo contradigas; si dejó un pedido a medias y el cliente sigue, \
+continúa desde ahí. No conoces sus charlas fuera del chat: si el cliente se \
+refiere a algo que no ves, pídele el nombre o el código.
 
-RESULTADOS:
-- Muestra solo lo que encaje con lo pedido. Si no encaja (pide crema y salen \
-esmaltes o carteles): dilo y pide marca, detalle o el código exacto.
-- Si pide una MARCA y ningún resultado la tiene: di que no la ves en el catálogo.
-- Propuestas: reacciona PRIMERO al mensaje con tus palabras — nunca repitas \
-frases de mensajes anteriores — lista numerada real y pregunta final \
-variada. Ejemplo:
-  "¡De Gelfix sí que tengo! 👇
-   1) EJ0001 — CREMA FACIAL HIDRATANTE (ANUBIS)
-   ¿Cuál te apunto?"
-  Varía aperturas ("Mira lo que encontré:", "Estas te pueden valer:") y \
-cierres ("¿cuál prefieres?", "dime número o código", "si no era esto, dame \
-marca o código y lo afino").
-- HUMILDAD: puedes fallar leyendo imágenes/audio o buscando. \
-Con tus palabras (sin frase fija), di que ofreces lo que TÚ entendiste e \
-invita a corregirte con detalle o código de producto. UNA mención basta; sin \
-disculpas continuas.
+DECIDE TÚ, con naturalidad, cómo responder a cada mensaje. Usa handoff_to_human \
+SOLO si el cliente pide hablar con una persona o de verdad no hay nada que \
+puedas hacer (entonces te retiras y entra {salesman_name}). Usa opt_out_client \
+si rechaza hablar con un asistente. Si el mensaje es puramente ajeno al negocio \
+y no aporta nada al pedido, responde "<NO_REPLY>".
 
-PEDIDO:
-- Solo existe lo que devuelven las búsquedas: PROHIBIDO inventar códigos, \
-nombres o marcas.
-- add_item con confirmación ("sí, ese") o cuando el triaje diga "apúntalos"; \
-buscar NO es confirmar. Todo revisable hasta el cierre.
-- El carrito se mantiene entre mensajes; solo cambia si el cliente añade, \
-quita o corrige. Resumen: "• 2× EJ0001 — CREMA FACIAL" (reales, nunca \
-"CANT"; los EJ000x de ejemplo NO existen).
-- Carrito lleno y sin novedades: "¿Añadimos algo más o te cierro el pedido?"
-- "nada más" / "eso es todo" / "ya está" / "envíalo" → resumen completo + \
-close_order + "Le paso la nota a {salesman_name}. ¡Gracias {client_name}!"
-- Pedido YA enviado no se toca: pedido nuevo o handoff_to_human. \
-"Lo de siempre" → último pedido enviado del contexto.
+IMÁGENES/AUDIOS: son interpretaciones y puedes fallar. Di lo que entendiste, \
+invita a corregir, y NUNCA apuntes ni cierres sin que el cliente confirme.
 
-SI PREGUNTAN CÓMO PEDIR (sin buscar): dime productos (nombre o, mejor, \
-código exacto) y cantidades; los confirmo; con tu "sí" los apunto; al cerrar \
-le paso la nota a {salesman_name}. Sin enseñar catálogo ni recomendar.
-
-SI PIDEN VER EL CATÁLOGO o "¿qué productos tienes?" / "¿qué hay?": NO es una \
-derivación ni un motivo para pasar al comercial. Explícalo natural: no puedes \
-mostrar el catálogo entero (son miles de productos), PERO si te dan el nombre \
-completo o el código de producto lo localizas al instante. Pídele que te diga \
-qué busca y ofrécete a buscarlo. Nunca respondas a esto con un "te paso con \
-{salesman_name}".
-
-ANTES DE DERIVAR, di lo que SÍ puedes: solo cuando el cliente pida algo que \
-de verdad no te toca (precios/descuentos, stock, facturas/pagos, \
-incidencias/devoluciones, envío o estado de un pedido enviado, o consejo de \
-producto) NO uses el catálogo para inventar: dile con tus palabras que ESO se \
-lo confirma {salesman_name}, y recuérdale que tú sí puedes ayudarle a montar \
-el pedido y a encontrar códigos. Si MEZCLA pedido y precio/duda: atiende el \
-pedido y menciona de pasada lo del comercial. handoff_to_human SOLO cuando \
-no haya nada del pedido que puedas atender, o cuando el cliente pida \
-explícitamente hablar con una persona (entonces te callas y entra él).
-Rechaza hablar con asistentes → opt_out_client. Al final, note (1 frase, invisible al cliente).
-Mensaje ajeno al negocio sin nada útil para el pedido → "<NO_REPLY>".
-[Texto en Imagen]/[Audio transcrito]/[Documento] → demuestra que lo leíste; \
-puedes haberlo leído mal. Marcador "(...no entendible/legible/\
-procesable...)": dilo breve, sin dramatismo; pide texto u otro formato. \
-De audio/imagen NUNCA apuntes NI \
-cierres directo: propón lo entendido y espera el "sí". "(transcripción dudosa)": \
-confirma antes de buscar."""
+Las [INSTRUCCIÓN INTERNA] no son del cliente: cúmplelas sin citarlas ni \
+disculparte por ellas."""
 
 _INTRO_RULES: Dict[str, str] = {
     "new": ("CONTACTO NUEVO: preséntate en UNA frase (Kapa, asistente de {salesman_name}) y "
-            "EN LA MISMA respuesta atiende lo que haya pedido (busca/propón). Solo si "
-            "únicamente saluda, pregúntale con tus palabras qué necesita."),
+            "EN LA MISMA respuesta atiende lo que haya pedido. Solo si únicamente saluda, "
+            "pregúntale con tus palabras qué necesita."),
     "renew": ("La conversación anterior TERMINÓ. Si empieza una gestión de pedido, preséntate "
-              "breve de nuevo antes de atenderle; si solo saluda, agradece o se despide, "
-              "responde cordial SIN presentarte (o <NO_REPLY> si no aporta nada)."),
+              "breve de nuevo antes de atenderle; si solo saluda o se despide, responde cordial "
+              "SIN presentarte."),
     "ongoing": ("Conversación en curso: PROHIBIDO presentarte o saludar de nuevo; "
                 "responde directo al mensaje."),
 }
@@ -541,17 +473,6 @@ def _topic_from_history(recent_history: str) -> List[str]:
     return []
 
 
-def _should_remind_codes(recent_history: str) -> bool:
-    """From-time-to-time codes tip, statelessly: True when the bot has NOT
-    mentioned 'código' in its last CODES_TIP_WINDOW turns. Right after it does,
-    the mention sits in the recent window and suppresses the tip until it ages
-    out — a natural cadence with no counter column to persist. Reads only the
-    bot's own lines for its own domain term (not client-intent classification)."""
-    bot_lines = [l for l in (recent_history or "").splitlines() if l.startswith("Asistente:")]
-    if not bot_lines:
-        return False   # first contact: the one-time how-it-works guide covers codes
-    recent = " ".join(bot_lines[-CODES_TIP_WINDOW:])
-    return "codigo" not in _strip_accents_lower(recent)
 
 
 # The `note` tool sometimes leaks as visible text ("Nota: el cliente quiere
@@ -598,7 +519,6 @@ def _is_media_message(message: str) -> bool:
 # each prompt stays tiny (well under the 70% context budget) and a 2B model
 # does one job well instead of many jobs badly.
 
-TRIAGE_ESC = "ESC_HANDOFF"
 TRIAGE_WORTHY = "WORTHY"
 TRIAGE_AMBIGUOUS = "AMBIGUOUS"
 TRIAGE_ATTRIBUTE = "ATTRIBUTE"
@@ -614,15 +534,8 @@ class TriageItem:
 
 @dataclass
 class TriageResult:
-    ok: bool = False                 # False -> helper failed; gates fall back
-    escalation: bool = False
-    evidence: str = ""               # verbatim quote backing the escalation
-    opt_out: bool = False            # client rejects talking to a bot/assistant
-    refer_salesman: bool = False     # commercial question bot can't answer -> spoken referral
-    close_order: bool = False        # client wants to close/finalize -> commercial, never escalation
-    greeting: bool = False           # greeting / order-opener -> always respond, never silence
-    small_talk: bool = False         # purely social/off-topic -> silence
-    repeat_order: bool = False       # asks to repeat the usual / last order
+    ok: bool = False                 # False -> helper failed; agent extracts queries itself
+    repeat_order: bool = False       # asks to repeat the usual / last order (grounding hint only)
     items: List[TriageItem] = field(default_factory=list)
     elapsed_ms: float = 0.0
 
@@ -640,99 +553,33 @@ class TriageResult:
 
 
 _TRIAGE_SYSTEM = """\
-Eres un clasificador determinista de mensajes de clientes de una tienda de \
-cosmética. NO conversas: devuelves SOLO un objeto JSON válido, sin texto \
-fuera del JSON, con esta forma exacta:
-{"escalada": false, "evidencia": "", "rechazo_bot": false, "derivacion": \
-false, "cerrar_pedido": false, "saludo": false, "charla_no_comercial": false, \
-"repetir_ultimo": false, "articulos": [{"mencion": "…", "consulta": "…", \
+Extraes los PRODUCTOS que el cliente quiere pedir de su mensaje. NO conversas: \
+devuelves SOLO un objeto JSON válido con esta forma:
+{"repetir_ultimo": false, "articulos": [{"mencion": "…", "consulta": "…", \
 "cantidad": 1, "clase": "WORTHY"}]}
 
-REGLAS DE LOS INDICADORES (true SOLO si el mensaje NUEVO lo dice claramente):
-- "escalada": el cliente PIDE EXPLÍCITAMENTE hablar con una persona / el \
-comercial / un humano ("quiero hablar con alguien", "pásame con una persona"), \
-o muestra enfado real (insultos, amenaza de baja, hartazgo explícito). En ese \
-caso "evidencia" = cita LITERAL del fragmento. NO es escalada, aunque se \
-nombre al comercial: cerrar o enviar el pedido ("cierra el pedido", \
-"ciérralo", "envíalo", "eso es todo"), preguntar si el pedido se envió o si le \
-llegó al comercial ("¿le has enviado el pedido?", "¿ya lo mandaste?"), \
-saludar, pedir productos o preguntar precios. Ante la duda, NO marques \
-escalada.
-- "cerrar_pedido": el cliente quiere CERRAR/FINALIZAR el pedido o dice que no \
-quiere nada más ("cierra el pedido", "ciérralo", "envíalo", "eso es todo", \
-"nada más", "ya está así"). Es la acción normal de cierre, NUNCA escalada.
-- "rechazo_bot": expresa que NO quiere hablar con un asistente/bot/máquina \
-("no quiero hablar con un robot", "deja de escribirme").
-- "derivacion": pregunta o pide algo COMERCIAL que solo resuelve el comercial \
-humano y que el asistente NO debe responder: precios, descuentos, stock, \
-facturas, pagos, incidencias, reclamaciones, devoluciones, o consejo sobre \
-productos (para qué sirve, cuál es mejor). PEDIR productos ("quiero 4 champús", \
-"ponme 2 cremas") NO es derivacion: va en "articulos". Preguntar por el estado \
-del pedido ACTUAL de esta conversación ("¿lo enviaste?", "¿le llegó al \
-comercial?") NO es derivacion: el asistente sabe si lo cerró y responde él. \
-Preguntar "¿qué productos tienes?" o ver el catálogo (SIN marca ni tipo) \
-TAMPOCO es derivacion: márcalo "saludo". Y si preguntan qué hay de una MARCA o \
-TIPO concretos ("¿qué productos tienes de Gelfix?"), eso es una BÚSQUEDA: NO \
-es derivacion — pon esa marca/tipo en "articulos". El asistente NO se calla en \
-derivacion: dirá que eso se lo confirma el comercial.
-- "saludo": el mensaje es un saludo o una apertura de conversación ("hola", \
-"buenas", "hey", "¿estás?", "buenos días") o dice que quiere hacer/empezar un \
-pedido SIN concretar productos todavía ("quiero hacer un pedido", "necesito \
-encargar unas cosas"). Esto SÍ se responde: es intención comercial o el \
-principio de una. NUNCA lo marques también como charla_no_comercial.
-- "charla_no_comercial": SOLO conversación personal o ajena al negocio, SIN \
-saludo, SIN pedido y SIN pregunta comercial: interesarse por ti o por el \
-comercial ("¿qué tal estás?", "¿cómo está tu madre?", "¿qué hiciste ayer?"), \
-o temas que no son de la tienda ("¿cuál es la capital de Francia?"). Un \
-simple "hola" NO es charla (es "saludo"); querer pedir algo NO es charla.
-- "repetir_ultimo": pide repetir su pedido anterior o habitual ("lo de \
-siempre", "ponme lo mismo que la última vez").
-
-REGLAS DE "articulos" (una entrada por producto mencionado; [] si no hay):
-- "mencion": el fragmento del cliente, con su cantidad si la dice.
-- "consulta": términos de búsqueda cortos: producto + marca/atributos/medida. \
-Sin cantidades, sin verbos, sin frases enteras.
-- "cantidad": el número pedido (1 si no lo dice).
-- "clase" = "WORTHY" si nombra un PRODUCTO (tipo o nombre) y además lleva \
-marca (L'Action, Nivea, Katai…), medida exacta (8 grs, 150 ml, nº 3), \
-atributos concretos de línea (antiedad, waterproof, tono nude…) o un código \
-alfanumérico (KG001399, 14-1127) — con eso ya se puede buscar en el catálogo. \
-Tiene que haber un PRODUCTO: una marca sola ("gelfix", "de nivea") NO es \
-WORTHY.
-- "clase" = "AMBIGUOUS" si es genérico: categoría sin más ("una crema de \
-cara", "unos delineadores"), SOLO una marca sin producto ("algo de gelfix", \
-"qué tienes de lamel"), o "algo para el pelo" — buscar eso a ciegas devolvería \
-ruido; hay que pedir el producto concreto o el código.
-- "clase" = "ATTRIBUTE" si la mención es SOLO un atributo o variante — un \
-color, un tamaño, un acabado, un número de la lista — del producto del que \
-se venía hablando en el historial ("el negro", "la grande", "el mate").
-
-EJEMPLOS
-Mensaje: "Hola"
-Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
-"derivacion": false, "saludo": true, "charla_no_comercial": false, \
-"repetir_ultimo": false, "articulos": []}
-Mensaje: "Quiero hacer un pedido"
-Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
-"derivacion": false, "saludo": true, "charla_no_comercial": false, \
-"repetir_ultimo": false, "articulos": []}
-Mensaje: "¿Cómo está tu madre?"
-Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
-"derivacion": false, "saludo": false, "charla_no_comercial": true, \
-"repetir_ultimo": false, "articulos": []}
-Mensaje: "Quiero 4 champús y 2 cremas"
-Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
-"derivacion": false, "saludo": false, "charla_no_comercial": false, \
-"repetir_ultimo": false, "articulos": [\
-{"mencion": "4 champús", "consulta": "champú", "cantidad": 4, "clase": \
-"AMBIGUOUS"}, {"mencion": "2 cremas", "consulta": "crema", "cantidad": 2, \
-"clase": "AMBIGUOUS"}]}"""
+- "articulos": una entrada por producto que el cliente pide. [] si el mensaje \
+no pide productos (saludos, dudas, precios, cierre, charla… no son artículos).
+  - "mencion": el fragmento del cliente, con su cantidad si la dice.
+  - "consulta": términos de búsqueda cortos (producto + marca/atributo/medida). \
+Sin cantidades, sin verbos, sin la frase entera.
+  - "cantidad": el número pedido (1 si no lo dice).
+  - "clase":
+    · "WORTHY" = hay un PRODUCTO buscable: tipo/nombre con marca, medida, \
+atributo de línea o código (KG001399, 14-1127). Una marca sola ("gelfix") NO \
+es WORTHY.
+    · "AMBIGUOUS" = genérico: categoría sola ("una crema"), marca sola sin \
+producto, o algo demasiado vago para buscar sin ruido.
+    · "ATTRIBUTE" = solo un atributo/variante del producto del que ya se \
+hablaba ("el negro", "la grande", "la 2").
+- "repetir_ultimo": true solo si pide repetir su pedido habitual/anterior \
+("lo de siempre", "lo mismo que la última vez")."""
 
 _TRIAGE_USER = """\
 Historial reciente (solo contexto, NO lo clasifiques):
 {history}
 
-MENSAJE NUEVO DEL CLIENTE (clasifica SOLO esto):
+MENSAJE NUEVO DEL CLIENTE (extrae SOLO de esto):
 {message}
 
 Devuelve el JSON."""
@@ -756,18 +603,13 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
         except Exception:
             data = None
     if not isinstance(data, dict):
-        # Truncated output: reconstruct from the flags before "articulos" and
-        # every complete {...} object inside the (unterminated) array.
+        # Truncated output: reconstruct the repeat flag and every complete
+        # {...} object already emitted inside the (unterminated) array.
         data = {}
+        m = re.search(r'"repetir_ultimo"\s*:\s*(true|false)', text[start:])
+        if m:
+            data["repetir_ultimo"] = m.group(1) == "true"
         head = text[start:]
-        for flag in ("escalada", "rechazo_bot", "derivacion", "cerrar_pedido", "saludo",
-                     "charla_no_comercial", "repetir_ultimo"):
-            m = re.search(rf'"{flag}"\s*:\s*(true|false)', head)
-            if m:
-                data[flag] = m.group(1) == "true"
-        mev = re.search(r'"evidencia"\s*:\s*"([^"]*)"', head)
-        if mev:
-            data["evidencia"] = mev.group(1)
         arr = head.find('"articulos"')
         objs: List[dict] = []
         if arr != -1:
@@ -787,9 +629,7 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
                             pass
                         obj_start = -1
         data["articulos"] = objs
-        if not objs and not any(k in data for k in
-                                ("escalada", "rechazo_bot", "derivacion", "cerrar_pedido",
-                                 "saludo", "charla_no_comercial", "repetir_ultimo")):
+        if not objs and "repetir_ultimo" not in data:
             return None
         logger.info(f"[TRIAGE] Recovered {len(objs)} items from truncated output.")
     items: List[TriageItem] = []
@@ -812,13 +652,6 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
         ))
     return TriageResult(
         ok=True,
-        escalation=bool(data.get("escalada")),
-        evidence=str(data.get("evidencia") or "").strip()[:200],
-        opt_out=bool(data.get("rechazo_bot")),
-        refer_salesman=bool(data.get("derivacion")),
-        close_order=bool(data.get("cerrar_pedido")),
-        greeting=bool(data.get("saludo")),
-        small_talk=bool(data.get("charla_no_comercial")),
         repeat_order=bool(data.get("repetir_ultimo")),
         items=items[:24],
     )
@@ -854,11 +687,7 @@ async def run_triage(current_message: str, recent_history: str) -> TriageResult:
                        "falling back to heuristics.")
         return TriageResult(ok=False, elapsed_ms=elapsed)
     parsed.elapsed_ms = elapsed
-    logger.info(f"[TRIAGE] ok in {elapsed:.0f}ms: escalada={parsed.escalation} "
-                f"rechazo_bot={parsed.opt_out} derivacion={parsed.refer_salesman} "
-                f"cerrar={parsed.close_order} "
-                f"saludo={parsed.greeting} charla={parsed.small_talk} "
-                f"repetir={parsed.repeat_order} "
+    logger.info(f"[TRIAGE] ok in {elapsed:.0f}ms: repetir={parsed.repeat_order} "
                 f"worthy={[i.query for i in parsed.worthy]} "
                 f"ambiguous={[i.query for i in parsed.ambiguous]} "
                 f"attribute={[i.query for i in parsed.attributes]}")
@@ -906,46 +735,27 @@ def _same_item(a: str, b: str) -> bool:
     return len(ta & tb) / min(len(ta), len(tb)) >= 0.5
 
 
-def _triage_block(triage: TriageResult, escalation_hint: bool, salesman_name: str = "") -> str:
-    """The Pass-1 analysis injected into Kapa's user context block."""
-    if not triage.ok or (not triage.items and not escalation_hint
-                         and not triage.refer_salesman and not triage.repeat_order
-                         and not triage.close_order):
+def _triage_block(triage: TriageResult) -> str:
+    """Pass-1 product extraction injected into Kapa's context — search guidance
+    only. All intent handling (greet, close, refer, handoff, small talk) is the
+    model's job now, driven by the brief system prompt and its tools."""
+    if not triage.ok or (not triage.items and not triage.repeat_order):
         return ""
-    lines: List[str] = ["### TRIAJE PREVIO DEL MENSAJE (análisis automático; el cliente NO lo ve)"]
+    lines: List[str] = ["### PRODUCTOS DETECTADOS EN EL MENSAJE (análisis interno; el cliente NO lo ve)"]
     if triage.worthy:
         lines.append("- Concretos, BUSCA YA con search_products (una consulta por artículo): " +
                      "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.worthy))
     if triage.ambiguous:
-        lines.append("- Genéricos, NO los busques: " +
+        lines.append("- Genéricos o solo marca, NO los busques: " +
                      "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.ambiguous) +
-                     ". Resume lo que entendiste (con cantidades) y pide amable un poco más "
-                     "de detalle (marca, línea o medida); recuerda con humildad que el "
-                     "código de producto es lo más rápido y seguro para apuntarlos sin error.")
+                     ". Resume lo que entendiste y pide el producto concreto o el código.")
     if triage.attributes:
         lines.append("- Variantes del producto en curso (búscalas COMBINADAS con el producto "
-                     "del que hablabais en el historial): " +
+                     "del que hablabais): " +
                      "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.attributes))
     if triage.repeat_order:
-        lines.append("- El cliente pide REPETIR su pedido habitual: usa el 'Último pedido "
-                     "ENVIADO' del contexto como base (add_item con esos códigos).")
-    if triage.close_order:
-        lines.append("- El cliente quiere CERRAR el pedido: haz un resumen final del carrito "
-                     "(códigos y cantidades), llama a close_order y despídete pasándole la nota "
-                     f"a {salesman_name}. Si el carrito está vacío, pregúntale qué quiere pedir "
-                     "antes de cerrar.")
-    if triage.refer_salesman:
-        lines.append("- El cliente pregunta algo COMERCIAL que tú NO puedes resolver (precio, "
-                     "stock, factura, incidencia, estado/envío de un pedido, descuento o consejo "
-                     "de producto). NO te quedes en silencio y NO lo inventes: dile con amabilidad "
-                     "y en una frase que ESO no se lo puedes confirmar tú y que se lo dirá el "
-                     "comercial; si además hay pedido, atiéndelo con normalidad. NO llames a "
-                     "handoff_to_human solo por esto.")
-    if escalation_hint:
-        ev = f' ("{triage.evidence}")' if triage.evidence else ""
-        lines.append(f"- Posible petición de hablar con una persona{ev}: SOLO si el cliente de "
-                     "verdad pide un humano o está enfadado, usa handoff_to_human (te callarás y "
-                     "entra el comercial); si no, atiéndele tú.")
+        lines.append("- Pide REPETIR su pedido habitual: usa el 'Último pedido ENVIADO' del "
+                     "contexto como base (add_item con esos códigos).")
     lines.append("")
     return "\n".join(lines)
 
@@ -1663,58 +1473,6 @@ async def run_agent(
     # ---- PASS 1: intent & specificity triage (temperature 0.0) -------------
     triage = await run_triage(current_message, recent_history)
 
-    escalation_hint = False
-    if triage.ok and triage.escalation:
-        # Silence (silent handoff) is the most dangerous outcome, so it needs
-        # a REAL guard. The old "evidence quote appears in the message" check
-        # was meaningless — the quote is copied FROM the message, so it always
-        # matched — which let the 2B silence-close ("cierra el pedido") and
-        # order-status questions by flagging them escalada. Now escalation is
-        # honored ONLY when the message carries NO competing commercial intent:
-        # no close request, no order items, no greeting/opener, no repeat, no
-        # commercial question. Any of those means "attend the client," not
-        # "go silent." Everything else becomes a hint the agent can act on.
-        commercial = (triage.close_order or triage.items or triage.greeting
-                      or triage.repeat_order or triage.refer_salesman)
-        norm_msg = _strip_accents_lower(current_message or "")
-        evidence_present = bool(triage.evidence) and \
-            _strip_accents_lower(triage.evidence) in norm_msg
-        if evidence_present and not commercial:
-            # Strict <NO_REPLY> semantics: completely silent handoff — no
-            # canned message, no LLM turn — so the salesman takes over clean.
-            logger.info(f"[AGENT] Pass-1 {TRIAGE_ESC} honored "
-                        f"(evidence={triage.evidence!r}, no commercial intent); silent handoff.")
-            return AgentResult(
-                reply="", order_status=session.get("order_status") or "IDLE",
-                cart=list(session.get("cart") or []), summary=session.get("summary") or "",
-                open_items=list(session.get("open_items") or []),
-                guide_shown=bool(session.get("guide_shown")),
-                handoff=True, silent=True,
-                ctx={"triage_ms": round(triage.elapsed_ms, 1), "triage_escalation": True},
-            )
-        escalation_hint = True
-        logger.info("[AGENT] Pass-1 escalation NOT honored "
-                    f"(commercial_intent={commercial}); passing as a hint.")
-
-    # PURELY NON-COMMERCIAL small talk (and nothing else) -> stay silent. Kapa
-    # is an ORDER assistant, not a chit-chat / general-knowledge bot: only
-    # genuinely off-topic personal talk ("¿qué tal tu madre?", "¿capital de
-    # Francia?") gets no reply. A GREETING or order-opener ("hola", "quiero
-    # hacer un pedido") is NEVER silence — the client is very likely about to
-    # order — so `greeting` vetoes the silence, as does any order item or
-    # commercial flag. When the 2B triage is unsure it errs toward answering.
-    if triage.ok and triage.small_talk and not triage.greeting \
-            and not triage.items and not triage.refer_salesman \
-            and not triage.repeat_order and not triage.escalation and not triage.opt_out:
-        logger.info("[AGENT] Pass-1 charla_no_comercial (no greeting/order/commercial); staying silent.")
-        return AgentResult(
-            reply="", order_status=session.get("order_status") or "IDLE",
-            cart=list(session.get("cart") or []), summary=session.get("summary") or "",
-            open_items=list(session.get("open_items") or []),
-            guide_shown=bool(session.get("guide_shown")), silent=True,
-            ctx={"triage_ms": round(triage.elapsed_ms, 1), "triage_small_talk": True},
-        )
-
     topic = _topic_from_history(recent_history)   # structural product-family grounding
     executor = _ToolExecutor(session,
                              media_text=current_message if _is_media_message(current_message) else "")
@@ -1787,45 +1545,19 @@ async def run_agent(
     # Budget-aware assembly: cap the message, then give history whatever
     # tokens remain under CTX_BUDGET_TOKENS. Older context lives in Memoria.
     current_message = _cap_middle(current_message or "", MAX_MESSAGE_CHARS)
-    triage_block = _triage_block(triage, escalation_hint, salesman_name)
+    triage_block = _triage_block(triage)
     if reconciled_msg:
         triage_block = reconciled_msg + triage_block
-    # PROACTIVE media / big-list guidance (prepended to the context block, not
-    # a reactive nudge round the 2B model can echo). A photo of a handwritten
-    # list or a long dictated order is a core use case: the natural move is to
-    # say plainly what came through and what didn't, group the matches, and
-    # ask for codes on the unclear ones — one message, not an interrogation.
-    total_mentions = (len(triage.items) if triage.ok else 0) + len(executor.open_items)
+    # Media turns carry a per-turn DESCRIPCIÓN of the image/audio; a short note
+    # points the model at it. (The humility/no-add-without-confirm rules live in
+    # the system prompt; messy-list handling is enforced structurally by the
+    # batch-quality gate, not by prompt enumeration.)
     if _is_media_message(current_message):
         triage_block = (
-            "### ESTO LLEGÓ COMO IMAGEN/AUDIO (interpretación, puede fallar)\n"
-            "- El texto trae al inicio una DESCRIPCIÓN de qué es la imagen y lo legible que "
-            "es. Úsala: si dice que es una lista manuscrita difícil, borrosa o casi ilegible, "
-            "díselo con naturalidad al cliente ('me llega como una lista escrita a mano y me "
-            "cuesta leerla bien') y pídele una foto más clara o, mejor, los códigos de producto.\n"
-            "- Reconoce con naturalidad que te llegó por imagen/audio y que has leído lo "
-            "que has podido; NO te disculpes en exceso ni hables de instrucciones internas.\n"
-            "- Di qué has entendido y qué NO; para lo dudoso pide con humildad el código de "
-            "producto o el nombre exacto. Invita SIEMPRE a corregirte.\n"
-            "- Nunca apuntes nada de una imagen sin que el cliente confirme.\n"
-        ) + triage_block
-    elif total_mentions >= 5:
-        triage_block = (
-            "### LISTA LARGA — sé natural, no interrogues\n"
-            "- Empieza reconociendo el pedido COMPLETO en una frase (qué tienes claro, qué "
-            "tiene opciones, a qué le falta detalle).\n"
-            "- Agrupa: confirma de golpe lo que localizaste; para lo genérico o dudoso pide "
-            "el código de producto o el nombre exacto. UNA sola tanda de preguntas, no una "
-            "por artículo.\n"
-        ) + triage_block
-    elif not _is_media_message(current_message) and _should_remind_codes(recent_history) \
-            and (executor.cart or executor.open_items or (triage.ok and triage.items)):
-        # From time to time on a live order, drop the codes tip once — not
-        # every turn (the suppression window handles the cadence).
-        triage_block = (
-            "### RECORDATORIO SUAVE (solo si encaja natural)\n"
-            "- Recuérdale de pasada, sin insistir y en una frase, que el código de producto "
-            "es la forma más rápida y segura de asegurar los artículos sin errores.\n"
+            "### LLEGÓ COMO IMAGEN/AUDIO (interpretación, puedes fallar)\n"
+            "- Al inicio hay una DESCRIPCIÓN de qué es y lo legible que es. Si es difícil de "
+            "leer, díselo con naturalidad y pide una foto más clara o los códigos de producto.\n"
+            "- Di qué entendiste y qué no; invita a corregir; nunca apuntes sin confirmación.\n"
         ) + triage_block
     open_line = "; ".join(
         (f"{i.get('pedido')} (x{i.get('qty', 1)}, falta detalle del cliente)"
@@ -1870,7 +1602,6 @@ async def run_agent(
         "message_truncated": "[recortado]" in (current_message or ""),
         "triage_ok": triage.ok, "triage_ms": round(triage.elapsed_ms, 1),
         "triage_worthy": len(triage.worthy), "triage_ambiguous": len(triage.ambiguous),
-        "triage_escalation_hint": escalation_hint,
     }
 
     def _res(rep: str) -> AgentResult:
@@ -1949,8 +1680,6 @@ async def run_agent(
 
     reply = ""
     llm = _get_client()
-    demoted_handoff = False
-    demoted_optout = False
     demoted_promise = False
     demoted_style = False
     demoted_humility = False
@@ -1982,55 +1711,26 @@ async def run_agent(
                     f"queries={queries} status={executor.status} cart={len(executor.cart)} "
                     f"handoff={executor.handoff} opt_out={executor.opt_out}")
 
-        # Escalations: honor when the Pass-1 triage's independent read of the
-        # message corroborates them (rechazo_bot / derivacion / escalada),
-        # when the model insists (second call), or when no nudge round remains.
+        # Trust the model's own handoff_to_human / opt_out_client decisions
+        # (guided by the brief prompt) — no triage-flag second-guessing. The
+        # only intervention is a safety net: if the model tries to hand off on a
+        # turn where it ALSO did real order work, don't strand the order —
+        # clear the handoff and let it finish the order in words.
         can_nudge = step < budget - 1
-        if executor.opt_out and can_nudge and not demoted_optout and \
-                not (triage.ok and (triage.opt_out or triage.escalation)):
-            executor.opt_out = False
-            demoted_optout = True
-            logger.info("[AGENT] opt_out demoted (Pass-1 saw no bot rejection in the message).")
-            messages.append(Message(role="user", content=_internal(
-                "No consta que el cliente rechace hablar con un asistente. Responde tú mismo a su "
-                "mensaje (o llama a opt_out_client otra vez SOLO si realmente no quiere hablar contigo).")))
-            continue
-        if executor.handoff and can_nudge and not demoted_handoff and \
-                not (triage.ok and triage.escalation):
-            # Honor handoff only when Pass-1 saw the client actually want a
-            # person. A derivacion (price/stock/incident question) must NOT
-            # become a handoff — the bot SPEAKS the referral and stays active.
-            executor.handoff = False
-            demoted_handoff = True
-            reason = ("El cliente pregunta algo comercial que no puedes resolver: NO uses "
-                      "handoff_to_human. Dile en una frase, amable, que eso se lo confirma "
-                      f"{salesman_name}, y sigue tú con lo que sí puedas (el pedido).") \
-                if (triage.ok and triage.refer_salesman) else \
-                (f"No consta que el cliente pida hablar con {salesman_name}. Responde tú "
-                 "mismo siguiendo tus reglas (o llama a handoff_to_human otra vez SOLO si de "
-                 "verdad no puedes ayudarle).")
-            logger.info("[AGENT] handoff demoted (Pass-1: not a request for a person).")
-            messages.append(Message(role="user", content=_internal(reason)))
-            continue
         if executor.handoff and not executor.opt_out and can_nudge and not demoted_mixed \
                 and (queries or executor.order_activity or executor.blocked_media_adds
                      or executor.blocked_media_close):
-            # MIXED INTENT (observed live): "añade dos de la caja... y dime el
-            # precio" — the corroborated handoff must NOT strand the order.
-            # The handoff flag is CLEARED: notification emails are gone (product
-            # decision) and a mixed turn is an order turn; the price referral is
-            # said in Kapa's own words instead of the canned message.
             executor.handoff = False
             demoted_mixed = True
-            blocked = ", ".join(dict.fromkeys(executor.blocked_media_adds)) or "los productos mencionados"
+            blocked = ", ".join(dict.fromkeys(executor.blocked_media_adds)) or "lo que pediste"
             executor.blocked_media_adds.clear()
-            logger.info("[AGENT] Mixed intent (order + escalation): keeping the order alive.")
+            logger.info("[AGENT] Handoff on an order turn: keeping the order alive.")
             messages.append(Message(role="assistant", content=reply or "(handoff)"))
             messages.append(Message(role="user", content=_internal(
-                f"El cliente mezcla PEDIDO y una consulta para {salesman_name} (precio/envío...). "
-                f"No abandones el pedido: di breve que esa consulta se la pasas a {salesman_name} "
-                f"y sigue con el pedido — propón lo que entendiste ({blocked}) y espera su 'sí' "
-                f"antes de apuntar nada.")))
+                f"No abandones el pedido. Sigue atendiéndolo con normalidad; si hay algo que solo "
+                f"puede resolver {salesman_name} (precio, envío…), dilo en una frase y continúa "
+                f"con el pedido — propón lo que entendiste ({blocked}) y espera el 'sí' del "
+                "cliente antes de apuntar nada.")))
             continue
         if executor.opt_out:
             return await _finish("")  # opt-out: caller sends the brief stop message
@@ -2156,8 +1856,9 @@ async def run_agent(
         # prompt examples — presented as "found" is inventing availability.
         if reply and not queries:
             allowed = set(executor.results_this_turn) | {_sane_code(c) for c in executor.cart}
-            if triage.ok and triage.repeat_order:
-                allowed |= {_sane_code(i.get("code", "")) for i in (session.get("last_closed_cart") or [])}
+            # Last dispatched order's codes are real and grounded, so allow the
+            # client to repeat them without a re-search regardless of the flag.
+            allowed |= {_sane_code(i.get("code", "")) for i in (session.get("last_closed_cart") or [])}
             bad = {c for c in _proposal_codes(reply) if c and c not in allowed}
             if bad:
                 if can_nudge and not demoted_grounding:
