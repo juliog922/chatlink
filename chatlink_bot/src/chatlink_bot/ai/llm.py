@@ -268,9 +268,13 @@ QUIÉN ERES: Kapa, el asistente de pedidos de {salesman_name}, vendedor de \
 cosmética. Atiendes a sus clientes por chat cuando él no está. NO eres \
 {salesman_name} ni ves sus charlas: ante "el que me comentaste/comentó" sin \
 rastro en tu historial, dilo natural — que lo confirme {salesman_name} o te \
-den el nombre — y sigue con el resto. En el historial, "Cliente:" es el \
-cliente y "Asistente:" eres TÚ: no confundas quién dijo qué ni repitas tus \
-frases. Si ya te presentaste en el historial, no saludes ni te presentes.
+den el nombre — y sigue con el resto. En el historial hay TRES voces: \
+"Cliente:" es el cliente, "Asistente:" eres TÚ, y "Comercial:" es \
+{salesman_name} en persona. Lee la conversación ENTERA: si el Comercial ya \
+respondió algo, dalo por dicho — no lo repitas ni lo contradigas; si él dejó \
+un pedido a medias y el cliente sigue, continúa desde donde él lo dejó. No \
+te confundas de quién dijo qué ni repitas tus propias frases. Si ya te \
+presentaste en el historial, no saludes ni te presentes.
 
 TU META: construir el pedido identificando el CÓDIGO DE PRODUCTO exacto de \
 cada artículo (dilo siempre así: "código de producto"). Todo lo demás es de \
@@ -341,11 +345,22 @@ SI PREGUNTAN CÓMO PEDIR (sin buscar): dime productos (nombre o, mejor, \
 código exacto) y cantidades; los confirmo; con tu "sí" los apunto; al cerrar \
 le paso la nota a {salesman_name}. Sin enseñar catálogo ni recomendar.
 
-DERIVA a handoff_to_human: precios/descuentos, stock, facturas/pagos, \
-incidencias/devoluciones, envío o estado de un pedido enviado, consejos de producto. Si MEZCLA pedido \
-y precio/duda: sigue el pedido y di tú, breve, que eso se lo confirmará \
-{salesman_name}; handoff solo si no hay pedido que atender. Puedes dar el NOMBRE del catálogo para \
-identificar el código; nunca describir ni recomendar.
+SI PIDEN VER EL CATÁLOGO o "¿qué productos tienes?" / "¿qué hay?": NO es una \
+derivación ni un motivo para pasar al comercial. Explícalo natural: no puedes \
+mostrar el catálogo entero (son miles de productos), PERO si te dan el nombre \
+completo o el código de producto lo localizas al instante. Pídele que te diga \
+qué busca y ofrécete a buscarlo. Nunca respondas a esto con un "te paso con \
+{salesman_name}".
+
+ANTES DE DERIVAR, di lo que SÍ puedes: solo cuando el cliente pida algo que \
+de verdad no te toca (precios/descuentos, stock, facturas/pagos, \
+incidencias/devoluciones, envío o estado de un pedido enviado, o consejo de \
+producto) NO uses el catálogo para inventar: dile con tus palabras que ESO se \
+lo confirma {salesman_name}, y recuérdale que tú sí puedes ayudarle a montar \
+el pedido y a encontrar códigos. Si MEZCLA pedido y precio/duda: atiende el \
+pedido y menciona de pasada lo del comercial. handoff_to_human SOLO cuando \
+no haya nada del pedido que puedas atender, o cuando el cliente pida \
+explícitamente hablar con una persona (entonces te callas y entra él).
 Rechaza hablar con asistentes → opt_out_client. Al final, note (1 frase, invisible al cliente).
 Mensaje ajeno al negocio sin nada útil para el pedido → "<NO_REPLY>".
 [Texto en Imagen]/[Audio transcrito]/[Documento] → demuestra que lo leíste; \
@@ -642,8 +657,10 @@ humano y que el asistente NO debe responder: precios, descuentos, stock, \
 facturas, pagos, incidencias, reclamaciones, devoluciones, estado o envío de \
 un pedido, o consejo sobre productos (para qué sirve, cuál es mejor). PEDIR \
 productos ("quiero 4 champús", "ponme 2 cremas") NO es derivacion: eso es un \
-pedido normal, va en "articulos". El asistente NO se calla en derivacion: \
-dirá que eso se lo confirma el comercial.
+pedido normal, va en "articulos". Preguntar "¿qué productos tienes?" o pedir \
+ver el catálogo TAMPOCO es derivacion: el asistente lo resuelve él mismo \
+(busca por nombre/código), así que marca "saludo" en su lugar. El asistente \
+NO se calla en derivacion: dirá que eso se lo confirma el comercial.
 - "saludo": el mensaje es un saludo o una apertura de conversación ("hola", \
 "buenas", "hey", "¿estás?", "buenos días") o dice que quiere hacer/empezar un \
 pedido SIN concretar productos todavía ("quiero hacer un pedido", "necesito \
@@ -1963,8 +1980,35 @@ async def run_agent(
                 f"y sigue con el pedido — propón lo que entendiste ({blocked}) y espera su 'sí' "
                 f"antes de apuntar nada.")))
             continue
-        if executor.handoff or executor.opt_out:
-            return await _finish("")  # pure escalation: caller sends the canned message
+        if executor.opt_out:
+            return await _finish("")  # opt-out: caller sends the brief stop message
+        if executor.handoff:
+            # A MODEL-initiated handoff that survived the demote. We never emit
+            # the robotic canned redirect for this — a redirect must be natural
+            # and lead with what the bot CAN do. (Silence for a genuine "wants
+            # a person" is the Pass-1 corroborated-escalation path, handled
+            # before the loop.) Use the model's own reply if it wrote one;
+            # otherwise force ONE capability-explaining reply, no tools.
+            executor.handoff = False
+            if reply.strip():
+                return await _finish(reply)
+            messages.append(Message(role="user", content=_internal(
+                "No uses ningún mensaje enlatado de derivación. Responde TÚ, natural y breve: "
+                "di primero qué SÍ puedes hacer (localizar productos por nombre completo o "
+                "código de producto y montar el pedido); y SOLO para lo que de verdad no te "
+                f"toca (precios, stock, facturas, incidencias, o hablar con una persona) di que "
+                f"eso se lo confirma {salesman_name}. Termina invitándole a decirte qué producto "
+                "busca. NO llames a ninguna herramienta.")))
+            try:
+                resp = await asyncio.to_thread(
+                    llm.chat, CIMA_MODEL, messages,
+                    options={"temperature": AGENT_TEMPERATURE, "top_p": 0.9,
+                             "repeat_penalty": 1.1, "num_predict": 400})
+                forced = _clean(resp.content)
+            except Exception as e:
+                logger.error(f"[AGENT] Forced capability reply failed: {e}")
+                forced = ""
+            return await _finish(forced)
         # A demoted mixed turn falls through as a normal order turn: the reply
         # still passes the grounding/humility/parroting guards. If the model
         # insists on handoff_to_human in the NEXT round, it is honored.
