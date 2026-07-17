@@ -601,6 +601,7 @@ class TriageResult:
     evidence: str = ""               # verbatim quote backing the escalation
     opt_out: bool = False            # client rejects talking to a bot/assistant
     refer_salesman: bool = False     # commercial question bot can't answer -> spoken referral
+    greeting: bool = False           # greeting / order-opener -> always respond, never silence
     small_talk: bool = False         # purely social/off-topic -> silence
     repeat_order: bool = False       # asks to repeat the usual / last order
     items: List[TriageItem] = field(default_factory=list)
@@ -624,8 +625,9 @@ Eres un clasificador determinista de mensajes de clientes de una tienda de \
 cosmética. NO conversas: devuelves SOLO un objeto JSON válido, sin texto \
 fuera del JSON, con esta forma exacta:
 {"escalada": false, "evidencia": "", "rechazo_bot": false, "derivacion": \
-false, "charla_no_comercial": false, "repetir_ultimo": false, "articulos": \
-[{"mencion": "…", "consulta": "…", "cantidad": 1, "clase": "WORTHY"}]}
+false, "saludo": false, "charla_no_comercial": false, "repetir_ultimo": \
+false, "articulos": [{"mencion": "…", "consulta": "…", "cantidad": 1, \
+"clase": "WORTHY"}]}
 
 REGLAS DE LOS INDICADORES (true SOLO si el mensaje NUEVO lo dice claramente):
 - "escalada": el cliente PIDE hablar con una persona / el comercial / un \
@@ -638,13 +640,20 @@ tampoco.
 - "derivacion": pregunta o pide algo COMERCIAL que solo resuelve el comercial \
 humano y que el asistente NO debe responder: precios, descuentos, stock, \
 facturas, pagos, incidencias, reclamaciones, devoluciones, estado o envío de \
-un pedido, o consejo sobre productos (para qué sirve, cuál es mejor). El \
-asistente NO se calla: dirá que eso se lo confirma el comercial.
-- "charla_no_comercial": el mensaje es SOLO charla social o ajena al negocio, \
-sin pedido ni pregunta comercial: saludos y cortesías ("¿qué tal?", "¿cómo \
-está tu madre?", "gracias, buen finde"), o temas que no son de la tienda \
-("¿cuál es la capital de Francia?"). Si el mensaje también trae pedido o una \
-pregunta comercial, esto es false.
+un pedido, o consejo sobre productos (para qué sirve, cuál es mejor). PEDIR \
+productos ("quiero 4 champús", "ponme 2 cremas") NO es derivacion: eso es un \
+pedido normal, va en "articulos". El asistente NO se calla en derivacion: \
+dirá que eso se lo confirma el comercial.
+- "saludo": el mensaje es un saludo o una apertura de conversación ("hola", \
+"buenas", "hey", "¿estás?", "buenos días") o dice que quiere hacer/empezar un \
+pedido SIN concretar productos todavía ("quiero hacer un pedido", "necesito \
+encargar unas cosas"). Esto SÍ se responde: es intención comercial o el \
+principio de una. NUNCA lo marques también como charla_no_comercial.
+- "charla_no_comercial": SOLO conversación personal o ajena al negocio, SIN \
+saludo, SIN pedido y SIN pregunta comercial: interesarse por ti o por el \
+comercial ("¿qué tal estás?", "¿cómo está tu madre?", "¿qué hiciste ayer?"), \
+o temas que no son de la tienda ("¿cuál es la capital de Francia?"). Un \
+simple "hola" NO es charla (es "saludo"); querer pedir algo NO es charla.
 - "repetir_ultimo": pide repetir su pedido anterior o habitual ("lo de \
 siempre", "ponme lo mismo que la última vez").
 
@@ -664,19 +673,26 @@ el pelo") — buscar eso a ciegas devolvería ruido.
 color, un tamaño, un acabado, un número de la lista — del producto del que \
 se venía hablando en el historial ("el negro", "la grande", "el mate").
 
-EJEMPLO
-Historial: (vacío)
-Mensaje: "Quiero los 5 delineadores de pestañas, 4 cremas para la cara y 3 \
-L'ACTION mascarilla facial antiedad 8 grs"
-Respuesta:
-{"escalada": false, "evidencia": "", "rechazo_bot": false, "derivacion": \
-false, "charla_no_comercial": false, "repetir_ultimo": false, "articulos": [\
-{"mencion": "5 delineadores de pestañas", "consulta": "delineador pestañas", \
-"cantidad": 5, "clase": "AMBIGUOUS"}, \
-{"mencion": "4 cremas para la cara", "consulta": "crema facial", \
-"cantidad": 4, "clase": "AMBIGUOUS"}, \
-{"mencion": "3 L'ACTION mascarilla facial antiedad 8 grs", "consulta": \
-"l'action mascarilla facial antiedad 8 grs", "cantidad": 3, "clase": "WORTHY"}]}"""
+EJEMPLOS
+Mensaje: "Hola"
+Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
+"derivacion": false, "saludo": true, "charla_no_comercial": false, \
+"repetir_ultimo": false, "articulos": []}
+Mensaje: "Quiero hacer un pedido"
+Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
+"derivacion": false, "saludo": true, "charla_no_comercial": false, \
+"repetir_ultimo": false, "articulos": []}
+Mensaje: "¿Cómo está tu madre?"
+Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
+"derivacion": false, "saludo": false, "charla_no_comercial": true, \
+"repetir_ultimo": false, "articulos": []}
+Mensaje: "Quiero 4 champús y 2 cremas"
+Respuesta: {"escalada": false, "evidencia": "", "rechazo_bot": false, \
+"derivacion": false, "saludo": false, "charla_no_comercial": false, \
+"repetir_ultimo": false, "articulos": [\
+{"mencion": "4 champús", "consulta": "champú", "cantidad": 4, "clase": \
+"AMBIGUOUS"}, {"mencion": "2 cremas", "consulta": "crema", "cantidad": 2, \
+"clase": "AMBIGUOUS"}]}"""
 
 _TRIAGE_USER = """\
 Historial reciente (solo contexto, NO lo clasifiques):
@@ -710,7 +726,8 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
         # every complete {...} object inside the (unterminated) array.
         data = {}
         head = text[start:]
-        for flag in ("escalada", "rechazo_bot", "derivacion", "charla_no_comercial", "repetir_ultimo"):
+        for flag in ("escalada", "rechazo_bot", "derivacion", "saludo",
+                     "charla_no_comercial", "repetir_ultimo"):
             m = re.search(rf'"{flag}"\s*:\s*(true|false)', head)
             if m:
                 data[flag] = m.group(1) == "true"
@@ -737,7 +754,7 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
                         obj_start = -1
         data["articulos"] = objs
         if not objs and not any(k in data for k in
-                                ("escalada", "rechazo_bot", "derivacion",
+                                ("escalada", "rechazo_bot", "derivacion", "saludo",
                                  "charla_no_comercial", "repetir_ultimo")):
             return None
         logger.info(f"[TRIAGE] Recovered {len(objs)} items from truncated output.")
@@ -765,6 +782,7 @@ def _parse_triage_json(raw: str) -> Optional[TriageResult]:
         evidence=str(data.get("evidencia") or "").strip()[:200],
         opt_out=bool(data.get("rechazo_bot")),
         refer_salesman=bool(data.get("derivacion")),
+        greeting=bool(data.get("saludo")),
         small_talk=bool(data.get("charla_no_comercial")),
         repeat_order=bool(data.get("repetir_ultimo")),
         items=items[:24],
@@ -803,7 +821,7 @@ async def run_triage(current_message: str, recent_history: str) -> TriageResult:
     parsed.elapsed_ms = elapsed
     logger.info(f"[TRIAGE] ok in {elapsed:.0f}ms: escalada={parsed.escalation} "
                 f"rechazo_bot={parsed.opt_out} derivacion={parsed.refer_salesman} "
-                f"charla={parsed.small_talk} "
+                f"saludo={parsed.greeting} charla={parsed.small_talk} "
                 f"repetir={parsed.repeat_order} "
                 f"worthy={[i.query for i in parsed.worthy]} "
                 f"ambiguous={[i.query for i in parsed.ambiguous]} "
@@ -1609,16 +1627,17 @@ async def run_agent(
         escalation_hint = True
         logger.info("[AGENT] Pass-1 escalation flag NOT evidence-backed; passing as a hint.")
 
-    # PURELY NON-COMMERCIAL small talk (and nothing else in the message) ->
-    # stay silent. Kapa is an ORDER assistant, not a chit-chat / general-
-    # knowledge bot: "¿qué tal tu madre?", "¿capital de Francia?", a bare
-    # "gracias, buen finde" get no reply (the salesman handles the social
-    # side). Only fires when there is NO order intent and NO commercial
-    # question in the turn — a mixed message falls through to the agent.
-    if triage.ok and triage.small_talk and not triage.items \
-            and not triage.refer_salesman and not triage.repeat_order \
-            and not triage.escalation and not triage.opt_out:
-        logger.info("[AGENT] Pass-1 charla_no_comercial with no order/commercial intent; staying silent.")
+    # PURELY NON-COMMERCIAL small talk (and nothing else) -> stay silent. Kapa
+    # is an ORDER assistant, not a chit-chat / general-knowledge bot: only
+    # genuinely off-topic personal talk ("¿qué tal tu madre?", "¿capital de
+    # Francia?") gets no reply. A GREETING or order-opener ("hola", "quiero
+    # hacer un pedido") is NEVER silence — the client is very likely about to
+    # order — so `greeting` vetoes the silence, as does any order item or
+    # commercial flag. When the 2B triage is unsure it errs toward answering.
+    if triage.ok and triage.small_talk and not triage.greeting \
+            and not triage.items and not triage.refer_salesman \
+            and not triage.repeat_order and not triage.escalation and not triage.opt_out:
+        logger.info("[AGENT] Pass-1 charla_no_comercial (no greeting/order/commercial); staying silent.")
         return AgentResult(
             reply="", order_status=session.get("order_status") or "IDLE",
             cart=list(session.get("cart") or []), summary=session.get("summary") or "",
