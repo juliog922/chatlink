@@ -986,6 +986,57 @@ def _code_shaped(q: str) -> bool:
 # 8-product message produced a 24-line hit dump — technically complete,
 # humanly useless. The LLM only phrases the digest; code decides it.
 
+_MATCH_SYSTEM = """\
+Decides, para cada producto que pidió el cliente, qué candidatos del catálogo \
+son de verdad ESE producto. NO conversas: devuelves SOLO JSON:
+{"resultados": [{"pedido": "…", "codigos": ["…"]}]}
+
+Para cada "pedido" te doy candidatos del catálogo (código, nombre, marca). En \
+"codigos" pon los códigos de los candidatos que SON ese producto (mismo tipo, \
+marca y variante que pidió el cliente), del más probable al menos probable:
+- Si uno coincide claramente, pon solo ese.
+- Si varios encajan y no puedes distinguirlos con lo que dijo el cliente, \
+ponlos todos (para que el cliente elija).
+- Si NINGÚN candidato es ese producto, "codigos": [].
+Usa SOLO códigos de los candidatos que te doy; nunca inventes. Un nombre \
+parecido pero de otra variante/producto NO coincide."""
+
+
+async def run_match(items: List[Dict[str, Any]]) -> Optional[Dict[str, List[str]]]:
+    """One simple 0.0 call that replaces brittle score thresholds: given each
+    request and its catalog candidates, return which candidate codes genuinely
+    match. -> {pedido: [codigo…ranked]} or None on failure (callers then fall
+    back to the score-based verdict, staying permissive)."""
+    payload_items = [it for it in items if it.get("candidatos")]
+    if not payload_items:
+        return None
+    payload = json.dumps({"items": payload_items}, ensure_ascii=False)
+    try:
+        resp = await asyncio.to_thread(
+            _get_client().chat, CIMA_MODEL,
+            [Message(role="system", content=_MATCH_SYSTEM),
+             Message(role="user", content=_cap_middle(payload, MAX_RESULTS_CHARS))],
+            fmt="json",
+            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0, "num_predict": TRIAGE_MAX_TOKENS},
+            timeout=TRIAGE_TIMEOUT_S,
+        )
+        text = (resp.content or "").strip()
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start:end + 1]) if start != -1 and end > start else None
+    except Exception as e:
+        logger.warning(f"[MATCH] Helper failed ({e}); falling back to score verdicts.")
+        return None
+    if not isinstance(data, dict):
+        return None
+    out: Dict[str, List[str]] = {}
+    for r in (data.get("resultados") or []):
+        if isinstance(r, dict) and r.get("pedido") is not None:
+            codes = [_sane_code(c) for c in (r.get("codigos") or []) if _sane_code(c)]
+            out[str(r["pedido"])] = codes
+    logger.info(f"[MATCH] {out}")
+    return out
+
+
 def _query_verdict(hits: List[Dict[str, Any]]) -> str:
     """resolved -> note it; leading -> pick it and mention the alternative in
     passing; ambiguous -> the ONE question this turn; none -> ask for detail.
@@ -1038,7 +1089,8 @@ def _merge_variant_queries(results: Dict[str, List[Dict[str, Any]]]) -> Dict[str
 def _triage_results(results: Dict[str, List[Dict[str, Any]]],
                     carried_queue: List[Dict[str, Any]],
                     is_media: bool = False,
-                    held_count: int = 0) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                    held_count: int = 0,
+                    match_map: Optional[Dict[str, List[str]]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """-> (digest for the model, open_items to persist).
 
     Digest keys are Spanish on purpose: the 2B model relays them naturally.
@@ -1056,8 +1108,23 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
     resolved, chosen, ambiguous, missing = [], [], [], []
     honesty_needed = False
     for q, hits in merged.items():
-        verdict = _query_verdict(hits)
-        uncovered = list(hits[0].get("query_uncovered") or []) if hits else []
+        # Prefer the semantic MATCH verdict (which real catalog hits are this
+        # product) over brittle score thresholds. Reorder hits to the matched
+        # codes; fall back to the score-based verdict when the match helper
+        # didn't cover this query.
+        matched_codes = match_map.get(q) if match_map else None
+        if matched_codes is not None:
+            by_code = {_sane_code(h.get("CodigoArticulo")): h for h in hits}
+            matched_hits = [by_code[c] for c in matched_codes if c in by_code]
+            if not matched_hits:
+                missing.append(q)
+                continue
+            hits = matched_hits
+            verdict = "resolved" if len(matched_hits) == 1 else "ambiguous"
+            uncovered = []
+        else:
+            verdict = _query_verdict(hits)
+            uncovered = list(hits[0].get("query_uncovered") or []) if hits else []
         if uncovered and verdict in ("resolved", "leading"):
             # Something the client SAID ('nivea') is in none of the options:
             # confidence would be fortune-telling. Demote to an honest ask —
@@ -1375,12 +1442,108 @@ class _ToolExecutor:
         )
 
 
+_KNOWN_TOOLS = ("search_products", "add_item", "remove_item", "set_qty",
+                "close_order", "handoff_to_human", "opt_out_client", "note")
+
+
+def _recover_text_tool_calls(content: str) -> List[Dict[str, Any]]:
+    """Parse tool calls the model emitted as TEXT (malformed, not via the tool
+    channel) and normalize them to the executor's {"function": {...}} shape, so
+    a search/add the model 'said' in prose still executes instead of vanishing.
+    Handles {"tool_calls":[{name:args}]}, {"function":{"name","arguments"}}, and
+    a bare {name: args}. Best-effort: unparseable blocks are ignored."""
+    if not content or "{" not in content:
+        return []
+    blocks, i, n = [], 0, len(content)
+    while i < n:
+        if content[i] == "{":
+            depth, j = 0, i
+            while j < n:
+                if content[j] == "{":
+                    depth += 1
+                elif content[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth == 0:
+                blocks.append(content[i:j + 1])
+                i = j + 1
+                continue
+        i += 1
+    out: List[Dict[str, Any]] = []
+    for blk in blocks:
+        try:
+            data = json.loads(blk)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        calls = data.get("tool_calls")
+        if not isinstance(calls, list):
+            calls = [data]        # bare {name: args} or {"function": {...}}
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            fn = c.get("function")
+            if isinstance(fn, dict) and fn.get("name") in _KNOWN_TOOLS:
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                out.append({"function": {"name": fn["name"], "arguments": args or {}}})
+                continue
+            for k, v in c.items():
+                if k in _KNOWN_TOOLS:
+                    out.append({"function": {"name": k,
+                                             "arguments": v if isinstance(v, dict) else {}}})
+    return out
+
+
 def _clean(text: str) -> str:
-    """Strip reasoning tags, the silence token, and sentences where the model
-    leaks its OWN internal process into the client reply."""
+    """Strip reasoning tags, the silence token, raw tool-call JSON the model
+    leaked as text, and sentences where the model leaks its OWN internal
+    process into the client reply."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
     if "<NO_REPLY>" in text:
         return ""
+    # The 2B model sometimes emits a TOOL CALL as plain text instead of through
+    # the tool channel — observed live: a whole {"tool_calls":[{"note":{...}}]}
+    # blob shipped to the client. Strip any JSON object that carries "tool_calls"
+    # or names one of our tools, plus stray ```json fences. What remains (if
+    # anything) is the real prose; an all-JSON reply becomes empty -> the caller
+    # forces a proper answer / deterministic fallback instead of leaking.
+    text = re.sub(r"```(?:json)?|```", "", text)
+    _tool_names = ("tool_calls", "search_products", "add_item", "remove_item",
+                   "set_qty", "close_order", "handoff_to_human", "opt_out_client", "note")
+    tool_re = re.compile(r'"(?:' + "|".join(_tool_names) + r')"')
+    # Remove balanced {...} blocks that mention a tool name (repeat until stable).
+    def _strip_tool_json(s: str) -> str:
+        out, i, n = [], 0, len(s)
+        while i < n:
+            if s[i] == "{":
+                depth, j = 0, i
+                while j < n:
+                    if s[j] == "{":
+                        depth += 1
+                    elif s[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                block = s[i:j + 1]
+                if depth == 0 and tool_re.search(block):
+                    i = j + 1          # drop this tool-call block
+                    continue
+                out.append(s[i]); i += 1
+            else:
+                out.append(s[i]); i += 1
+        return "".join(out)
+    if tool_re.search(text):
+        text = _strip_tool_json(text).strip()
+        logger.info("[AGENT] Stripped leaked tool-call JSON from the reply.")
     # Small models leak their machinery into the reply in a few recurring ways,
     # all about the BOT's own process (never anything the client wrote):
     #   - acknowledging our internal nudges ("...esa instrucción interna",
@@ -1705,9 +1868,17 @@ async def run_agent(
             logger.error(f"[AGENT] LLM call failed at step {step}: {e}")
             return await _finish("")
 
+        # The 2B model sometimes writes a tool call as TEXT instead of using the
+        # tool channel (it leaked a note-as-text live, and the same failure
+        # silently drops search_products/add_item, stalling the order). Recover
+        # any tool calls found in the text and merge them so they execute.
+        text_calls = _recover_text_tool_calls(resp.content)
+        all_calls = (resp.tool_calls or []) + text_calls
         reply = _clean(resp.content)
-        queries = executor.apply(resp.tool_calls or [])
-        logger.info(f"[AGENT] step={step} tools={len(resp.tool_calls or [])} "
+        queries = executor.apply(all_calls)
+        if text_calls:
+            logger.info(f"[AGENT] Recovered {len(text_calls)} tool call(s) emitted as text.")
+        logger.info(f"[AGENT] step={step} tools={len(all_calls)} "
                     f"queries={queries} status={executor.status} cart={len(executor.cart)} "
                     f"handoff={executor.handoff} opt_out={executor.opt_out}")
 
@@ -1951,13 +2122,25 @@ async def run_agent(
             queries = runnable
             results = await search(queries)
             executor.register_results(results)
+            # Semantic MATCH pass (one simple 0.0 call): decide which retrieved
+            # candidates truly are each requested product, instead of guessing
+            # from relevance-score thresholds. Uses the merged (per-item) hits
+            # and the top few candidates each.
+            merged_for_match = _merge_variant_queries(results)
+            match_items = [
+                {"pedido": q,
+                 "candidatos": [_hit_line(h) for h in hits[:6]]}
+                for q, hits in merged_for_match.items() if hits
+            ]
+            match_map = await run_match(match_items) if match_items else None
             # Feed a TRIAGED digest, not a raw hit dump: resolved items in one
             # line each, ONE question at a time, the rest queued — how a real
             # salesman walks a client's list. The queue persists in the session.
             digest, executor.open_items = _triage_results(
                 results, executor.open_items,
                 is_media=_is_media_message(current_message),
-                held_count=len(executor.held_for_enrichment))
+                held_count=len(executor.held_for_enrichment),
+                match_map=match_map)
             batch_stopped = "instruccion_lista_ilegible" in digest
             if batch_stopped:
                 # The list was mostly unreadable: we asked for codes/a clean
@@ -1984,10 +2167,10 @@ async def run_agent(
                 json.dumps({"resultados_busqueda": digest}, ensure_ascii=False), MAX_RESULTS_CHARS)))
             continue
 
-        if not reply and resp.tool_calls and step < MAX_STEPS - 1:
+        if not reply and all_calls and step < MAX_STEPS - 1:
             # Small models often emit only tool calls first; ask for the final text.
             messages.append(Message(role="assistant", content=json.dumps(
-                {"tool_calls": [c.get("function", {}).get("name") for c in resp.tool_calls]})))
+                {"tool_calls": [c.get("function", {}).get("name") for c in all_calls]})))
             messages.append(Message(role="user",
                                     content="Cambios aplicados. Escribe AHORA tu respuesta final al cliente (o <NO_REPLY>)."))
             continue
