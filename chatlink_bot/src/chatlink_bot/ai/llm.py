@@ -1279,6 +1279,18 @@ def _sane_qty(qty: Any) -> int:
         return 1
 
 
+def _has_explicit_qty(qty: Any) -> bool:
+    """True only when the model actually supplied a usable quantity. A missing/
+    null/non-numeric qty on a re-add must NOT overwrite a real cart quantity."""
+    if qty is None:
+        return False
+    try:
+        int(qty)
+        return True
+    except Exception:
+        return False
+
+
 class _ToolExecutor:
     """Applies tool calls to the state, enforcing every invariant in code."""
 
@@ -1354,7 +1366,18 @@ class _ToolExecutor:
                     self.blocked_media_adds.append(code)
                 elif code in self.seen_codes:
                     self.order_activity = True
-                    self.cart[code] = {"code": code, "qty": _sane_qty(args.get("qty"))}
+                    # Re-adding a code ALREADY in the cart without an explicit
+                    # quantity must NOT reset it to 1 — the 2B model re-emits
+                    # add_item on the close turn to 'confirm', and that silently
+                    # wiped real quantities (cart showed 1, reply showed N, the
+                    # Excel shipped 1). Keep the existing qty unless the model
+                    # gives a new valid one; set_qty remains the way to change it.
+                    raw_qty = args.get("qty")
+                    if code in self.cart and not _has_explicit_qty(raw_qty):
+                        qty = self.cart[code]["qty"]
+                    else:
+                        qty = _sane_qty(raw_qty)
+                    self.cart[code] = {"code": code, "qty": qty}
                     self.status = "BUILDING" if self.status != "CLOSED" else self.status
                     logger.info(f"[AGENT] add_item applied: {code} x{self.cart[code]['qty']} "
                                 f"(cart={len(self.cart)})")
@@ -1371,7 +1394,14 @@ class _ToolExecutor:
                     # confirmation is never lost while invented codes stay impossible.
                     logger.info(f"[AGENT] add_item deferred for unseen code {code}; grounding via search.")
                     self.order_activity = True
-                    self.pending_adds[code] = _sane_qty(args.get("qty"))
+                    raw_qty = args.get("qty")
+                    # Preserve a known qty (cart or a prior pending add) on a
+                    # bare re-add; only a new explicit qty overrides it.
+                    if not _has_explicit_qty(raw_qty):
+                        self.pending_adds[code] = (self.cart.get(code, {}).get("qty")
+                                                   or self.pending_adds.get(code) or 1)
+                    else:
+                        self.pending_adds[code] = _sane_qty(raw_qty)
                     queries.append(code)
             elif name == "remove_item":
                 self.cart.pop(_sane_code(args.get("code")), None)
