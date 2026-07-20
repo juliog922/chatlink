@@ -55,6 +55,9 @@ HANDOFF_TEXT = os.getenv("BOT_GUARDRAIL_TEXT", "{salesman} revisará tu mensaje 
 OPTOUT_TEXT = os.getenv("BOT_OPTOUT_TEXT", "Entendido, no te escribiré más 🙂 {salesman} te atenderá personalmente.")
 
 ADMIN_CMD_RE = re.compile(r"^\s*(login|logout)\b", re.IGNORECASE)
+# Direct address to the bot by name re-engages it after an opt-out.
+BOT_NAME = os.getenv("AGENT_BOT_NAME", "Kapa").strip()
+BOT_NAME_RE = re.compile(rf"\b{re.escape(BOT_NAME)}\b", re.IGNORECASE) if BOT_NAME else None
 ADMIN_HELP_TEXT = (
     "🤖 *ChatLink Admin Help*\n\n"
     "Para gestionar tu acceso, utiliza los siguientes comandos:\n\n"
@@ -672,9 +675,6 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
             salesman_name = getattr(user_obj, "name", "") or "Comercial"
 
             session = await _get_session(db, channel, client_id, user_id)
-            if not session.bot_enabled:
-                logger.info(f"[AI_FLOW] Bot OPTED-OUT for {client_id}; staying silent.")
-                return
 
             # 2. History + the messages this turn must answer: the trailing run of
             #    client messages since the last bot/salesman message. (An id cursor
@@ -704,6 +704,21 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 logger.info(f"[AI_FLOW] Batching {len(pending)} client messages into one turn "
                             f"for {channel}/{client_id}.")
             current_message = "\n".join(reversed(pending)).strip()
+
+            # OPT-OUT gate — placed AFTER assembling the message so an opt-out is
+            # not a life sentence: if the client directly addresses the bot by
+            # name ("Kapa"), they clearly want it back, so re-enable and answer.
+            # Any other message respects the opt-out and stays silent.
+            if not session.bot_enabled:
+                if BOT_NAME_RE and BOT_NAME_RE.search(current_message):
+                    session.bot_enabled = True
+                    await db.commit()
+                    logger.info(f"[AI_FLOW] Bot re-engaged by name ('{BOT_NAME}') for "
+                                f"{client_id}; opt-out cleared.")
+                else:
+                    logger.info(f"[AI_FLOW] Bot OPTED-OUT for {client_id}; staying silent "
+                                f"(mention '{BOT_NAME}' to re-engage).")
+                    return
 
             # LOOP BREAKER (last resort): if the newest "client" text is
             # byte-identical to the bot's own last reply, an echo leaked past
