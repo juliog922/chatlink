@@ -1036,7 +1036,7 @@ async def run_match(items: List[Dict[str, Any]]) -> Optional[Dict[str, List[str]
         resp = await asyncio.to_thread(
             _get_client().chat, CIMA_MODEL,
             [Message(role="system", content=_MATCH_SYSTEM),
-             Message(role="user", content=_cap_middle(payload, MAX_RESULTS_CHARS))],
+             Message(role="user", content=_cap_middle(payload, max(MAX_RESULTS_CHARS, 6000)))],
             fmt="json",
             options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0, "num_predict": TRIAGE_MAX_TOKENS},
             timeout=TRIAGE_TIMEOUT_S,
@@ -1049,11 +1049,27 @@ async def run_match(items: List[Dict[str, Any]]) -> Optional[Dict[str, List[str]
         return None
     if not isinstance(data, dict):
         return None
+    # Hallucination guard: the model may echo a "pedido" that wasn't asked
+    # (it invented KG001399 -> SL034256P live) or a code that wasn't among the
+    # candidates. Accept only requested pedidos and only their own candidates.
+    valid_pedidos = {str(it.get("pedido")): {_sane_code(c.get("codigo"))
+                                             for c in (it.get("candidatos") or [])}
+                     for it in payload_items}
     out: Dict[str, List[str]] = {}
     for r in (data.get("resultados") or []):
-        if isinstance(r, dict) and r.get("pedido") is not None:
-            codes = [_sane_code(c) for c in (r.get("codigos") or []) if _sane_code(c)]
-            out[str(r["pedido"])] = codes
+        if not (isinstance(r, dict) and r.get("pedido") is not None):
+            continue
+        ped = str(r["pedido"])
+        if ped not in valid_pedidos:
+            logger.info(f"[MATCH] Ignored hallucinated pedido {ped!r} (not in input).")
+            continue
+        allowed = valid_pedidos[ped]
+        codes = [_sane_code(c) for c in (r.get("codigos") or [])
+                 if _sane_code(c) and _sane_code(c) in allowed]
+        prev = out.setdefault(ped, [])
+        for c in codes:
+            if c not in prev:
+                prev.append(c)
     logger.info(f"[MATCH] {out}")
     return out
 
@@ -1087,23 +1103,24 @@ def _hit_line(h: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _merge_variant_queries(results: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Query VARIANTS of the same item ('crema nivea'/'crema facial') return
-    overlapping hits; merge them so triage counts items, not queries."""
+    """Collapse ONLY literal-duplicate queries (same product asked twice with
+    identical wording). We deliberately do NOT merge by result overlap anymore:
+    a catalog of near-identical names (15 'Ardell Pestañas Postizas … Negras'
+    variants) returns heavily overlapping noisy hits, and the old overlap merge
+    silently fused those DISTINCT products into a handful — dropping most of the
+    client's list. Distinct products stay distinct; the cart is keyed by code,
+    so any genuine duplicate resolution dedupes there harmlessly."""
     merged: Dict[str, List[Dict[str, Any]]] = {}
-    code_sets: Dict[str, set] = {}
+    norm_seen: Dict[str, str] = {}
     for q, hits in results.items():
-        codes = {str(h.get("CodigoArticulo")) for h in hits}
-        top = str(hits[0].get("CodigoArticulo")) if hits else None
-        target = next((k for k, cs in code_sets.items() if codes and cs and (
-            (top is not None and merged[k] and str(merged[k][0].get("CodigoArticulo")) == top)
-            or len(codes & cs) / len(codes | cs) >= 1 / 3)), None)
-        if target is None:
-            merged[q] = list(hits)
-            code_sets[q] = codes
+        norm = re.sub(r"\s+", " ", _strip_accents_lower(q)).strip()
+        if norm in norm_seen:
+            target = norm_seen[norm]
+            have = {str(h.get("CodigoArticulo")) for h in merged[target]}
+            merged[target].extend(h for h in hits if str(h.get("CodigoArticulo")) not in have)
         else:
-            seen = {str(h.get("CodigoArticulo")) for h in merged[target]}
-            merged[target].extend(h for h in hits if str(h.get("CodigoArticulo")) not in seen)
-            code_sets[target] |= codes
+            merged[q] = list(hits)
+            norm_seen[norm] = q
     return merged
 
 
@@ -1129,6 +1146,18 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
     resolved, chosen, ambiguous, missing = [], [], [], []
     honesty_needed = False
     for q, hits in merged.items():
+        # A CODE the client typed must resolve to THAT code or to nothing — the
+        # search may fuzzy-return other codes (KG001399 -> SL034256P live), and
+        # substituting a different code is worse than admitting we didn't find
+        # it. Handled deterministically here; never sent to the match helper.
+        if _code_shaped(q):
+            exact = [h for h in hits
+                     if _sane_code(h.get("CodigoArticulo")).upper() == q.strip().upper()]
+            if exact:
+                resolved.append({"pedido": q, **_hit_line(exact[0])})
+            else:
+                missing.append(q)
+            continue
         # Prefer the semantic MATCH verdict (which real catalog hits are this
         # product) over brittle score thresholds. Reorder hits to the matched
         # codes; fall back to the score-based verdict when the match helper
@@ -2183,10 +2212,13 @@ async def run_agent(
             # from relevance-score thresholds. Uses the merged (per-item) hits
             # and the top few candidates each.
             merged_for_match = _merge_variant_queries(results)
+            # Code queries are resolved deterministically (exact match) in the
+            # triage, so they never go to the match helper. Cap candidates per
+            # item to 4 so a long list's payload isn't middle-cut (which would
+            # silently drop items from the match).
             match_items = [
-                {"pedido": q,
-                 "candidatos": [_hit_line(h) for h in hits[:6]]}
-                for q, hits in merged_for_match.items() if hits
+                {"pedido": q, "candidatos": [_hit_line(h) for h in hits[:4]]}
+                for q, hits in merged_for_match.items() if hits and not _code_shaped(q)
             ]
             match_map = await run_match(match_items) if match_items else None
             # Feed a TRIAGED digest, not a raw hit dump: resolved items in one
