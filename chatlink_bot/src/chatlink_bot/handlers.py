@@ -356,6 +356,18 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         is_self_chat = bool(_norm_phone(from_phone)) and _norm_phone(from_phone) == _norm_phone(to_phone)
         is_mock_owner = is_self_chat and user_from is not None
 
+        # DIAGNOSTIC: shows exactly why a message is (or isn't) classified as
+        # self-talk and how the admin router will see it — from/to numbers,
+        # their resolved users+roles, and the flags. When "salesman -> admin"
+        # is being treated as self-talk, this line reveals whether from==to
+        # (same physical number) or a role/lookup surprise is the cause.
+        logger.info(
+            "[MSG_FLOW][DIAG] from=%s (user=%s role=%s) -> to=%s (user=%s role=%s) | "
+            "self_chat=%s mock_owner=%s text=%r",
+            from_phone, getattr(user_from, "email", None), getattr(user_from, "role", None),
+            to_phone, getattr(user_to, "email", None), getattr(user_to, "role", None),
+            is_self_chat, is_mock_owner, (text_msg or "")[:40])
+
         if is_mock_owner:
             direction, user_phone, client_phone = "received", to_phone, from_phone
             device_jid, internal_user = getattr(msg, "to_jid", None), (user_to or user_from)
