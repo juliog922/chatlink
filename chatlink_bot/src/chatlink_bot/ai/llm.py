@@ -96,7 +96,7 @@ CIMA_URL = os.getenv("CIMA_URL", "http://cima:8000")
 CIMA_MODEL = os.getenv("CIMA_MODEL", "unsloth/gemma-4-E2B-it-GGUF:Q8_0")
 CTX_WINDOW = int(os.getenv("CIMA_CTX_WINDOW", "8192"))
 MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "3"))          # LLM calls per turn
-MAX_HISTORY_CHARS = int(os.getenv("AGENT_HISTORY_MAX_CHARS", "4000"))
+MAX_HISTORY_CHARS = int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000"))
 AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.55"))  # variety without breaking tool JSON
 
 
@@ -114,14 +114,18 @@ TRIAGE_HISTORY_MAX_CHARS = int(os.getenv("AGENT_TRIAGE_HISTORY_MAX_CHARS", "600"
 
 # ---- context budget -------------------------------------------------------
 # The assembled prompt (system + state + history + message + tool results)
-# must stay under AGENT_CTX_BUDGET_PCT of the model's window, leaving the rest
-# for generation. When it doesn't fit, the sacrifices are ordered by value:
-# history is trimmed tail-first (the persisted `note` summary — always in the
-# prompt as "Memoria" — carries the older context), then oversized messages
-# (huge PDF/image extractions) are middle-cut, then tool results are capped.
-CTX_BUDGET_TOKENS = int(CTX_WINDOW * float(os.getenv("AGENT_CTX_BUDGET_PCT", "0.70")))
-MAX_MESSAGE_CHARS = int(os.getenv("AGENT_MESSAGE_MAX_CHARS", "2500"))
-MAX_RESULTS_CHARS = int(os.getenv("AGENT_RESULTS_MAX_CHARS", "3000"))
+# must stay under AGENT_CTX_BUDGET_PCT of the model's window. The gemma-E2B
+# degrades visibly on long contexts (the <|token-soup|> tool-call leak appeared
+# there), so the budget is deliberately tight — 60% — and the heavy lifting is
+# DISTRIBUTED to the single-task helper calls (triage, query-gate, match,
+# reconcile, audit), each of which sees only a tiny focused context. When the
+# main prompt doesn't fit, sacrifices are ordered by value: history is trimmed
+# tail-first (the persisted `note` summary — always present as "Memoria" —
+# carries older context), then oversized messages are middle-cut, then tool
+# results are capped, then _fit_messages drops the oldest loop chatter.
+CTX_BUDGET_TOKENS = int(CTX_WINDOW * float(os.getenv("AGENT_CTX_BUDGET_PCT", "0.60")))
+MAX_MESSAGE_CHARS = int(os.getenv("AGENT_MESSAGE_MAX_CHARS", "2000"))
+MAX_RESULTS_CHARS = int(os.getenv("AGENT_RESULTS_MAX_CHARS", "2400"))
 _GENERATION_SLACK_TOKENS = 96   # role markers, chat template overhead
 
 
@@ -322,6 +326,12 @@ y no aporta nada al pedido, responde "<NO_REPLY>".
 
 IMÁGENES/AUDIOS: son interpretaciones y puedes fallar. Di lo que entendiste, \
 invita a corregir, y NUNCA apuntes ni cierres sin que el cliente confirme.
+
+TUS ERRORES: puedes equivocarte (leer mal, buscar mal, o que algún mensaje \
+tuyo salga raro por un fallo técnico). Si el cliente señala un error o algo \
+no cuadra con lo que dijiste antes, reconócelo con naturalidad en una frase \
+(un pequeño cruce de cables, sin dramatizar ni excusas largas), corrígelo y \
+sigue con el pedido. Nunca discutas con el cliente sobre lo que pasó.
 
 Las [INSTRUCCIÓN INTERNA] no son del cliente: cúmplelas sin citarlas ni \
 disculparte por ellas."""
@@ -1515,6 +1525,30 @@ class _ToolExecutor:
 _KNOWN_TOOLS = ("search_products", "add_item", "remove_item", "set_qty",
                 "close_order", "handoff_to_human", "opt_out_client", "note")
 
+# cima's DEGRADED special-token tool-call format, observed live under long
+# context: <|tool_call>call:search_products{queries:[<|"|>KG001399<|"|>, `65062`]}<tool_call|>
+# Normalize it to plain JSON so the call still EXECUTES instead of leaking.
+_TOKEN_SOUP_RE = re.compile(r"<\|[^>|]{0,24}\|>|<\|[a-z_]+>|<[a-z_]+\|>", re.IGNORECASE)
+
+
+def _normalize_token_soup(content: str) -> str:
+    """Rewrite the special-token tool-call dialect into parseable JSON:
+    <|"|> -> ", backticks -> ", call:name{...} -> {"name": {...}}, and bare
+    keys ({queries: -> {"queries":)."""
+    if "<|" not in content and "`" not in content and "call:" not in content:
+        return content
+    s = content.replace('<|"|>', '"').replace("`", '"')
+    s = _TOKEN_SOUP_RE.sub(" ", s)
+    s = re.sub(r"call\s*:\s*(" + "|".join(_KNOWN_TOOLS) + r")\s*\{",
+               r'{"\1": {', s)
+    # quote bare keys: {queries: [...]} -> {"queries": [...]}
+    s = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', s)
+    # the call:name{ rewrite opened one extra object -> close it
+    opens, closes = s.count("{"), s.count("}")
+    if opens > closes:
+        s += "}" * (opens - closes)
+    return s
+
 
 def _recover_text_tool_calls(content: str) -> List[Dict[str, Any]]:
     """Parse tool calls the model emitted as TEXT (malformed, not via the tool
@@ -1524,6 +1558,7 @@ def _recover_text_tool_calls(content: str) -> List[Dict[str, Any]]:
     a bare {name: args}. Best-effort: unparseable blocks are ignored."""
     if not content or "{" not in content:
         return []
+    content = _normalize_token_soup(content)
     blocks, i, n = [], 0, len(content)
     while i < n:
         if content[i] == "{":
@@ -1586,6 +1621,10 @@ def _clean(text: str) -> str:
     # anything) is the real prose; an all-JSON reply becomes empty -> the caller
     # forces a proper answer / deterministic fallback instead of leaking.
     text = re.sub(r"```(?:json)?|```", "", text)
+    # Rewrite cima's degraded special-token tool syntax into plain JSON first,
+    # so the same balanced-brace stripper removes it (and prose survives).
+    if "<|" in text or "call:" in text:
+        text = _normalize_token_soup(text)
     _tool_names = ("tool_calls", "search_products", "add_item", "remove_item",
                    "set_qty", "close_order", "handoff_to_human", "opt_out_client", "note")
     tool_re = re.compile(r'"(?:' + "|".join(_tool_names) + r')"')
@@ -1642,7 +1681,33 @@ def _clean(text: str) -> str:
     cleaned = " ".join(kept).strip()
     if cleaned != text:
         logger.info("[AGENT] Stripped a leaked internal/process reference from the reply.")
+    # FINAL MACHINERY GATE — the "no matter what" guarantee. If ANY machinery
+    # signature survives the stripping above (special tokens like <|...|>,
+    # tool syntax, raw JSON braces with our tool/argument names), the reply is
+    # NOT sendable: return empty so the caller produces a forced answer or the
+    # deterministic fallback. A slightly generic but professional message
+    # always beats a leaked one in front of clients and bosses.
+    if _looks_like_machinery(cleaned):
+        logger.warning("[AGENT] Machinery gate: reply still contained internal "
+                       "syntax after cleaning; discarding it for a safe fallback.")
+        return ""
     return cleaned
+
+
+_MACHINERY_RE = re.compile(
+    r"<\|.*?\|>|<\|[a-z_]+>|<[a-z_]+\|>|"                       # special tokens
+    r"</?tool_call>?|tool_calls?\s*[:>{]|call\s*:\s*[a-z_]+\s*\{|"  # tool syntax
+    r"\{\s*\"?(?:" + "|".join(("search_products", "add_item", "remove_item",
+                               "set_qty", "close_order", "handoff_to_human",
+                               "opt_out_client", "note", "queries",
+                               "arguments", "function")) + r")\"?\s*[:\]}]",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _looks_like_machinery(text: str) -> bool:
+    """True when a reply still carries internal tool/token syntax that must
+    never reach a client."""
+    return bool(text) and bool(_MACHINERY_RE.search(text))
 
 
 def _fallback_reply(cart: List[Dict[str, Any]], open_items: List[Dict[str, Any]],
@@ -1929,6 +1994,7 @@ async def run_agent(
     reply = ""
     llm = _get_client()
     demoted_promise = False
+    turn_glitch = False   # a draft came out corrupted this turn (machinery gate)
     demoted_style = False
     demoted_humility = False
     demoted_media_add = False
@@ -1962,6 +2028,21 @@ async def run_agent(
         queries = executor.apply(all_calls)
         if text_calls:
             logger.info(f"[AGENT] Recovered {len(text_calls)} tool call(s) emitted as text.")
+        # SELF-AWARENESS OF GLITCHES: if the draft came out corrupted (machinery
+        # gate emptied it) the model is TOLD so — as internal context, not a
+        # scripted apology — and decides itself whether/how to acknowledge it.
+        # This also covers the client's next message ("¿qué era ese mensaje
+        # raro?"): the system prompt principle + this context let it own the
+        # error naturally instead of denying or ignoring it.
+        if not turn_glitch and (resp.content or "").strip() and not reply \
+                and _looks_like_machinery(resp.content):
+            turn_glitch = True
+            messages.append(Message(role="user", content=_internal(
+                "Tu último borrador salió corrupto por un fallo técnico y se ha descartado "
+                "(el cliente NO lo ha visto, aunque puede haber visto alguno raro antes). "
+                "Escribe la respuesta de nuevo con normalidad; si el cliente menciona un "
+                "mensaje extraño, reconócelo breve y amable como un pequeño fallo técnico "
+                "tuyo, sin tecnicismos, y sigue con el pedido.")))
         logger.info(f"[AGENT] step={step} tools={len(all_calls)} "
                     f"queries={queries} status={executor.status} cart={len(executor.cart)} "
                     f"handoff={executor.handoff} opt_out={executor.opt_out}")
@@ -2288,7 +2369,12 @@ async def run_agent(
                    or executor.cart or executor.open_items or executor.pending_adds)
     if not reply and not executor.handoff and not executor.opt_out and active_turn:
         logger.info("[AGENT] Budget spent with no reply on an active turn; forcing a final answer.")
+        glitch_note = ("Además, tus borradores de este turno salieron corruptos por un fallo "
+                       "técnico: si encaja, reconoce breve y amable un pequeño fallo por tu "
+                       "parte (sin tecnicismos) antes de continuar. "
+                       if turn_glitch else "")
         messages.append(Message(role="user", content=_internal(
+            glitch_note +
             "Se acabaron los pasos. Escribe AHORA la respuesta final al cliente siguiendo tus "
             "reglas: confirma con naturalidad lo que has apuntado (con sus códigos y cantidades), "
             "y si pidió un resumen, dáselo a partir del carrito actual. PROHIBIDO prometer que "
