@@ -155,6 +155,27 @@ def _tail_lines_to_fit(history: str, max_chars: int) -> str:
         used += cost
     return "\n".join(reversed(kept))
 
+
+def _messages_tokens(msgs: List["Message"]) -> int:
+    """Estimated tokens for the whole message list actually sent to the model,
+    including per-message chat-template overhead."""
+    return sum(_est_tokens(m.content or "") + 4 for m in msgs)
+
+
+def _fit_messages(msgs: List["Message"], budget: int) -> List["Message"]:
+    """Guarantee the assembled context stays under `budget` tokens even after
+    the loop has appended tool results and nudges. The system prompt (msgs[0]),
+    the main state/context turn (msgs[1]) and the most recent turn are always
+    kept; the OLDEST middle chatter (stale tool results, superseded tool-call
+    announcements, spent nudges) is dropped first — its information already
+    lives in the cart/open_items state and the persisted note summary."""
+    if len(msgs) <= 3 or _messages_tokens(msgs) <= budget:
+        return msgs
+    head, middle, tail = msgs[:2], msgs[2:-1], msgs[-1:]
+    while middle and _messages_tokens(head + middle + tail) > budget:
+        middle.pop(0)
+    return head + middle + tail
+
 VALID_STATUS = ("IDLE", "BUILDING", "CLOSED")
 
 # Retriever signature: queries -> {query: [{"CodigoArticulo", "DescripcionArticulo", ...}]}
@@ -1144,50 +1165,6 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
                 item["sin_coincidencia"] = uncovered
                 honesty_needed = True
             ambiguous.append(item)
-    # BATCH-QUALITY GATE (partial match is the LAST resort). When a whole
-    # list comes in — especially a photo of a handwritten one — and most of
-    # it does NOT resolve cleanly (multiple no-matches, multiple weak/partial
-    # hits, or items we couldn't even read), rushing to mention the one or two
-    # matches we scraped is worse than useless: it looks like the bot ignored
-    # the list. The signal is retrieval quality (verdicts derived from RAG
-    # scores) plus counts — not any word list. Rule: on a list, if the
-    # unresolved items are at least two AND they are not outnumbered by clean
-    # hits, STOP proposing and ask the client for codes / a clearer list.
-    clean = len(resolved) + len(chosen)
-    unresolved = len(missing) + len(ambiguous) + max(0, held_count)
-    total = clean + unresolved
-    batch_stop = total >= 3 and unresolved >= 2 and clean <= unresolved
-    if batch_stop:
-        digest = {
-            "estado_lista": {
-                "identificados_con_seguridad": clean,
-                "sin_identificar_o_dudosos": unresolved,
-                "total_detectado": total,
-            },
-            "instruccion_lista_ilegible": (
-                "La lista llegó en su mayoría ilegible o ambigua: NO menciones las pocas "
-                "coincidencias sueltas ni las apuntes (una coincidencia parcial es el último "
-                "recurso, no el primero). Reconoce con naturalidad que has recibido la lista "
-                "pero que así no puedes identificar los productos con seguridad y no quieres "
-                "equivocarte. Pide amablemente que te la pase de forma más clara: MEJOR los "
-                "códigos de producto (uno por línea), o si no, los nombres completos / marcas. "
-                "NO vuelvas a buscar hasta que llegue esa lista. Una sola petición, cordial."
-            ),
-        }
-        # Discard this turn's weak reads; keep only prior grounded carriers so
-        # the client's clean re-send starts from a clean slate.
-        persist_stop = [i for i in carried_queue if i.get("estado") == "propuesto"]
-        seen_s: set = set()
-        deduped_stop: List[Dict[str, Any]] = []
-        for it in persist_stop:
-            first = (it.get("opciones") or [{}])[0].get("codigo") or it.get("pedido") or ""
-            key = (it.get("estado"), _sane_code(first) or first.lower())
-            if key not in seen_s:
-                seen_s.add(key)
-                deduped_stop.append(it)
-        logger.info(f"[AGENT] Batch-quality STOP: clean={clean} unresolved={unresolved} "
-                    f"total={total}; asking for codes/clean list, not proposing partials.")
-        return digest, deduped_stop
     # Previously queued items go first: the client is mid-list. Only items
     # that still need a client decision (enrichment or option-choice) belong
     # in the ask queue; carried "propuesto" grounding carriers are passed
@@ -1195,22 +1172,15 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
     carried_ask = [i for i in carried_queue if i.get("estado") != "propuesto"]
     carried_grounded = [i for i in carried_queue if i.get("estado") == "propuesto"]
     queue = list(carried_ask) + ambiguous
-    ask_now = queue[0] if queue else None
-    remaining = queue[1:]
-    # GROUNDING PERSISTENCE (breaks the re-propose loop): resolved/leading
-    # hits were catalog-validated by THIS search, but the model may propose
-    # them ("¿te apunto?") instead of adding them. If we don't persist them,
-    # next turn's "sí" has no grounded code to confirm -> add_item defers ->
-    # re-search -> the same "resolved" digest -> the model proposes again.
-    # We carry each grounded code as estado="propuesto" so it lands in the
-    # next turn's seen_codes; add_item's own cleanup drops it the moment the
-    # code is actually added, so same-turn adds don't linger.
+    # GROUNDING PERSISTENCE (breaks the re-propose loop): resolved/leading hits
+    # persist as estado="propuesto" so next turn's "sí" has a grounded code.
     grounded_proposals = carried_grounded + [
         {"pedido": r["pedido"], "estado": "propuesto",
          "opciones": [{"codigo": r["codigo"], "nombre": r.get("nombre", "")}]}
         for r in resolved + chosen if r.get("codigo")
     ]
     persist = queue + grounded_proposals
+
     digest: Dict[str, Any] = {}
     n_items = len(resolved) + len(chosen) + len(queue) + len(missing)
     if n_items > 1:
@@ -1218,6 +1188,8 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
             "empieza reconociendo el pedido COMPLETO en una frase natural (qué tienes "
             "claro, qué tiene opciones, a qué le faltan datos) y luego desarrolla; "
             "una sola pregunta")
+    # ALWAYS commit / propose the FULL matches — never make the client hunt for
+    # products the search already pinned down.
     if resolved:
         digest["identificados_seguros"] = resolved
         digest["instruccion_identificados"] = (
@@ -1230,24 +1202,50 @@ def _triage_results(results: Dict[str, List[Dict[str, Any]]],
             "propón el elegido mencionando la alternativa y espera el sí" if is_media else
             "apúntalos YA con add_item y di de pasada que has elegido ese "
             "(ej.: 'te pongo X; si preferías la alternativa, me dices')")
-    if ask_now:
-        digest["pregunta_ahora"] = ask_now
-        digest["instruccion_pregunta"] = ("ofrece SOLO estas opciones numeradas, pide que elija "
-                                          "y varía la forma de preguntar; si dice que ninguna "
-                                          "vale, pide nombre exacto o código de producto, apúntalo en note "
-                                          "y NO vuelvas a ofrecer esas")
-    if remaining:
-        digest["en_cola"] = [i["pedido"] for i in remaining]
-        digest["instruccion_cola"] = ("di brevemente que los verás uno a uno" +
-                                      ("; si te da códigos o marcas de esos, mejor"
-                                       if len(remaining) > 1 else ""))
-    if honesty_needed:
-        digest["instruccion_honestidad"] = (
-            'si un artículo trae "sin_coincidencia", di CLARO que ninguna opción tiene eso; '
-            "que elija una igualmente, dé el código de producto, o se lo deja al comercial")
-    if missing:
-        digest["sin_resultados"] = missing
-        digest["instruccion_sin_resultados"] = "pide marca, más detalle o el código de producto"
+
+    # The UNRESOLVED set (needs the client): ambiguous options + not-found +
+    # generic-held. How we present it scales with how many there are — the
+    # count is the only threshold (the WHAT-matched decision was the run_match
+    # AI call). >2 unresolved would make a tedious "pick one for each" wall, so
+    # collapse it into a single ask for names/codes; <=2 stays helpful and
+    # concrete (options / mention). Full matches above are committed either way.
+    unresolved_names = [i["pedido"] for i in ambiguous] + list(missing)
+    n_unresolved = len(ambiguous) + len(missing) + max(0, held_count)
+    if n_unresolved > 2:
+        digest["no_encontrados"] = unresolved_names
+        digest["instruccion_no_encontrados"] = (
+            "Son varios los que NO has podido identificar con seguridad. NO listes opciones "
+            "de cada uno (sería un mensaje larguísimo): di en UNA frase, natural, cuáles no "
+            "has localizado y pídele esos por nombre completo o código de producto. Recuerda "
+            "que el código es lo más rápido y seguro.")
+        # Persist the unresolved as enrichment items so that when the client
+        # sends names/codes next turn, reconcile/search can match them — but do
+        # NOT surface per-item options now.
+        for it in ambiguous:
+            if not any(_same_item(it["pedido"], q.get("pedido", "")) for q in queue if q is not it):
+                it["estado"] = "enriquecer"
+    else:
+        # <=2 unresolved: the concrete, helpful per-item behavior.
+        ask_now = queue[0] if queue else None
+        remaining = queue[1:]
+        if ask_now:
+            digest["pregunta_ahora"] = ask_now
+            digest["instruccion_pregunta"] = ("ofrece SOLO estas opciones numeradas, pide que elija "
+                                              "y varía la forma de preguntar; si dice que ninguna "
+                                              "vale, pide nombre exacto o código de producto, apúntalo en note "
+                                              "y NO vuelvas a ofrecer esas")
+        if remaining:
+            digest["en_cola"] = [i["pedido"] for i in remaining]
+            digest["instruccion_cola"] = ("di brevemente que los verás uno a uno" +
+                                          ("; si te da códigos o marcas de esos, mejor"
+                                           if len(remaining) > 1 else ""))
+        if honesty_needed:
+            digest["instruccion_honestidad"] = (
+                'si un artículo trae "sin_coincidencia", di CLARO que ninguna opción tiene eso; '
+                "que elija una igualmente, dé el código de producto, o se lo deja al comercial")
+        if missing:
+            digest["sin_resultados"] = missing
+            digest["instruccion_sin_resultados"] = "pide marca, más detalle o el código de producto"
     # dedupe persisted items by (estado, first-code/pedido) so a code that is
     # both freshly resolved and already carried doesn't double up.
     seen: set = set()
@@ -1330,6 +1328,12 @@ class _ToolExecutor:
             _sane_code(i.get("code")) for i in (session.get("last_closed_cart") or []) if i.get("code")
         }
         self.pending_adds: Dict[str, int] = {}        # rejected adds awaiting grounding
+        # Authoritative quantities parsed from FREE JSON (triage / reconcile),
+        # keyed by code. The inference server's tool-call grammar can truncate
+        # an integer argument to a single digit (10->1, 12->1), so when we have
+        # a code's quantity from a non-tool path we trust THAT over add_item's
+        # qty argument.
+        self.qty_hints: Dict[str, int] = {}
         self.handoff = False
         self.opt_out = False
 
@@ -1373,7 +1377,12 @@ class _ToolExecutor:
                     # Excel shipped 1). Keep the existing qty unless the model
                     # gives a new valid one; set_qty remains the way to change it.
                     raw_qty = args.get("qty")
-                    if code in self.cart and not _has_explicit_qty(raw_qty):
+                    if code in self.qty_hints:
+                        # Authoritative quantity from triage/reconcile (free
+                        # JSON) — beats the tool-call arg, which the grammar may
+                        # have truncated to a single digit.
+                        qty = self.qty_hints[code]
+                    elif code in self.cart and not _has_explicit_qty(raw_qty):
                         qty = self.cart[code]["qty"]
                     else:
                         qty = _sane_qty(raw_qty)
@@ -1395,9 +1404,11 @@ class _ToolExecutor:
                     logger.info(f"[AGENT] add_item deferred for unseen code {code}; grounding via search.")
                     self.order_activity = True
                     raw_qty = args.get("qty")
-                    # Preserve a known qty (cart or a prior pending add) on a
-                    # bare re-add; only a new explicit qty overrides it.
-                    if not _has_explicit_qty(raw_qty):
+                    # Preserve a known qty (hint, cart, or prior pending add) on
+                    # a bare re-add; only a new explicit qty overrides it.
+                    if code in self.qty_hints:
+                        self.pending_adds[code] = self.qty_hints[code]
+                    elif not _has_explicit_qty(raw_qty):
                         self.pending_adds[code] = (self.cart.get(code, {}).get("qty")
                                                    or self.pending_adds.get(code) or 1)
                     else:
@@ -1408,7 +1419,7 @@ class _ToolExecutor:
             elif name == "set_qty":
                 code = _sane_code(args.get("code"))
                 if code in self.cart:
-                    self.cart[code]["qty"] = _sane_qty(args.get("qty"))
+                    self.cart[code]["qty"] = self.qty_hints.get(code) or _sane_qty(args.get("qty"))
             elif name == "close_order":
                 # Decide AFTER the whole tool pass (below), so the order of
                 # add_item vs close_order in this turn's calls doesn't matter.
@@ -1696,6 +1707,7 @@ async def run_agent(
                 # earlier or in the cart/last order) — never an invented code.
                 if code and code in executor.seen_codes:
                     executor.cart[code] = {"code": code, "qty": c["cantidad"]}
+                    executor.qty_hints[code] = c["cantidad"]   # authoritative (free JSON)
                     executor.order_activity = True
                     executor.status = "BUILDING" if executor.status != "CLOSED" else executor.status
                     executor.open_items = [
@@ -1771,7 +1783,13 @@ async def run_agent(
         triage_block=triage_block,
         current_message=current_message or "(sin texto)",
     )
-    avail_tokens = CTX_BUDGET_TOKENS - _est_tokens(system) - _est_tokens(shell) - _GENERATION_SLACK_TOKENS
+    # Reserve room for what the LOOP will append on top of this base prompt
+    # (search-result digests + tool-call announcements + nudges), so the total
+    # context stays under budget once the loop grows it — history is trimmed
+    # tail-first now instead of tool results being dropped later.
+    _LOOP_RESERVE_TOKENS = _est_tokens("x" * MAX_RESULTS_CHARS) + 200
+    avail_tokens = (CTX_BUDGET_TOKENS - _est_tokens(system) - _est_tokens(shell)
+                    - _GENERATION_SLACK_TOKENS - _LOOP_RESERVE_TOKENS)
     history = _tail_lines_to_fit(recent_history or "", min(max(avail_tokens, 0) * 3, MAX_HISTORY_CHARS))
 
     messages: List[Message] = [
@@ -1796,6 +1814,14 @@ async def run_agent(
         "triage_ok": triage.ok, "triage_ms": round(triage.elapsed_ms, 1),
         "triage_worthy": len(triage.worthy), "triage_ambiguous": len(triage.ambiguous),
     }
+
+    def _fit_and_track() -> None:
+        """Trim the accumulated context under budget and record the real peak
+        usage (the gauge the console monitors — must stay < CTX_BUDGET_TOKENS,
+        i.e. under 70% of the window)."""
+        nonlocal messages
+        messages = _fit_messages(messages, CTX_BUDGET_TOKENS)
+        ctx_stats["used"] = max(int(ctx_stats["used"]), _messages_tokens(messages))
 
     def _res(rep: str) -> AgentResult:
         r = executor.result(rep)
@@ -1886,8 +1912,7 @@ async def run_agent(
     step = -1
     while step + 1 < budget:
         step += 1
-        ctx_stats["used"] = max(ctx_stats["used"],
-                                sum(_est_tokens(m.content or "") for m in messages))
+        _fit_and_track()
         try:
             resp = await asyncio.to_thread(
                 llm.chat, CIMA_MODEL, messages, tools=_TOOLS,
@@ -1952,6 +1977,7 @@ async def run_agent(
                 f"toca (precios, stock, facturas, incidencias, o hablar con una persona) di que "
                 f"eso se lo confirma {salesman_name}. Termina invitándole a decirte qué producto "
                 "busca. NO llames a ninguna herramienta.")))
+            _fit_and_track()
             try:
                 resp = await asyncio.to_thread(
                     llm.chat, CIMA_MODEL, messages,
@@ -2171,12 +2197,24 @@ async def run_agent(
                 is_media=_is_media_message(current_message),
                 held_count=len(executor.held_for_enrichment),
                 match_map=match_map)
-            batch_stopped = "instruccion_lista_ilegible" in digest
-            if batch_stopped:
-                # The list was mostly unreadable: we asked for codes/a clean
-                # list. Drop this turn's held reads so they don't reappear as
-                # per-item questions and muddy the single cordial request.
-                executor.held_for_enrichment.clear()
+            # Record authoritative quantities (from the free-JSON triage) for
+            # every code the search resolved this turn, so add_item uses the
+            # real number even if the tool-call grammar truncates its argument.
+            for key in ("identificados_seguros", "elegidos_probables"):
+                for r in digest.get(key, []):
+                    code = _sane_code(r.get("codigo"))
+                    if code:
+                        executor.qty_hints[code] = _triage_qty(r.get("pedido", ""), triage)
+            many_unresolved = "no_encontrados" in digest
+            if many_unresolved:
+                # >2 unresolved: we already collapsed them into one ask for
+                # names/codes. Don't also spell out per-item enrichment prompts
+                # (that's the tedious wall we're avoiding) — fold the held names
+                # into the same ask and clear them.
+                if executor.held_for_enrichment:
+                    digest["no_encontrados"] = list(digest["no_encontrados"]) + \
+                        list(executor.held_for_enrichment)
+                    executor.held_for_enrichment.clear()
             elif executor.held_for_enrichment:
                 digest["necesitan_detalle"] = list(executor.held_for_enrichment)
                 digest["instruccion_detalle"] = (
@@ -2226,6 +2264,7 @@ async def run_agent(
             "demoras o mencionar búsquedas, sistemas o procesos internos: la búsqueda ya ha "
             "terminado, responde con lo que TIENES. NO llames a ninguna herramienta; responde "
             "solo con el texto para el cliente.")))
+        _fit_and_track()
         try:
             resp = await asyncio.to_thread(
                 llm.chat, CIMA_MODEL, messages,   # NO tools: text is the only valid output
