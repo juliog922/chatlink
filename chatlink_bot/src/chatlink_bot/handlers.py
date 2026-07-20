@@ -404,14 +404,21 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         sender_is_admin = bool(internal_user and internal_user.role == "admin")
         to_is_admin = bool(user_to and user_to.role == "admin")
         if admin_cmd and (is_mock_owner or sender_is_admin or to_is_admin):
-            admin_jid = (getattr(msg, "from_jid", None)
-                         if (is_mock_owner or sender_is_admin)
-                         else getattr(msg, "to_jid", None))
+            # RECEIVER -> SENDER. The command arrived sender -> receiver
+            # (salesman -> admin); the reply must go back FROM the device that
+            # RECEIVED it (to_jid = the admin number) TO the number that SENT
+            # it (from_phone = the salesman). The old code used from_jid on the
+            # self-talk path, which sent it sender -> sender (salesman ->
+            # salesman) — the reported bug. to_jid is the receiver in every
+            # case (genuine self-talk has to_jid == from_jid, so it still works).
+            # No fallback to from_jid: that is the sender, and falling back to it
+            # would recreate the sender -> sender bug. Empty -> default device.
+            admin_jid = getattr(msg, "to_jid", None)
             await event_bus.emit("admin_command", {
                 "command": admin_cmd.group(1).lower(), "phone": from_phone,
                 "reply_from_jid": admin_jid})
-            logger.info(f"[MSG_FLOW] Admin command '{admin_cmd.group(1).lower()}' routed for "
-                        f"{from_phone}{' (self-talk)' if is_mock_owner else ''}.")
+            logger.info(f"[MSG_FLOW] Admin command '{admin_cmd.group(1).lower()}' routed: "
+                        f"reply {admin_jid or 'default'} -> {from_phone} (receiver->sender).")
             return
         # A plain (non-command) message to an admin number -> help card.
         if to_is_admin and not is_mock_owner:
