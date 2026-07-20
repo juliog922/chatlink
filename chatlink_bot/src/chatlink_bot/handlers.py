@@ -381,23 +381,28 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             logger.info(f"[MSG_FLOW] WA IGNORED (bot echo) for {client_phone}.")
             return
 
-        # Admin command channel (sender is admin, or user messaging an admin).
-        # The reply MUST be sent from the ADMIN's device — otherwise the gRPC
-        # layer picks a default device (in a multi-account setup that is often
-        # the salesman's own linked phone), and the login code arrives on the
-        # salesman's WhatsApp looking like a self-sent message.
+        # Admin command channel. login/logout are ALWAYS admin operations for
+        # the SENDER's own account — never client orders — so they must reach
+        # the admin handler and NEVER the AI. This includes SELF-TALK: the log
+        # showed a "login" self-talk falling through to Kapa, which then replied
+        # salesman->salesman. The reply is sent from the admin/receiving device
+        # (in self-talk that is the user's own device, but the content is the
+        # login code, not a Kapa answer).
         admin_cmd = ADMIN_CMD_RE.match(text_msg)
-        if internal_user and internal_user.role == "admin" and admin_cmd:
+        sender_is_admin = bool(internal_user and internal_user.role == "admin")
+        to_is_admin = bool(user_to and user_to.role == "admin")
+        if admin_cmd and (is_mock_owner or sender_is_admin or to_is_admin):
+            admin_jid = (getattr(msg, "from_jid", None)
+                         if (is_mock_owner or sender_is_admin)
+                         else getattr(msg, "to_jid", None))
             await event_bus.emit("admin_command", {
                 "command": admin_cmd.group(1).lower(), "phone": from_phone,
-                "reply_from_jid": getattr(msg, "from_jid", None)})
+                "reply_from_jid": admin_jid})
+            logger.info(f"[MSG_FLOW] Admin command '{admin_cmd.group(1).lower()}' routed for "
+                        f"{from_phone}{' (self-talk)' if is_mock_owner else ''}.")
             return
-        if user_to and user_to.role == "admin" and not is_mock_owner:
-            if admin_cmd:
-                await event_bus.emit("admin_command", {
-                    "command": admin_cmd.group(1).lower(), "phone": from_phone,
-                    "reply_from_jid": getattr(msg, "to_jid", None)})
-                return
+        # A plain (non-command) message to an admin number -> help card.
+        if to_is_admin and not is_mock_owner:
             if (user_from or is_simulation) and "ChatLink Admin Help" not in text_msg:
                 now, cache_key = _now_utc(), f"{from_phone}_{to_phone}"
                 last = _admin_help_cache.get(cache_key)
