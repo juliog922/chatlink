@@ -296,6 +296,7 @@ async def logout_user(user: User) -> Dict[str, Any]:
 async def handle_admin_command(payload: Dict[str, Any]) -> None:
     cmd = (payload.get("command") or "").lower()
     phone = (payload.get("phone") or "").strip()
+    reply_from_jid = payload.get("reply_from_jid") or None
     if cmd not in ("login", "logout") or not phone:
         return
 
@@ -310,7 +311,8 @@ async def handle_admin_command(payload: Dict[str, Any]) -> None:
         user = await _get_user_by_phone(db, phone)
     if not user:
         whatsapp_transport.send_message(
-            to_phone=phone, text="❌ *Error:* Tu número no está registrado como usuario válido.")
+            to_phone=phone, text="❌ *Error:* Tu número no está registrado como usuario válido.",
+            from_jid=reply_from_jid)
         return
 
     if cmd == "login":
@@ -327,8 +329,8 @@ async def handle_admin_command(payload: Dict[str, Any]) -> None:
         reply = ("✅ *Servicio Desactivado*\nSesiones cerradas; el bot ya no responderá por ti."
                  if out.get("success") else f"❌ *Error al desactivar*\nDetalle: {out.get('error', 'desconocido')}")
 
-    whatsapp_transport.send_message(to_phone=phone, text=reply)
-    logger.info(f"Admin cmd {cmd} for {user.email}: {out}")
+    whatsapp_transport.send_message(to_phone=phone, text=reply, from_jid=reply_from_jid)
+    logger.info(f"Admin cmd {cmd} for {user.email} (reply via {reply_from_jid or 'default'}): {out}")
 
 
 # ------------------------------------------------------------ WhatsApp ingest
@@ -380,13 +382,21 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
             return
 
         # Admin command channel (sender is admin, or user messaging an admin).
+        # The reply MUST be sent from the ADMIN's device — otherwise the gRPC
+        # layer picks a default device (in a multi-account setup that is often
+        # the salesman's own linked phone), and the login code arrives on the
+        # salesman's WhatsApp looking like a self-sent message.
         admin_cmd = ADMIN_CMD_RE.match(text_msg)
         if internal_user and internal_user.role == "admin" and admin_cmd:
-            await event_bus.emit("admin_command", {"command": admin_cmd.group(1).lower(), "phone": from_phone})
+            await event_bus.emit("admin_command", {
+                "command": admin_cmd.group(1).lower(), "phone": from_phone,
+                "reply_from_jid": getattr(msg, "from_jid", None)})
             return
         if user_to and user_to.role == "admin" and not is_mock_owner:
             if admin_cmd:
-                await event_bus.emit("admin_command", {"command": admin_cmd.group(1).lower(), "phone": from_phone})
+                await event_bus.emit("admin_command", {
+                    "command": admin_cmd.group(1).lower(), "phone": from_phone,
+                    "reply_from_jid": getattr(msg, "to_jid", None)})
                 return
             if (user_from or is_simulation) and "ChatLink Admin Help" not in text_msg:
                 now, cache_key = _now_utc(), f"{from_phone}_{to_phone}"
