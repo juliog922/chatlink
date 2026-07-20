@@ -400,35 +400,46 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
         # salesman->salesman. The reply is sent from the admin/receiving device
         # (in self-talk that is the user's own device, but the content is the
         # login code, not a Kapa answer).
+        # Admin channel. login/logout always go to the admin handler, never the
+        # AI. THE DEVICE MATTERS MORE THAN THE ADDRESS: msg.to_jid on a message
+        # observed on the SENDER's device is just the recipient address — NOT a
+        # device the meow server can send from. Passing it made the server fall
+        # back silently to the default linked device (the salesman's own phone),
+        # which is why every reply kept arriving salesman -> salesman no matter
+        # how the routing was fixed. The only JID the server can actually send
+        # from is a LINKED device, and the admin's linked device is stored on
+        # their User row (wa_device_jid, captured at login). Use THAT.
         admin_cmd = ADMIN_CMD_RE.match(text_msg)
         sender_is_admin = bool(internal_user and internal_user.role == "admin")
         to_is_admin = bool(user_to and user_to.role == "admin")
+        admin_user = user_to if to_is_admin else (internal_user if sender_is_admin else None)
+        admin_device = getattr(admin_user, "wa_device_jid", None) if admin_user else None
         if admin_cmd and (is_mock_owner or sender_is_admin or to_is_admin):
-            # RECEIVER -> SENDER. The command arrived sender -> receiver
-            # (salesman -> admin); the reply must go back FROM the device that
-            # RECEIVED it (to_jid = the admin number) TO the number that SENT
-            # it (from_phone = the salesman). The old code used from_jid on the
-            # self-talk path, which sent it sender -> sender (salesman ->
-            # salesman) — the reported bug. to_jid is the receiver in every
-            # case (genuine self-talk has to_jid == from_jid, so it still works).
-            # No fallback to from_jid: that is the sender, and falling back to it
-            # would recreate the sender -> sender bug. Empty -> default device.
-            admin_jid = getattr(msg, "to_jid", None)
+            if (is_mock_owner or sender_is_admin) and not to_is_admin:
+                # command issued on the user's own device (self-talk / admin self)
+                admin_device = admin_device or getattr(msg, "from_jid", None)
             await event_bus.emit("admin_command", {
                 "command": admin_cmd.group(1).lower(), "phone": from_phone,
-                "reply_from_jid": admin_jid})
+                "reply_from_jid": admin_device})
+            dev_desc = admin_device or "DEFAULT (admin has no linked device!)"
             logger.info(f"[MSG_FLOW] Admin command '{admin_cmd.group(1).lower()}' routed: "
-                        f"reply {admin_jid or 'default'} -> {from_phone} (receiver->sender).")
+                        f"reply FROM device {dev_desc} -> TO {from_phone}.")
             return
-        # A plain (non-command) message to an admin number -> help card.
+        # A plain (non-command) message to an admin number -> help card,
+        # also from the admin's LINKED device.
         if to_is_admin and not is_mock_owner:
             if (user_from or is_simulation) and "ChatLink Admin Help" not in text_msg:
                 now, cache_key = _now_utc(), f"{from_phone}_{to_phone}"
                 last = _admin_help_cache.get(cache_key)
                 if not last or (now - last).total_seconds() > 10:
                     _admin_help_cache[cache_key] = now
+                    if not admin_device:
+                        logger.warning(f"[MSG_FLOW] Admin {getattr(user_to, 'email', to_phone)} has "
+                                       "no linked WhatsApp device (wa_device_jid empty): the help "
+                                       "reply will go out from the DEFAULT device and look "
+                                       "self-sent. Link the admin number (send 'login' from it).")
                     whatsapp_transport.send_message(to_phone=from_phone, text=ADMIN_HELP_TEXT,
-                                                    from_jid=getattr(msg, "to_jid", None))
+                                                    from_jid=admin_device)
             return
 
         if not internal_user.enabled and not is_simulation and not is_mock_owner:
