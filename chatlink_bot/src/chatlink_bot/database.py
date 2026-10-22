@@ -61,3 +61,39 @@ class MSBase(DeclarativeBase):
 async def get_db():
     async with AsyncSessionPG() as session:
         yield session
+
+# --- Schema -----------------------------------------------------------------
+# create_all() makes missing tables; these idempotent statements add columns
+# to tables that already exist. A migration tool comes when this stops being
+# enough.
+SCHEMA_UPGRADES = [
+    "ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS open_items JSONB DEFAULT '[]'::jsonb",
+    "ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS guide_shown BOOLEAN DEFAULT FALSE",
+    # The cursor starts at each conversation's newest message, so the first
+    # deploy does not re-answer old chats.
+    """DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name = 'conversation_sessions' AND column_name = 'last_answered_id') THEN
+        ALTER TABLE conversation_sessions ADD COLUMN last_answered_id INTEGER DEFAULT 0;
+        UPDATE conversation_sessions s SET last_answered_id = COALESCE(
+          CASE WHEN s.channel = 'whatsapp'
+               THEN (SELECT max(id) FROM chats c WHERE c.chat_id = s.client_id AND c."user" = s.user_id)
+               ELSE (SELECT max(id) FROM email_chats e WHERE e.chat_id = s.client_id AND e."user" = s.user_id)
+          END, 0);
+      END IF;
+    END $$""",
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'sent'",
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
+    "ALTER TABLE email_chats ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'sent'",
+    "ALTER TABLE email_chats ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
+    "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS imap_uids JSON DEFAULT '{}'::json",
+]
+
+
+async def init_schema() -> None:
+    from sqlalchemy import text
+    from . import models  # noqa: F401  (registers the tables)
+    async with pg_engine.begin() as conn:
+        await conn.run_sync(PGBase.metadata.create_all)
+        for stmt in SCHEMA_UPGRADES:
+            await conn.execute(text(stmt))

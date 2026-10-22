@@ -65,7 +65,8 @@ class NormalizedEmail:
 IMAP_SENT_FOLDER = os.getenv("IMAP_SENT_FOLDER", "").strip()  # optional override
 
 class _MailboxListener:
-    def __init__(self, login_email: str, mailbox_password: str, main_loop: asyncio.AbstractEventLoop, user_mailbox: str):
+    def __init__(self, login_email: str, mailbox_password: str, main_loop: asyncio.AbstractEventLoop, user_mailbox: str,
+                 last_uids: Optional[Dict[str, int]] = None):
         self.login_email = login_email
         self.user_mailbox = user_mailbox
         self.mailbox_password = mailbox_password
@@ -74,7 +75,8 @@ class _MailboxListener:
         self._thread: Optional[threading.Thread] = None
 
         # track last UID per folder so we ingest sent+received exactly once
-        self._last_uid: Dict[str, int] = {}
+        # Restored from the user row, so a restart neither re-reads nor skips mail.
+        self._last_uid: Dict[str, int] = {k: int(v) for k, v in (last_uids or {}).items()}
         self._sent_folder: Optional[str] = None
 
     @property
@@ -186,6 +188,7 @@ class _MailboxListener:
                                 ],
                                 # NEW:
                                 "folder": folder,
+                                "uid": uid,
                                 "direction": direction,  # "received" for inbox, "sent" for sent folder
                                 "login_email": self.login_email,
                             }
@@ -225,12 +228,20 @@ class _MailboxListener:
 
             except Exception as e:
                 logger.error(f"IMAP loop error ({self.login_email}): {e}")
+                if "AUTHENTICATIONFAILED" in str(e).upper() or "INVALID CREDENTIALS" in str(e).upper():
+                    from ..logic.alerts import alert
+                    alert(f"gmail_auth:{self.login_email}",
+                          f"Gmail rejected the app password of {self.login_email}. Email coverage is off "
+                          "for this salesman until a new app password is set.",
+                          also_to=[self.user_mailbox])
 
             time.sleep(POLL_INTERVAL_SECONDS)
 
     def _parse_raw(self, raw_bytes: bytes) -> Optional[NormalizedEmail]:
         try:
             msg = email_pkg.message_from_bytes(raw_bytes)
+            if msg.get("X-Kapa"):
+                return None   # sent by Kapa itself: never a salesman or client message
 
             subject = _decode_subject(msg.get("Subject", ""))
             from_email = _extract_email_addr(msg.get("From", ""))
@@ -308,6 +319,7 @@ class EmailTransport:
         mailbox_email: str,                      # IMAP login email
         mailbox_password: Optional[str] = None,  # IMAP app password
         user_mailbox: Optional[str] = None,      # logical mailbox for attribution (Postgres user.email)
+        last_uids: Optional[Dict[str, int]] = None,
     ) -> bool:
         if not mailbox_email:
             return False
@@ -331,7 +343,8 @@ class EmailTransport:
             logger.warning(f"No app password found for {mailbox_email} (email monitoring disabled for {logical})")
             return False
 
-        listener = _MailboxListener(mailbox_email, mailbox_password, self._main_loop, user_mailbox=logical)
+        listener = _MailboxListener(mailbox_email, mailbox_password, self._main_loop, user_mailbox=logical,
+                                    last_uids=last_uids)
         self._listeners[logical] = listener
         listener.start()
         return True
@@ -360,6 +373,7 @@ class EmailTransport:
         msg["Subject"] = subject
         msg["From"] = SMTP_USER
         msg["To"] = to_email
+        msg["X-Kapa"] = "1"   # our own mail: the IMAP poller skips it
         msg.set_content(body or "")
 
         if attachments:
@@ -435,6 +449,7 @@ class EmailTransport:
         msg["Subject"] = subject
         msg["From"] = from_email
         msg["To"] = to_email
+        msg["X-Kapa"] = "1"   # our own mail: the IMAP poller skips it
         msg.set_content(body or "")
 
         if attachments:

@@ -16,11 +16,6 @@ logger = logging.getLogger("Transport.WhatsApp")
 GRPC_HOST = os.getenv("GRPC_HOST", "meow_server")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 
-# Admin control (comma-separated phone numbers, no +, no @s.whatsapp.net)
-# Example: ADMIN_WA_NUMBERS=34685176889,34600111222
-ADMIN_WA_NUMBERS = {
-    x.strip() for x in os.getenv("ADMIN_WA_NUMBERS", "").split(",") if x.strip()
-}
 
 
 def _jid_to_phone(jid: str) -> str:
@@ -28,23 +23,6 @@ def _jid_to_phone(jid: str) -> str:
     if not jid:
         return ""
     return jid.split("@")[0].split(":")[0]
-
-
-def _is_admin_sender(from_jid: str) -> bool:
-    phone = _jid_to_phone(from_jid)
-    return bool(phone) and phone in ADMIN_WA_NUMBERS
-
-
-def _parse_admin_command(text: str) -> Optional[Dict[str, Optional[str]]]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    parts = t.split()
-    cmd = parts[0].lower()
-    if cmd not in ("login", "logout"):
-        return None
-    return {"command": cmd}
-
 
 
 @dataclass
@@ -135,18 +113,6 @@ class WhatsAppTransport:
                         filename=getattr(ev, "filename", "") or "",
                     )
 
-                    # Admin command channel
-                    is_admin_chat = (msg.from_phone in ADMIN_WA_NUMBERS) or (msg.to_phone in ADMIN_WA_NUMBERS)
-                    if is_admin_chat:
-                        parsed = _parse_admin_command(msg.text)
-                        if parsed:
-                            self._emit_threadsafe("admin_command", {
-                                "transport": "whatsapp",
-                                "phone": msg.from_phone,
-                                "command": parsed["command"]
-                            })
-                            continue
-
                     # Normal ingress
                     self._emit_threadsafe("message_received", {"msg": ev, "normalized": msg})
 
@@ -214,7 +180,10 @@ class WhatsAppTransport:
             binary=binary or b"",
             filename=filename or "",
         )
-        resp = self.stub.SendMessage(req)
+        try:
+            resp = self.stub.SendMessage(req, timeout=60)
+        except grpc.RpcError as e:
+            return {"success": False, "error": e.details() or str(e)}
         return {"success": bool(getattr(resp, "success", False)), "error": getattr(resp, "error", "")}
 
     def list_devices(self) -> List[str]:

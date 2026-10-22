@@ -40,6 +40,7 @@ class User(PGBase):
     role = Column(Enum(UserRole), default=UserRole.USER)
     enabled = Column(Boolean, default=False)          # bot service on/off for this salesman
     wa_device_jid = Column(String, nullable=True)     # for safe delete-device on logout
+    imap_uids = Column(JSON, default=dict)            # {folder: last UID seen}, survives restarts
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -61,6 +62,10 @@ class Chat(PGBase):
     is_bot = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Bot replies are written "queued" in the turn's transaction and sent by
+    # the loop: queued -> sent | failed (after SEND_ATTEMPTS tries).
+    status = Column(String, default="sent")
+    attempts = Column(Integer, default=0)
 
 
 class EmailChat(PGBase):
@@ -76,6 +81,10 @@ class EmailChat(PGBase):
     is_bot = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Bot replies are written "queued" in the turn's transaction and sent by
+    # the loop: queued -> sent | failed (after SEND_ATTEMPTS tries).
+    status = Column(String, default="sent")
+    attempts = Column(Integer, default=0)
 
 
 class ConversationSession(PGBase):
@@ -116,10 +125,44 @@ class ConversationSession(PGBase):
     # One-time "how I work best" capability guidance delivered flag.
     guide_shown = Column(Boolean, default=False)
 
+    # Highest client message id already handled (answered, or deliberately
+    # left silent). Messages above it, and above the salesman's last message,
+    # are pending: see logic/loop.py.
+    last_answered_id = Column(Integer, default=0)
+
     conv_open = Column(Boolean, default=False)
     bot_enabled = Column(Boolean, default=True)
     bot_introduced_at = Column(DateTime(timezone=True), nullable=True)
     last_client_msg_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class KapaOrder(PGBase):
+    """An order Kapa closed. Written in the same transaction as the close;
+    the loop emails it to the salesman and retries until it is delivered."""
+    __tablename__ = "kapa_orders"
+
+    id = Column(Integer, primary_key=True)
+    channel = Column(String, nullable=False)
+    client_id = Column(String, nullable=False)
+    user_id = Column(String, nullable=False)
+    client_name = Column(String, default="")
+    cart = Column(JSON, default=list)       # [{code, qty, name, fuente}]
+    review = Column(JSON, default=list)     # [{texto, qty}] the salesman must resolve
+    closed_at = Column(DateTime(timezone=True), server_default=func.now())
+    email_status = Column(String, default="queued")   # queued | sent | failed
+    attempts = Column(Integer, default=0)
+
+
+class ClientAlias(PGBase):
+    """The client's own words for a product, saved when he picked it."""
+    __tablename__ = "client_aliases"
+
+    codigo_cliente = Column(String(15), primary_key=True)
+    alias = Column(String, primary_key=True)          # normalize_text() of his words
+    code = Column(String(32), nullable=False)
+    name = Column(String, default="")
+    uses = Column(Integer, default=1)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

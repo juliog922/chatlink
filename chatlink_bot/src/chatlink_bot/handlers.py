@@ -1,22 +1,10 @@
 # chatlink_bot/src/chatlink_bot/handlers.py
 """
-Ingestion + AI orchestration.
+Ingestion, admin commands and the conversation turn.
 
-Changes vs the previous version:
-- Bot-echo race fixed: outbound bot texts are fingerprinted in `bot_outbox`
-  BEFORE sending; inbound "sent" messages matching a fingerprint are dropped
-  before they can be mistaken for a manual salesman reply (which used to
-  trigger a handoff — the bot cancelled itself).
-- Conversation state moved from ai.llm's in-memory dict to the persisted
-  `ConversationSession` row, keyed (channel, client, salesman). Client
-  opt-out (`bot_enabled`) and self-introduction (`bot_introduced_at` +
-  inactivity gap) are now deterministic columns, not LLM guesses.
-- `handle_ai_trigger` calls the single agent loop in ai.llm (search -> ground
-  -> reply in one chain) instead of the old Pass A / Pass B pipeline. The
-  local `_processing_locks` dict is gone: the FSM is the only concurrency
-  authority and never emits two concurrent triggers for the same key.
-- Persist-then-send for bot replies (a failed commit no longer leaves an
-  unpersisted-but-delivered message).
+Ingestion only STORES messages. logic/loop.py decides when a conversation is
+due and calls run_turn(); replies and closed orders are written in the same
+transaction as the session and delivered by send_queued()/send_orders().
 """
 from __future__ import annotations
 
@@ -41,11 +29,10 @@ from .ai.parsers import (
 from .ai.rag import client_history
 from .database import AsyncSessionPG, AsyncSessionSQL
 from .events import event_bus
-from .logic.fsm import fsm
+from .logic.alerts import alert
 from .logic.lifecycle import conversation_mode, lifecycle_after_turn
-from .models import Chat, ConversationSession, EmailChat, InputType, MSArticle, MSClient, User
+from .models import Chat, ConversationSession, EmailChat, InputType, KapaOrder, MSArticle, MSClient, User
 from .transport.email import email_transport
-from .transport.outbox import bot_outbox, same_text, sim_capture
 from .transport.whatsapp import whatsapp_transport
 
 logger = logging.getLogger("Handlers")
@@ -290,12 +277,6 @@ async def _get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
     return (await db.execute(select(User).where(func.lower(User.email) == addr))).scalars().first()
 
 
-def _fake_user(identifier: str) -> User:
-    """Transient salesman object for simulation-only conversations."""
-    return User(id=999999, name=f"Sim Salesman {identifier}", phone=identifier, role="user", enabled=True,
-                email=identifier if "@" in identifier else f"{identifier}@fake.local")
-
-
 def _fake_client(identifier: str) -> MSClient:
     """Transient SAGE client object for simulation-only conversations."""
     return MSClient(CodigoCliente="FAKE001", CodigoEmpresa=1, Nombre=f"Sim Client {identifier}",
@@ -373,13 +354,6 @@ async def _load_history(db: AsyncSession, channel: str, client_id: str, user_id:
     return list(reversed((await db.execute(stmt)).scalars().all()))
 
 
-async def _persist_bot_reply(db: AsyncSession, channel: str, client_id: str, user_id: str, text_msg: str) -> None:
-    model = Chat if channel == "whatsapp" else EmailChat
-    db.add(model(chat_id=client_id, user=user_id, client=client_id, message=text_msg,
-                 direction="sent", input_type=InputType.TEXT, is_bot=True, timestamp=_now_utc()))
-    await db.commit()
-
-
 def _history_lines(history: List[Any], last: int = 10) -> str:
     lines = []
     for h in history[-last:]:
@@ -389,77 +363,62 @@ def _history_lines(history: List[Any], last: int = 10) -> str:
 
 
 # --------------------------------------------------------------- admin flows
-def _send_system_wa(to_phone: str, text: str, from_jid: Optional[str] = None,
-                    peer_phone: Optional[str] = None) -> Dict[str, Any]:
-    """Send a bot/system WhatsApp message (admin help, login/logout replies) AND
-    fingerprint it in bot_outbox first — otherwise the message echoes back
-    (WhatsApp device sync; or, when the sending device IS the recipient's own
-    phone because the admin has no linked device, as a self-talk message) and
-    gets RE-INGESTED and processed. Registered under both the self-talk key and
-    the (recipient, peer) key so the echo guard drops it whichever way it
-    returns."""
-    keys = {("whatsapp", to_phone, to_phone)}
-    if peer_phone:
-        keys.add(("whatsapp", to_phone, peer_phone))
-    for key in keys:
-        bot_outbox.register(key, text, copies=3)
+def _send_system_wa(to_phone: str, text: str, from_jid: Optional[str] = None) -> Dict[str, Any]:
+    """Admin help and login/logout replies, from the device that received the command."""
     return whatsapp_transport.send_message(to_phone=to_phone, text=text, from_jid=from_jid)
 
 
-async def login_user(user: User) -> Dict[str, Any]:
-    """Pair the salesman's WhatsApp device and start their mailbox listener."""
-    email_monitoring = False
+def _start_mailbox(user: User) -> bool:
+    """Start the Gmail listener for a salesman, resuming from his stored IMAP cursor.
+    MOCK_EMAIL lets a developer route one user's mailbox through the SMTP account."""
+    login_email = (user.email or "").strip().lower()
     mock_email = (os.getenv("MOCK_EMAIL") or "").strip().lower()
     smtp_user = (os.getenv("SMTP_USER") or "").strip().lower()
+    imap_login = smtp_user if (mock_email and smtp_user and login_email == mock_email) else login_email
+    pwd = email_transport.get_app_password(imap_login)
+    if not imap_login or not pwd:
+        return False
+    return email_transport.start_mailbox(mailbox_email=imap_login, mailbox_password=pwd,
+                                         user_mailbox=imap_login, last_uids=user.imap_uids or {})
 
+
+async def login_user(user: User) -> Dict[str, Any]:
+    """Pair the salesman's WhatsApp device and start his mailbox listener."""
     login_email = (user.email or "").strip().lower()
     if not login_email:
         return {"success": False, "error": "user_email_missing"}
-
-    # MOCK_EMAIL lets a dev route a user's logical mailbox through the admin Gmail.
-    imap_login = smtp_user if (mock_email and smtp_user and login_email == mock_email) else login_email
-    user_mailbox = imap_login
-
-    mailbox_pwd = email_transport.get_app_password(imap_login)
-    if mailbox_pwd:
-        email_monitoring = email_transport.start_mailbox(
-            mailbox_email=imap_login, mailbox_password=mailbox_pwd, user_mailbox=user_mailbox)
-    else:
-        logger.info(f"No Gmail app password for {imap_login}; continuing WhatsApp-only.")
-
+    email_monitoring = _start_mailbox(user)
     login_resp = whatsapp_transport.start_login(phone_number=(user.phone or "").strip())
     code = login_resp.get("code") or ""
     if not login_resp.get("success"):
-        if email_monitoring:
-            email_transport.stop_mailbox(user_mailbox)
         return {"success": False, "error": login_resp.get("error") or "start_login_failed"}
-
     if code:
         email_transport.send_pairing_code_email(to_email=login_email, name=user.name or "User", code=code)
-
     async with AsyncSessionPG() as db:
         db_user = (await db.execute(select(User).where(User.id == user.id))).scalars().first()
         if db_user:
             db_user.enabled = True
-        if user_mailbox != login_email:  # keep secondary SMTP routing user enabled
-            u_mail = (await db.execute(select(User).where(func.lower(User.email) == user_mailbox))).scalars().first()
+        # MOCK_EMAIL: the SMTP account stands in for this user's mailbox.
+        mock, smtp_user = (os.getenv("MOCK_EMAIL") or "").strip().lower(), (os.getenv("SMTP_USER") or "").strip().lower()
+        if mock and smtp_user and login_email == mock:
+            u_mail = (await db.execute(select(User).where(func.lower(User.email) == smtp_user))).scalars().first()
             if not u_mail:
-                db.add(User(name="Admin SMTP", email=user_mailbox, phone="", role="user", enabled=True))
+                db.add(User(name="Admin SMTP", email=smtp_user, phone="", role="user", enabled=True))
             else:
                 u_mail.enabled = True
         await db.commit()
-
-    return {"success": True, "email_monitoring": email_monitoring, "code": code,
-            "login_user_email": login_email, "logical_user_mailbox": user_mailbox, "imap_login_email": imap_login}
+    return {"success": True, "email_monitoring": email_monitoring, "code": code}
 
 
 async def logout_user(user: User) -> Dict[str, Any]:
     if user.email:
         email_transport.stop_mailbox(user.email)
     if user.phone:
-        logger.info(f"Sending WhatsApp logout for {user.phone}...")
-        whatsapp_transport.logout_device(user.phone)
-        whatsapp_transport.delete_device(user.phone)  # cleanup dead sessions too
+        try:
+            whatsapp_transport.logout_device(user.phone)
+            whatsapp_transport.delete_device(user.phone)
+        except Exception as e:   # meow down: still disable the user
+            logger.warning(f"WhatsApp logout for {user.phone} failed: {e}")
     async with AsyncSessionPG() as db:
         db_user = (await db.execute(select(User).where(User.id == user.id))).scalars().first()
         if db_user:
@@ -511,163 +470,122 @@ async def handle_admin_command(payload: Dict[str, Any]) -> None:
 
 # ------------------------------------------------------------ WhatsApp ingest
 async def handle_new_message(payload: Dict[str, Any]) -> None:
+    """Store one WhatsApp message. Answering is the loop's job (logic/loop.py)."""
     _prune_caches()
     msg = payload.get("normalized")
     if not msg:
         return
-    is_simulation: bool = payload.get("is_simulation", False)
-    mock_client_force: bool = payload.get("mock_client_force", False)
-
     from_phone: str = getattr(msg, "from_phone", "") or ""
     to_phone: str = getattr(msg, "to_phone", "") or ""
     text_msg: str = (getattr(msg, "text", "") or "").strip()
     filename: str = getattr(msg, "filename", "") or ""
     binary: bytes = getattr(msg, "binary", b"") or b""
 
+    if from_phone == "__DEVICE__":
+        await handle_device_event(to_phone, text_msg)
+        return
+
     async with AsyncSessionPG() as db:
         user_from = await _get_user_by_phone(db, from_phone)
         user_to = await _get_user_by_phone(db, to_phone)
 
-        # Self-chat = a linked user messaging their own number -> full-workflow simulation.
+        # Self-chat = a linked salesman messaging his own number: he plays the
+        # client (the live check before a release).
         is_self_chat = bool(_norm_phone(from_phone)) and _norm_phone(from_phone) == _norm_phone(to_phone)
         is_mock_owner = is_self_chat and user_from is not None
-
-        # DIAGNOSTIC: shows exactly why a message is (or isn't) classified as
-        # self-talk and how the admin router will see it — from/to numbers,
-        # their resolved users+roles, and the flags. When "salesman -> admin"
-        # is being treated as self-talk, this line reveals whether from==to
-        # (same physical number) or a role/lookup surprise is the cause.
-        logger.info(
-            "[MSG_FLOW][DIAG] from=%s (user=%s role=%s) -> to=%s (user=%s role=%s) | "
-            "self_chat=%s mock_owner=%s text=%r",
-            from_phone, getattr(user_from, "email", None), getattr(user_from, "role", None),
-            to_phone, getattr(user_to, "email", None), getattr(user_to, "role", None),
-            is_self_chat, is_mock_owner, (text_msg or "")[:40])
 
         if is_mock_owner:
             direction, user_phone, client_phone = "received", to_phone, from_phone
             device_jid, internal_user = getattr(msg, "to_jid", None), (user_to or user_from)
-            logger.info(f"[MSG_FLOW] WA SIMULATION INCOMING (self-talk by {user_from.email})")
-        elif user_from:  # salesman wrote (manually, or it is the bot's own echo)
+        elif user_from:  # the salesman wrote (meow never echoes the bot's own sends)
             direction, user_phone, client_phone = "sent", from_phone, to_phone
             device_jid, internal_user = getattr(msg, "from_jid", None), user_from
-        elif user_to:  # normal inbound: external client -> salesman
+        elif user_to:    # a client wrote to a salesman
             direction, user_phone, client_phone = "received", to_phone, from_phone
             device_jid, internal_user = getattr(msg, "to_jid", None), user_to
         else:
-            logger.debug(f"[MSG_FLOW] WA IGNORED (no internal user): {from_phone} -> {to_phone}")
             return
 
-        # ECHO GUARD. Production (normal chats): the bot sends from the
-        # salesman's JID, so its messages echo back as direction="sent" —
-        # unchanged, sent-only semantics. SELF-CHAT (full mode) additionally
-        # checks all directions, because there the echo is classified as a
-        # CLIENT message ("received") and would otherwise start an infinite
-        # bot-answers-itself loop. Fingerprints are registered BEFORE sending.
-        if (direction == "sent" or is_self_chat) and \
-                bot_outbox.is_echo(("whatsapp", client_phone, user_phone), text_msg):
-            logger.info(f"[MSG_FLOW] WA IGNORED (bot echo) for {client_phone}.")
-            return
-
-        # Admin command channel. login/logout are ALWAYS admin operations for
-        # the SENDER's own account — never client orders — so they must reach
-        # the admin handler and NEVER the AI. This includes SELF-TALK: the log
-        # showed a "login" self-talk falling through to Kapa, which then replied
-        # salesman->salesman. The reply is sent from the admin/receiving device
-        # (in self-talk that is the user's own device, but the content is the
-        # login code, not a Kapa answer).
+        # Admin commands: login/logout for the SENDER's own account, never the AI.
+        # The reply goes from the device that received it back to the sender.
         admin_cmd = ADMIN_CMD_RE.match(text_msg)
-        sender_is_admin = bool(internal_user and internal_user.role == "admin")
         to_is_admin = bool(user_to and user_to.role == "admin")
-        if admin_cmd and (is_mock_owner or sender_is_admin or to_is_admin):
-            # RECEIVER -> SENDER. The command arrived sender -> receiver
-            # (salesman -> admin); the reply must go back FROM the device that
-            # RECEIVED it (to_jid = the admin number) TO the number that SENT
-            # it (from_phone = the salesman). The old code used from_jid on the
-            # self-talk path, which sent it sender -> sender (salesman ->
-            # salesman) — the reported bug. to_jid is the receiver in every
-            # case (genuine self-talk has to_jid == from_jid, so it still works).
-            # No fallback to from_jid: that is the sender, and falling back to it
-            # would recreate the sender -> sender bug. Empty -> default device.
-            admin_jid = getattr(msg, "to_jid", None)
+        if admin_cmd and (is_mock_owner or internal_user.role == "admin" or to_is_admin):
             await event_bus.emit("admin_command", {
                 "command": admin_cmd.group(1).lower(), "phone": from_phone,
-                "reply_from_jid": admin_jid})
-            logger.info(f"[MSG_FLOW] Admin command '{admin_cmd.group(1).lower()}' routed: "
-                        f"reply {admin_jid or 'default'} -> {from_phone} (receiver->sender).")
+                "reply_from_jid": getattr(msg, "to_jid", None)})
             return
-        # A plain (non-command) message to an admin number -> help card.
         if to_is_admin and not is_mock_owner:
-            if (user_from or is_simulation) and "ChatLink Admin Help" not in text_msg:
+            if user_from and "ChatLink Admin Help" not in text_msg:
                 now, cache_key = _now_utc(), f"{from_phone}_{to_phone}"
                 last = _admin_help_cache.get(cache_key)
                 if not last or (now - last).total_seconds() > 10:
                     _admin_help_cache[cache_key] = now
-                    # RECEIVER -> SENDER, exactly like the admin-command block
-                    # above: the card is sent FROM the device that received the
-                    # message (to_jid = the admin number) TO whoever sent it.
-                    # NOT `device_jid`: on this path user_from is truthy, so
-                    # device_jid was set to from_jid — the SENDER's device — and
-                    # using it would send salesman -> salesman, the same
-                    # sender->sender bug documented above. Empty -> default device.
-                    admin_device = getattr(msg, "to_jid", None)
                     _send_system_wa(to_phone=from_phone, text=ADMIN_HELP_TEXT,
-                                    from_jid=admin_device, peer_phone=to_phone)
+                                    from_jid=getattr(msg, "to_jid", None))
             return
 
-        if not internal_user.enabled and not is_simulation and not is_mock_owner:
-            logger.info(f"[MSG_FLOW] WA IGNORED: user {internal_user.email} is DISABLED.")
+        if not internal_user.enabled and not is_mock_owner:
             return
 
-        # Gatekeeper: only SAGE clients ever get stored or answered.
-        client = await _find_client_by_phone(client_phone)
-        if not client:
-            if (is_simulation and mock_client_force) or is_mock_owner:
-                client = _fake_client(client_phone)
-            else:
-                logger.info(f"[MSG_FLOW] WA DROPPED (client not in SAGE): {client_phone}")
-                return
+        # Gatekeeper: only SAGE clients are stored. If SAGE is down the message
+        # is stored anyway (unanswered until SAGE is back) instead of lost.
+        if direction == "received" and not is_mock_owner:
+            try:
+                if not await _find_client_by_phone(client_phone):
+                    logger.info(f"[MSG_FLOW] WA dropped (not a SAGE client): {client_phone}")
+                    return
+            except Exception as e:
+                alert("sage", f"SAGE lookup failed: {e!r}. Messages are stored but Kapa cannot answer.")
 
-        if device_jid and not is_simulation:
+        if device_jid:
             internal_user.wa_device_jid = device_jid
-            await db.commit()
 
-        # Media -> text.
         inferred = _infer_input_type(filename, "", binary)
         final_text = text_msg
         if binary:
             try:
                 extracted = await _extract_media_text(binary, filename, inferred)
-                if extracted:
-                    prefix = _MEDIA_PREFIX.get(inferred, "[Documento]:")
-                    final_text = (final_text + "\n" if final_text else "") + f"{prefix} {extracted}"
+                prefix = _MEDIA_PREFIX.get(inferred, "[Documento]:")
+                final_text = (final_text + "\n" if final_text else "") + f"{prefix} {extracted}"
             except Exception as e:
                 logger.warning(f"Media parsing failed: {e}")
 
-        # Rapid-duplicate guard (transport retries).
-        if not is_simulation:
-            cutoff = _now_utc() - timedelta(seconds=10)
-            dup = (await db.execute(select(Chat.id).where(
-                Chat.chat_id == client_phone, Chat.user == user_phone,
-                Chat.message == final_text, Chat.timestamp >= cutoff).limit(1))).scalars().first()
-            if dup:
-                logger.info(f"[MSG_FLOW] WA IGNORED (rapid duplicate): {client_phone}")
-                return
+        # Transport retries deliver the same message twice within seconds.
+        cutoff = _now_utc() - timedelta(seconds=10)
+        if (await db.execute(select(Chat.id).where(
+                Chat.chat_id == client_phone, Chat.user == user_phone, Chat.direction == direction,
+                Chat.message == final_text, Chat.timestamp >= cutoff).limit(1))).scalars().first():
+            return
 
         db.add(Chat(chat_id=client_phone, user=user_phone, client=client_phone, message=final_text,
                     direction=direction, input_type=inferred if binary else InputType.TEXT,
                     is_bot=False, timestamp=_now_utc()))
         await db.commit()
 
-    sim_flag = is_simulation or is_mock_owner
-    if direction == "received":
-        await fsm.on_client_message("whatsapp", client_phone, user_phone, is_simulation=sim_flag)
-    else:
-        await fsm.on_user_message("whatsapp", client_phone, user_phone)
+
+async def handle_device_event(phone: str, kind: str) -> None:
+    """meow reports a salesman's device changed state (A7)."""
+    async with AsyncSessionPG() as db:
+        user = await _get_user_by_phone(db, phone)
+        name = getattr(user, "name", None) or phone
+        if user and kind in ("logged_out", "stream_replaced", "temporary_ban"):
+            user.enabled = False
+            user.wa_device_jid = None
+            await db.commit()
+    why = {"logged_out": "WhatsApp unlinked the device",
+           "stream_replaced": "another session replaced the device's connection",
+           "temporary_ban": "WhatsApp temporarily banned the number",
+           "client_outdated": "WhatsApp says the client is outdated: bump whatsmeow and redeploy"}.get(kind, kind)
+    tail = "" if kind == "client_outdated" else \
+        " Kapa no longer covers this salesman: send `login` to the admin number to link again."
+    alert(f"device:{phone}:{kind}", f"{name} ({phone}): {why}.{tail}",
+          also_to=[] if kind == "client_outdated" else [getattr(user, "email", "")])
 
 
 # --------------------------------------------------------------- Email ingest
 async def handle_new_email(payload: Dict[str, Any]) -> None:
+    """Store one email. Answering is the loop's job."""
     user_mailbox = (payload.get("user_mailbox") or "").strip().lower()
     from_email = (payload.get("from") or "").strip().lower()
     to_email = (payload.get("to") or "").strip().lower()
@@ -675,28 +593,22 @@ async def handle_new_email(payload: Dict[str, Any]) -> None:
     body = (payload.get("body") or "").strip()
     attachments: List[Dict[str, Any]] = payload.get("attachments") or []
     direction_hint = (payload.get("direction") or "").strip().lower()
-    is_simulation: bool = payload.get("is_simulation", False)
-    mock_client_force: bool = payload.get("mock_client_force", False)
-
     if not user_mailbox:
         return
 
     async with AsyncSessionPG() as db:
         user = await _get_user_by_email(db, user_mailbox)
-        if not user and is_simulation:
-            user = _fake_user(user_mailbox)
         if not user:
-            logger.info(f"[MSG_FLOW] Email DROPPED: mailbox {user_mailbox} unknown.")
             return
-        if not user.enabled and not is_simulation:
-            logger.info(f"[MSG_FLOW] Email DROPPED: user {user_mailbox} disabled.")
+        if payload.get("folder") and payload.get("uid"):
+            uids = dict(user.imap_uids or {})
+            uids[payload["folder"]] = max(int(uids.get(payload["folder"], 0)), int(payload["uid"]))
+            user.imap_uids = uids
+            await db.commit()
+        if not user.enabled:
             return
 
-        # FULL MODE (self-chat): the salesman emailing their OWN mailbox acts
-        # as the client and the bot answers from the same account — mirrors
-        # the WhatsApp self-chat path. Echo guard + dedupe prevent loops.
-        is_self_email = bool(user_mailbox) and from_email == user_mailbox and to_email == user_mailbox
-
+        is_self_email = from_email == user_mailbox and to_email == user_mailbox
         if is_self_email:
             direction = "received"
         elif direction_hint in ("sent", "received"):
@@ -705,26 +617,13 @@ async def handle_new_email(payload: Dict[str, Any]) -> None:
             direction = "sent" if from_email == user_mailbox else "received"
         client_email = (to_email if direction == "sent" else from_email).strip().lower()
 
-        # ECHO GUARD: production keeps sent-only semantics (sent-folder polls);
-        # SELF-CHAT additionally checks all directions — there the bot's own
-        # reply comes back classified as a CLIENT message, via inbox AND
-        # sent-folder polls.
-        chunks_probe = f"Subject: {subject}\n\n{body}".strip()
-        if (direction == "sent" or is_self_email) and \
-                bot_outbox.is_echo(("email", client_email, user_mailbox), chunks_probe):
-            logger.info(f"[MSG_FLOW] Email IGNORED (bot echo) for {client_email}.")
-            return
+        if direction == "received" and not is_self_email:
+            try:
+                if not await _find_client_by_email(client_email):
+                    return
+            except Exception as e:
+                alert("sage", f"SAGE lookup failed: {e!r}. Messages are stored but Kapa cannot answer.")
 
-        # Gatekeeper: only SAGE clients (the owner acts as a fake client in full mode).
-        client = await _find_client_by_email(client_email)
-        if not client:
-            if (is_simulation and mock_client_force) or is_self_email:
-                client = _fake_client(client_email)
-            else:
-                logger.info(f"[MSG_FLOW] Email DROPPED: client {client_email} not in SAGE.")
-                return
-
-        # Attachments -> text.
         chunks: List[str] = []
         input_type = InputType.TEXT
         for a in attachments:
@@ -737,32 +636,21 @@ async def handle_new_email(payload: Dict[str, Any]) -> None:
                 chunks.append(await _extract_media_text(data, a.get("filename") or "", kind))
             except Exception as e:
                 logger.warning(f"Attachment parse failed ({a.get('filename')}): {e}")
-
         msg_text = f"Subject: {subject}\n\n{body}".strip()
         extracted = "\n\n".join(c for c in chunks if c)
         if extracted:
             msg_text += "\n\n[EXTRACTED]\n" + extracted
 
-        # Duplicate guard: exact repeats must not re-trigger the FSM either.
-        if not is_simulation:
-            cutoff = _now_utc() - timedelta(minutes=int(os.getenv("EMAIL_DEDUPE_WINDOW_MINUTES", "30")))
-            dup = (await db.execute(select(EmailChat.id).where(
+        cutoff = _now_utc() - timedelta(minutes=int(os.getenv("EMAIL_DEDUPE_WINDOW_MINUTES", "30")))
+        if (await db.execute(select(EmailChat.id).where(
                 EmailChat.user == user_mailbox, EmailChat.client == client_email,
                 EmailChat.direction == direction, EmailChat.message == msg_text,
-                EmailChat.timestamp >= cutoff).limit(1))).scalars().first()
-            if dup:
-                logger.info("[MSG_FLOW] Email IGNORED (duplicate).")
-                return
+                EmailChat.timestamp >= cutoff).limit(1))).scalars().first():
+            return
 
         db.add(EmailChat(chat_id=client_email, user=user_mailbox, client=client_email, message=msg_text,
                          direction=direction, input_type=input_type, is_bot=False, timestamp=_now_utc()))
         await db.commit()
-
-    if direction == "received":
-        await fsm.on_client_message("email", client_email, user_mailbox,
-                                    is_simulation=is_simulation or is_self_email)
-    else:
-        await fsm.on_user_message("email", client_email, user_mailbox)
 
 
 # -------------------------------------------------------------------- RAG glue
@@ -875,10 +763,9 @@ async def _sage_code_lookup(codes: List[str]) -> Dict[str, Optional[Dict[str, st
     return out
 
 
-def _xlsx_from_cart(cart: List[Dict[str, Any]]) -> bytes:
-    """The order sheet the salesman receives: código, cantidad, origen. Spanish, because
-    it is read by Spanish-speaking staff and pasted into SAGE, whose own column
-    is CodigoArticulo."""
+def _xlsx_from_cart(cart: List[Dict[str, Any]], review: Optional[List[Dict[str, Any]]] = None) -> bytes:
+    """The order sheet the salesman pastes into SAGE: codigo, cantidad, origen.
+    Review rows carry no code: the client's own words, for the salesman to resolve."""
     import io
     from openpyxl import Workbook
     wb = Workbook()
@@ -886,264 +773,215 @@ def _xlsx_from_cart(cart: List[Dict[str, Any]]) -> bytes:
     ws.title = "pedido"
     ws.append(["codigo", "cantidad", "origen"])
     for item in cart:
-        # "codigo_cliente (revisar)": el cliente tecleó el código y se aceptó
-        # por existir en SAGE aunque K_BOT lo excluya (D4) — revisión manual.
         origen = "codigo_cliente (revisar)" if item.get("fuente") == "codigo_cliente" else ""
         ws.append([item.get("code") or "", int(item.get("qty") or 1), origen])
+    for r in review or []:
+        ws.append(["", int(r.get("qty") or 1), f"revisar: {r.get('texto') or ''}"])
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 10
-    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["C"].width = 40
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-# ------------------------------------------------------------------ AI trigger
-def _send_reply(channel: str, client_id: str, user_id: str, reply: str,
-                user_obj: Optional[User]) -> Dict[str, Any]:
-    """Fingerprint (echo guard) then hand the reply to the real transport.
-    Self-conversations (full mode) register extra fingerprint copies: one send
-    can echo back through several paths (WhatsApp device sync; email inbox AND
-    sent-folder pollers), and each is_echo() hit consumes one copy."""
-    is_self = (_norm_phone(client_id) == _norm_phone(user_id)) if channel == "whatsapp" \
-        else (client_id.strip().lower() == user_id.strip().lower())
-    copies = 3 if is_self else 1
-    if channel == "whatsapp":
-        bot_outbox.register(("whatsapp", client_id, user_id), reply, copies=copies)
-        return whatsapp_transport.send_message(
-            to_phone=client_id, text=reply, from_jid=getattr(user_obj, "wa_device_jid", None))
-    subject = "Re: Pedido"
-    bot_outbox.register(("email", client_id, user_id),
-                        f"Subject: {subject}\n\n{reply}".strip(), copies=copies)  # match ingest format
-    ok, err = email_transport.send_email_as(from_email=user_id, to_email=client_id, subject=subject, body=reply)
-    return {"success": ok, "error": err}
+# ------------------------------------------------------------------ the turn
+SEND_ATTEMPTS = int(os.getenv("SEND_ATTEMPTS", "3"))
 
 
-async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
-    """Debounce fired: run the agent for one conversation turn and deliver its reply."""
-    channel: str = payload.get("channel") or ""
-    client_id: str = str(payload.get("client_id") or "")
-    user_id: str = str(payload.get("user_id") or "")
-    is_simulation: bool = payload.get("is_simulation", False)
-    if channel not in ("whatsapp", "email") or not client_id or not user_id:
-        return
+def _model(channel: str):
+    return Chat if channel == "whatsapp" else EmailChat
 
-    logger.info(f"[AI_FLOW] Triggered for {channel} | client={client_id} user={user_id}")
-    try:
-        async with AsyncSessionPG() as db:
-            # 1. Actors + persisted session.
-            user_obj = await (_get_user_by_phone(db, user_id) if channel == "whatsapp"
-                              else _get_user_by_email(db, user_id))
-            if not user_obj and is_simulation:
-                user_obj = _fake_user(user_id)
-            salesman_name = getattr(user_obj, "name", "") or "Comercial"
 
-            session = await _get_session(db, channel, client_id, user_id)
+async def _salesman_of(db: AsyncSession, channel: str, user_id: str) -> Optional[User]:
+    return await (_get_user_by_phone(db, user_id) if channel == "whatsapp" else _get_user_by_email(db, user_id))
 
-            # 2. History + the messages this turn must answer: the trailing run of
-            #    client messages since the last bot/salesman message. (An id cursor
-            #    would treat a client's entire pre-bot history as "new" on the
-            #    bot's first turn for that conversation.)
-            history = await _load_history(db, channel, client_id, user_id, MAX_HISTORY)
-            last_client_msg = next((h for h in reversed(history)
-                                    if h.direction == "received" and not h.is_bot), None)
-            pending: List[str] = []
-            for h in reversed(history):
-                if h.direction == "received" and not h.is_bot:
-                    pending.append((h.message or "").strip())
-                else:
-                    break
-            # BATCHING: `pending` is the whole trailing run of client messages
-            # since the last bot/salesman turn — every message that arrived
-            # during the debounce window is answered together, in ONE turn.
-            # If it is empty, there is nothing NEW to answer: a spurious or
-            # duplicate trigger (e.g. a re-debounce after a message that the
-            # previous turn already folded in). Answering the old last message
-            # again is exactly the "responds twice" bug — stay silent instead.
-            if not pending:
-                logger.info(f"[AI_FLOW] No new client messages since last reply for "
-                            f"{channel}/{client_id}; nothing to answer, staying silent.")
-                return
-            if len(pending) > 1:
-                logger.info(f"[AI_FLOW] Batching {len(pending)} client messages into one turn "
-                            f"for {channel}/{client_id}.")
-            current_message = "\n".join(reversed(pending)).strip()
 
-            # OPT-OUT gate — placed AFTER assembling the message so an opt-out is
-            # not a life sentence: if the client directly addresses the bot by
-            # name ("Kapa"), they clearly want it back, so re-enable and answer.
-            # Any other message respects the opt-out and stays silent.
-            if not session.bot_enabled:
-                if BOT_NAME_RE and BOT_NAME_RE.search(current_message):
-                    session.bot_enabled = True
-                    await db.commit()
-                    logger.info(f"[AI_FLOW] Bot re-engaged by name ('{BOT_NAME}') for "
-                                f"{client_id}; opt-out cleared.")
-                else:
-                    logger.info(f"[AI_FLOW] Bot OPTED-OUT for {client_id}; staying silent "
-                                f"(mention '{BOT_NAME}' to re-engage).")
-                    return
+async def run_turn(channel: str, client_id: str, user_id: str) -> None:
+    """Answer the pending client messages of one conversation (logic/loop.py
+    decided it is due). The reply, the session and a closed order are written
+    in ONE transaction; send_queued()/send_orders() deliver them. Raises on
+    transient failures (SAGE, inference) so the loop retries later."""
+    model = _model(channel)
+    async with AsyncSessionPG() as db:
+        user_obj = await _salesman_of(db, channel, user_id)
+        session = await _get_session(db, channel, client_id, user_id)
+        history = await _load_history(db, channel, client_id, user_id, MAX_HISTORY)
+        last_salesman_id = max((h.id for h in history if h.direction == "sent" and not h.is_bot), default=0)
+        cursor = max(session.last_answered_id or 0, last_salesman_id)
+        pending = [h for h in history if h.direction == "received" and not h.is_bot and h.id > cursor]
+        if not pending:
+            return
+        newest_id = pending[-1].id
 
-            # LOOP BREAKER (last resort): if the newest "client" text is
-            # byte-identical to the bot's own last reply, an echo leaked past
-            # the outbox guard (transport transformed it, TTL expired, or a
-            # restart wiped the fingerprints). Answering it would start a
-            # self-feeding loop — stay silent instead.
-            last_bot_msg = next((h for h in reversed(history) if h.is_bot), None)
-            if last_bot_msg and current_message and same_text(current_message, last_bot_msg.message or ""):
-                logger.warning(f"[AI_FLOW] Loop guard: client text equals my own last reply "
-                               f"({channel}/{client_id}); staying silent.")
-                return
+        async def done(why: str) -> None:
+            session.last_answered_id = newest_id
+            await db.commit()
+            logger.info(f"[TURN] {channel}/{client_id}: {why}")
 
-            # 3. Conversation lifecycle — decided IN CODE by logic/lifecycle.py;
-            #    the LLM only decides the client's intent within its mode. A
-            #    dispatched (CLOSED) order is immutable: on any ended
-            #    conversation the agent works on a FRESH cart, with the last
-            #    dispatched order as context ("ponme lo mismo que la última vez").
-            if session.order_status == "CLOSED" and session.cart:
-                session.last_closed_cart = session.cart          # stash the dispatched order
-            intro_mode, ended = conversation_mode(
-                introduced=session.bot_introduced_at is not None,
-                conv_open=bool(session.conv_open),
-                order_status=session.order_status or "IDLE",
-                gap_expired=_gap_expired(session),
-            )
-            working_status = "IDLE" if ended else (session.order_status or "IDLE")
-            working_cart: List[Dict[str, Any]] = [] if ended else (session.cart or [])
-            working_summary = "" if ended else (session.summary or "")
-            # The multi-item enrichment queue and the one-time capability
-            # guide are per-conversation: an ended conversation starts clean.
-            # getattr fallbacks: tolerate a ConversationSession row that
-            # predates the open_items / guide_shown columns (stale schema).
-            working_open_items: List[Dict[str, Any]] = [] if ended else (getattr(session, "open_items", None) or [])
-            working_guide_shown = False if ended else bool(getattr(session, "guide_shown", False))
+        if not user_obj or not user_obj.enabled:
+            return await done("salesman disabled, not covering")
+        current_message = "\n".join((h.message or "").strip() for h in pending).strip()
+        if not current_message:
+            return await done("nothing to answer")
 
-            # Identity: `resolve_client_identity` dispatches on the SHAPE of the
-            # identifier, not on the channel. Dispatching by channel looked
-            # equivalent and is not: an email arriving on the whatsapp channel
-            # (the simulator can produce exactly that) went to the phone lookup,
-            # which strips every non-digit, resolved to nothing, and fell back
-            # to the FAKE001 mock client — whose order history is empty. The bot
-            # then searched the whole catalog and substituted a product, with no
-            # sign in the log that the real client had never been found.
-            identity = await resolve_client_identity(client_id)
-            client_obj = identity.client
-            if not client_obj and is_simulation:
-                client_obj = _fake_client(client_id)
-                identity = _sim_identity(client_obj)
-            client_name = (getattr(client_obj, "Nombre", "") or "").strip() or "Cliente"
-            history_code = identity.code if identity.history_allowed else None
-            logger.info(f"[AI_FLOW] Identidad {client_id} -> {identity.describe()} | "
-                        f"historial={'ON ' + str(history_code) if history_code else 'OFF'}")
-            retriever = partial(_build_rag_candidates, client_code=history_code)
-
-            # 4. Agent turn (search -> ground -> reply in one loop).
-            result: AgentResult = await run_agent(
-                client_name=client_name,
-                salesman_name=salesman_name,
-                session={"order_status": working_status, "cart": working_cart,
-                         "summary": working_summary,
-                         "open_items": working_open_items,
-                         "guide_shown": working_guide_shown,
-                         "last_closed_cart": session.last_closed_cart or []},
-                recent_history=_history_lines(history),
-                current_message=current_message,
-                intro_mode=intro_mode,
-                search=retriever,
-                code_lookup=_sage_code_lookup,
-            )
-
-            # 5. Decide the outgoing text first (canned messages are code, not
-            #    LLM output) — the lifecycle below depends on what is delivered.
-            if result.opt_out:
-                reply = OPTOUT_TEXT.format(salesman=salesman_name)
-            elif result.handoff:
-                # handoff + silent = Pass-1 triage ESC_HANDOFF (explicit human
-                # demand / anger / uncommercial dispute): strict silence — no
-                # canned line, no LLM text — the salesman takes over clean.
-                # handoff without silent keeps the previous semantics: PURE
-                # escalation decided in the agent loop -> canned referral.
-                if result.silent:
-                    reply = ""
-                else:
-                    reply = result.reply.strip() or HANDOFF_TEXT.format(salesman=salesman_name)
+        # Opt-out is respected unless the client calls Kapa by name.
+        if not session.bot_enabled:
+            if BOT_NAME_RE and BOT_NAME_RE.search(current_message):
+                session.bot_enabled = True
             else:
-                reply = result.reply.strip()
-            spoke_as_kapa = bool(reply) and not (result.opt_out or (result.handoff and not result.reply.strip()))
+                return await done("client opted out")
 
-            # 6. Persist lifecycle BEFORE sending (a failed commit must not
-            #    leave a delivered-but-unrecorded reply). Rules live in
-            #    logic/lifecycle.py (unit-tested there).
-            outcome = lifecycle_after_turn(
-                intro_mode=intro_mode, spoke_as_kapa=spoke_as_kapa,
-                result_status=result.order_status, cart_size=len(result.cart),
-                handoff=result.handoff, opt_out=result.opt_out,
-            )
-            session.order_status, session.cart, session.summary = result.order_status, result.cart, result.summary
-            # These two columns may be absent on an out-of-date table; only
-            # assign when the mapper actually has them (a bare setattr on an
-            # ORM object without the column would silently never persist).
-            if hasattr(type(session), "open_items"):
-                session.open_items = result.open_items
-            if hasattr(type(session), "guide_shown"):
-                session.guide_shown = bool(result.guide_shown)
-            if result.order_status == "CLOSED":
-                session.last_closed_cart = result.cart
-            if result.opt_out:
-                session.bot_enabled = False
-            if outcome.conv_open is not None:
-                session.conv_open = outcome.conv_open
-            if outcome.introduced_now:
-                session.bot_introduced_at = _now_utc()
-            session.last_client_msg_at = getattr(last_client_msg, "timestamp", None) or _now_utc()
+        identity = await resolve_client_identity(client_id)
+        if not identity.found:
+            if _norm_phone(client_id) == _norm_phone(user_id) or client_id == user_id:
+                identity = _sim_identity(_fake_client(client_id))   # self-chat live check
+            else:
+                return await done("not a SAGE client")
+        elif not identity.unique:
+            alert(f"ambiguous:{client_id}",
+                  f"{client_id} matches several SAGE clients {identity.candidate_codes}: Kapa cannot use "
+                  "their order history. Fix the phone/email in SAGE.")
+        client_name = (getattr(identity.client, "Nombre", "") or "").strip() or "Cliente"
+        history_code = identity.code if identity.history_allowed else None
+
+        # Lifecycle: only a CLOSED order starts a fresh cart. Silence, an
+        # opt-out or a goodbye never drop the lines the client already gave.
+        if session.order_status == "CLOSED" and session.cart:
+            session.last_closed_cart = session.cart
+        intro_mode, ended = conversation_mode(
+            introduced=session.bot_introduced_at is not None,
+            conv_open=bool(session.conv_open),
+            order_status=session.order_status or "IDLE",
+            gap_expired=_gap_expired(session))
+        fresh = (session.order_status or "IDLE") == "CLOSED"
+        salesman_name = getattr(user_obj, "name", "") or "Comercial"
+
+        result: AgentResult = await run_agent(
+            client_name=client_name,
+            salesman_name=salesman_name,
+            session={"order_status": "IDLE" if fresh else (session.order_status or "IDLE"),
+                     "cart": [] if fresh else (session.cart or []),
+                     "summary": "",
+                     "open_items": [] if fresh else (session.open_items or []),
+                     "guide_shown": False if fresh else bool(session.guide_shown),
+                     "last_closed_cart": session.last_closed_cart or []},
+            recent_history=_history_lines(history),
+            current_message=current_message,
+            intro_mode=intro_mode,
+            search=partial(_build_rag_candidates, client_code=history_code),
+            code_lookup=_sage_code_lookup,
+        )
+        if result.ctx.get("inference_down"):
+            raise RuntimeError("inference is not answering")
+
+        # The salesman wrote while Kapa was thinking: he has it (C4).
+        newer = (await db.execute(select(func.max(model.id)).where(
+            model.chat_id == client_id, model.user == user_id,
+            model.direction == "sent", model.is_bot.is_(False)))).scalar() or 0
+        if newer > last_salesman_id:
+            return await done("salesman replied during the turn; reply dropped")
+
+        if result.opt_out:
+            reply = OPTOUT_TEXT.format(salesman=salesman_name)
+        elif result.handoff:
+            reply = result.reply.strip() or HANDOFF_TEXT.format(salesman=salesman_name)
+        else:
+            reply = result.reply.strip()
+        spoke_as_kapa = bool(reply) and not result.opt_out
+
+        outcome = lifecycle_after_turn(
+            intro_mode=intro_mode, spoke_as_kapa=spoke_as_kapa,
+            result_status=result.order_status, cart_size=len(result.cart),
+            handoff=result.handoff, opt_out=result.opt_out)
+        session.order_status, session.cart = result.order_status, result.cart
+        session.open_items = result.open_items
+        session.guide_shown = bool(result.guide_shown)
+        if result.opt_out:
+            session.bot_enabled = False
+        if outcome.conv_open is not None:
+            session.conv_open = outcome.conv_open
+        if outcome.introduced_now:
+            session.bot_introduced_at = _now_utc()
+        session.last_client_msg_at = pending[-1].timestamp
+        session.last_answered_id = newest_id
+        if reply:
+            db.add(model(chat_id=client_id, user=user_id, client=client_id, message=reply,
+                         direction="sent", input_type=InputType.TEXT, is_bot=True,
+                         status="queued", timestamp=_now_utc()))
+        if result.order_status == "CLOSED":
+            session.last_closed_cart = result.cart
+            db.add(KapaOrder(channel=channel, client_id=client_id, user_id=user_id,
+                             client_name=client_name, cart=result.cart,
+                             review=[{"texto": i.get("texto"), "qty": i.get("qty")}
+                                     for i in result.open_items if i.get("tipo") == "revisar"]))
+        await db.commit()
+        logger.info(f"[TURN] {channel}/{client_id}: {'replied' if reply else 'silent'}, "
+                    f"status={result.order_status}, cart={len(result.cart)}")
+
+
+async def send_queued() -> None:
+    """Deliver queued bot replies; after SEND_ATTEMPTS failures, alert."""
+    async with AsyncSessionPG() as db:
+        for channel in ("whatsapp", "email"):
+            model = _model(channel)
+            rows = (await db.execute(select(model).where(
+                model.is_bot.is_(True), model.status == "queued").order_by(model.id))).scalars().all()
+            for row in rows:
+                user = await _salesman_of(db, channel, row.user)
+                if channel == "whatsapp":
+                    res = await asyncio.to_thread(whatsapp_transport.send_message, to_phone=row.client,
+                                                  text=row.message, from_jid=getattr(user, "wa_device_jid", None))
+                    ok, err = bool(res.get("success")), res.get("error")
+                else:
+                    ok, err = await asyncio.to_thread(email_transport.send_email_as, from_email=row.user,
+                                                      to_email=row.client, subject="Re: Pedido", body=row.message)
+                row.attempts = (row.attempts or 0) + 1
+                if ok:
+                    row.status = "sent"
+                elif row.attempts >= SEND_ATTEMPTS:
+                    row.status = "failed"
+                    alert(f"send:{channel}:{row.user}",
+                          f"A reply to {row.client} could not be delivered from {row.user} ({channel}): {err}. "
+                          "The client has no answer; the salesman should reply.",
+                          also_to=[getattr(user, "email", "")])
+                await db.commit()
+
+
+async def send_orders() -> None:
+    """Email every closed order to its salesman as pedido.xlsx, with retries."""
+    async with AsyncSessionPG() as db:
+        orders = (await db.execute(select(KapaOrder).where(
+            KapaOrder.email_status == "queued").order_by(KapaOrder.id))).scalars().all()
+        for o in orders:
+            user = await _salesman_of(db, o.channel, o.user_id)
+            to = getattr(user, "email", None)
+            if not to:
+                ok, err = False, "the salesman has no email"
+            else:
+                lines = "\n".join(f"  {i.get('code')}  x{i.get('qty')}  {i.get('name') or ''}" for i in o.cart)
+                review = "\n".join(f"  REVISAR: {r.get('texto')}" + (f" x{r['qty']}" if r.get("qty") else "")
+                                   for r in o.review)
+                ok, err = await asyncio.to_thread(
+                    email_transport.send_email, to_email=to,
+                    subject=f"Pedido confirmado ({o.client_name or o.client_id})",
+                    body=f"Pedido confirmado por {o.client_name} ({o.client_id}).\n\n{lines}\n{review}".rstrip(),
+                    attachments=[("pedido.xlsx",
+                                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                  _xlsx_from_cart(o.cart, o.review))])
+            o.attempts = (o.attempts or 0) + 1
+            if ok:
+                o.email_status = "sent"
+            elif o.attempts >= SEND_ATTEMPTS:
+                o.email_status = "failed"
+                alert(f"order:{o.id}", f"Closed order {o.id} of {o.client_name} ({o.client_id}) could not be "
+                      f"emailed to {to or o.user_id}: {err}. Items: {o.cart} Review: {o.review}")
             await db.commit()
 
-            if not reply:
-                logger.info(f"[AI_FLOW] Silence for {client_id}.")
-                return
 
-            await _persist_bot_reply(db, channel, client_id, user_id, reply)
-            send_res = _send_reply(channel, client_id, user_id, reply, user_obj)
-            if not send_res.get("success") and not is_simulation:
-                logger.warning(f"[AI_FLOW] Send failed for {client_id}: {send_res.get('error')}")
-            if is_simulation:
-                sim_capture.record((channel, client_id, user_id), reply,
-                                   meta={"ctx": getattr(result, "ctx", {})})
-
-            # 7. Salesman notifications. A closed order ships as xlsx. Handoffs
-            #    do NOT email the salesman (he sees the conversation on his own
-            #    WhatsApp). The email goes out for any REAL salesman inbox —
-            #    including full-mode self-talk, which exists precisely to verify
-            #    end-to-end delivery. Only the fake simulation fixtures
-            #    (sales@sim.com / admin@sim.com) have no inbox and are skipped.
-            target_email = getattr(user_obj, "email", None)
-            is_fake_sim_actor = bool(target_email) and \
-                target_email.strip().lower().endswith("@sim.com")
-            if result.order_status == "CLOSED" and result.cart:
-                if not target_email:
-                    logger.error(f"[AI_FLOW] Order CLOSED for {client_id} but salesman has no "
-                                 "email on file; cannot deliver the xlsx.")
-                elif is_fake_sim_actor:
-                    logger.info(f"[AI_FLOW] Order CLOSED; salesman {target_email} is a sim "
-                                "fixture with no inbox — xlsx email skipped.")
-                else:
-                    logger.info(f"[AI_FLOW] Order CLOSED; emailing xlsx to {target_email} with "
-                                f"{len(result.cart)} rows: {[i.get('code') for i in result.cart]}")
-                    ok, err = await asyncio.to_thread(
-                        email_transport.send_email,
-                        to_email=target_email,
-                        subject=f"Pedido confirmado ({client_id})",
-                        body=f"Pedido confirmado para {client_id} ({client_name}).\n\n"
-                             f"Items: {result.cart}",
-                        attachments=[("pedido.xlsx",
-                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                      _xlsx_from_cart(result.cart))],
-                    )
-                    if ok:
-                        logger.info(f"[AI_FLOW] Order xlsx delivered to {target_email}.")
-                    else:
-                        logger.error(f"[AI_FLOW] Order xlsx FAILED to send to {target_email}: {err}")
-    except Exception as e:
-        logger.exception(f"[AI_FLOW] Unhandled error for {channel}/{client_id}: {e}")
-    finally:
-        await fsm.on_ai_done(channel, client_id, user_id)
+async def resume_mailboxes() -> None:
+    """Restart the Gmail listeners of enabled salesmen after a restart."""
+    async with AsyncSessionPG() as db:
+        users = (await db.execute(select(User).where(User.enabled.is_(True)))).scalars().all()
+    for u in users:
+        _start_mailbox(u)
