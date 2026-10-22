@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"net"
@@ -180,37 +179,55 @@ type WhatsAppServer struct {
 	pb.UnimplementedWhatsAppServiceServer
 	mu        sync.RWMutex
 	Container *sqlstore.Container
-	DB        *sql.DB // Direct DB access for manual queries
 	Clients   map[string]*whatsmeow.Client
+	// IDs of messages this server sent, so their echo (if WhatsApp ever
+	// delivers one) is never mistaken for a message typed by the salesman.
+	sent      map[types.MessageID]time.Time
 	Listeners map[pb.WhatsAppService_StreamMessagesServer]struct{}
 	Logger    *logrus.Logger
 }
 
-func NewWhatsAppServer(container *sqlstore.Container, db *sql.DB, logger *logrus.Logger) *WhatsAppServer {
+func NewWhatsAppServer(container *sqlstore.Container, logger *logrus.Logger) *WhatsAppServer {
 	return &WhatsAppServer{
 		Container: container,
-		DB:        db,
 		Clients:   make(map[string]*whatsmeow.Client),
+		sent:      make(map[types.MessageID]time.Time),
 		Listeners: make(map[pb.WhatsAppService_StreamMessagesServer]struct{}),
 		Logger:    logger,
 	}
 }
 
-// resolvePhoneFromLID queries the custom table 'whatsmeow_lid_map' to find the 'pn' (phone number).
-func (s *WhatsAppServer) resolvePhoneFromLID(ctx context.Context, lidUser string) string {
-	// Query based on the provided schema: lid | pn
-	const query = `SELECT pn FROM whatsmeow_lid_map WHERE lid = $1 LIMIT 1`
-
-	var phoneNumber string
-	// The table stores the LID as a simple string/int (e.g. "156332699189351")
-	// We pass the user part of the JID directly.
-	if err := s.DB.QueryRowContext(ctx, query, lidUser).Scan(&phoneNumber); err != nil {
-		if err != sql.ErrNoRows {
-			s.Logger.WithError(err).Warnf("DB Error resolving LID %s", lidUser)
-		}
+// resolvePhoneFromLID maps a hidden-user LID to a phone number with
+// whatsmeow's own LID store ("" when unknown).
+func resolvePhoneFromLID(ctx context.Context, client *whatsmeow.Client, lid types.JID) string {
+	pn, err := client.Store.LIDs.GetPNForLID(ctx, lid)
+	if err != nil || pn.IsEmpty() {
 		return ""
 	}
-	return phoneNumber
+	return pn.User
+}
+
+// deviceEvent tells the bot that a salesman's device changed state, over the
+// same stream as messages (like the __PAIRING__ events). phone is the
+// device's own number, captured at registration because a logged-out store
+// may no longer know it.
+func (s *WhatsAppServer) deviceEvent(phone, kind string) {
+	s.Logger.WithFields(logrus.Fields{"phone": phone, "event": kind}).Warn("Device event")
+	s.broadcastEvent(&pb.MessageEvent{From: "__DEVICE__", To: phone, Text: kind, Timestamp: time.Now().Format(time.RFC3339)})
+}
+
+// wasSentHere reports (and forgets) whether this server sent message id.
+func (s *WhatsAppServer) wasSentHere(id types.MessageID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, t := range s.sent {
+		if time.Since(t) > 10*time.Minute {
+			delete(s.sent, k)
+		}
+	}
+	_, ok := s.sent[id]
+	delete(s.sent, id)
+	return ok
 }
 
 // handleWhatsAppEvent processes incoming events and resolves JIDs.
@@ -220,8 +237,12 @@ func (s *WhatsAppServer) handleWhatsAppEvent(client *whatsmeow.Client, evt inter
 		return
 	}
 
-	// Ignore status updates
-	if msgEvt.Info.Chat.String() == "status@broadcast" {
+	// Ignore status updates and groups: Kapa only covers 1:1 chats.
+	if msgEvt.Info.Chat.String() == "status@broadcast" || msgEvt.Info.IsGroup {
+		return
+	}
+	// Our own sends are already stored by the bot.
+	if msgEvt.Info.IsFromMe && s.wasSentHere(msgEvt.Info.ID) {
 		return
 	}
 
@@ -236,7 +257,7 @@ func (s *WhatsAppServer) handleWhatsAppEvent(client *whatsmeow.Client, evt inter
 	// Helper closure to resolve any JID to a Phone number
 	getPhone := func(jid types.JID) string {
 		if jid.Server == types.HiddenUserServer { // It is a LID
-			phone := s.resolvePhoneFromLID(ctx, jid.User)
+			phone := resolvePhoneFromLID(ctx, client, jid)
 			if phone != "" {
 				return phone
 			}
@@ -496,7 +517,7 @@ func (s *WhatsAppServer) StartLogin(ctx context.Context, req *pb.LoginRequest) (
 func (s *WhatsAppServer) SendMessage(ctx context.Context, req *pb.SendRequest) (*pb.SendResponse, error) {
 	client := s.getClient(req.FromJid)
 	if client == nil {
-		return &pb.SendResponse{Success: false, Error: "No connected client"}, nil
+		return &pb.SendResponse{Success: false, Error: "no device for " + req.FromJid}, nil
 	}
 
 	// JID Parsing
@@ -521,18 +542,18 @@ func (s *WhatsAppServer) SendMessage(ctx context.Context, req *pb.SendRequest) (
 		msg = &waE2E.Message{Conversation: proto.String(req.Text)}
 	}
 
+	if !client.IsConnected() {
+		return &pb.SendResponse{Success: false, Error: "device not connected"}, nil
+	}
 	resp, err := client.SendMessage(ctx, jid, msg)
 	if err != nil {
 		s.Logger.WithError(err).Error("Send failed")
 		return &pb.SendResponse{Success: false, Error: err.Error()}, nil
 	}
-
+	s.mu.Lock()
+	s.sent[resp.ID] = time.Now()
+	s.mu.Unlock()
 	s.Logger.WithField("id", resp.ID).Info("Message sent")
-
-	// Echo back
-	s.broadcastEvent(&pb.MessageEvent{
-		From: client.Store.ID.User, To: req.To, Text: req.Text, Timestamp: time.Now().Format(time.RFC3339),
-	})
 	return &pb.SendResponse{Success: true}, nil
 }
 
@@ -578,21 +599,33 @@ func (s *WhatsAppServer) registerClient(c *whatsmeow.Client) {
 	s.mu.Lock()
 	s.Clients[c.Store.ID.String()] = c
 	s.mu.Unlock()
-	c.AddEventHandler(func(evt interface{}) { s.handleWhatsAppEvent(c, evt) })
+	phone := c.Store.ID.User
+	c.AddEventHandler(func(evt interface{}) {
+		switch evt.(type) {
+		case *events.LoggedOut:
+			s.deviceEvent(phone, "logged_out")
+		case *events.StreamReplaced:
+			s.deviceEvent(phone, "stream_replaced")
+		case *events.TemporaryBan:
+			s.deviceEvent(phone, "temporary_ban")
+		case *events.ClientOutdated:
+			s.deviceEvent(phone, "client_outdated")
+		default:
+			s.handleWhatsAppEvent(c, evt)
+		}
+	})
 }
 
 func (s *WhatsAppServer) getClient(jid string) *whatsmeow.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if jid != "" {
-		for id, c := range s.Clients {
-			if strings.Contains(id, jid) {
-				return c
-			}
-		}
+	// Only the requested device: falling back to another one would send a
+	// salesman's reply from somebody else's number.
+	if jid == "" {
+		return nil
 	}
-	for _, c := range s.Clients {
-		if c.IsConnected() {
+	for id, c := range s.Clients {
+		if strings.Contains(id, jid) {
 			return c
 		}
 	}
@@ -644,17 +677,7 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	// 2. Open Direct DB Connection for our custom queries (LID resolution)
-	rawDB, err := sql.Open("postgres", dsn)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	// Verify connection
-	if err := rawDB.Ping(); err != nil {
-		logger.WithError(err).Error("Failed to ping raw DB")
-	}
-
-	srv := NewWhatsAppServer(container, rawDB, logger)
+	srv := NewWhatsAppServer(container, logger)
 
 	// Restore sessions
 	devs, _ := container.GetAllDevices(context.Background())
