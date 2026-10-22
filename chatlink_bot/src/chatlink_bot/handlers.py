@@ -38,7 +38,7 @@ from .ai.parsers import (
     extract_text_from_image_bytes_async,
     transcribe_audio_bytes_async,
 )
-from .ai.rag import HISTORY_ONLY, client_history, rag_service
+from .ai.rag import client_history
 from .database import AsyncSessionPG, AsyncSessionSQL
 from .events import event_bus
 from .logic.fsm import fsm
@@ -46,7 +46,6 @@ from .logic.lifecycle import conversation_mode, lifecycle_after_turn
 from .models import Chat, ConversationSession, EmailChat, InputType, MSArticle, MSClient, User
 from .transport.email import email_transport
 from .transport.outbox import bot_outbox, same_text, sim_capture
-from .logic.sim_clients import sim_client_cache
 from .transport.whatsapp import whatsapp_transport
 
 logger = logging.getLogger("Handlers")
@@ -187,13 +186,6 @@ def _pick_identity(rows: List[Any], kind: str) -> ClientIdentity:
 
 
 async def resolve_client_by_phone(phone: str) -> ClientIdentity:
-    # 1) Simulation client cache (test entries, never in SAGE). Empty in
-    #    production -> one dict lookup, zero behavior change.
-    sim = sim_client_cache.resolve(phone)
-    if sim is not None:
-        logger.info(f"[MSG_FLOW] Client {phone} resolved from SIMULATION cache.")
-        return _sim_identity(sim)
-
     term = _norm_phone(phone)
     if len(term) < 9:
         return ClientIdentity()
@@ -246,11 +238,6 @@ async def resolve_client_by_phone(phone: str) -> ClientIdentity:
 
 
 async def resolve_client_by_email(email: str) -> ClientIdentity:
-    sim = sim_client_cache.resolve(email)      # 1) simulation cache
-    if sim is not None:
-        logger.info(f"[MSG_FLOW] Client {email} resolved from SIMULATION cache.")
-        return _sim_identity(sim)
-
     addr = (email or "").strip().lower()       # 2) SAGE
     if "@" not in addr:
         return ClientIdentity()
@@ -827,134 +814,41 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 
 async def _build_rag_candidates(queries: List[str], top_k: int = RAG_TOP_K,
                                 client_code: Optional[str] = None,
-                                scope: str = "auto"
-                                ) -> Dict[str, List[Dict[str, Any]]]:
-    """Resolve each mention, order history FIRST, catalog as the fallback.
+                                scope: str = "auto") -> Dict[str, List[Dict[str, Any]]]:
+    """Candidates for each mention, from THIS client's order history only.
 
-    WHY HISTORY FIRST. Against 8000 articles "el shampoo de coco" is
-    irresolvable; against the 40-300 that THIS client has actually bought it
-    usually resolves outright. The narrower set is what makes a vague name
-    identifiable at all.
-
-    WHY THE DOWNSTREAM LOGIC IS UNTOUCHED. This function only decides WHERE the
-    candidates come from. Whether one candidate gets committed or several
-    trigger a question is decided, exactly as before, by _query_verdict and
-    _triage_results in ai/llm.py: one hit -> resolved (add it and say so);
-    several -> ambiguous (numbered options, and if none fit, ask for the exact
-    name or the product code); more than two unresolved -> collapse into a
-    single ask. Feeding history hits through that SAME pipeline is what makes
-    the behaviour identical by construction instead of by duplication.
-
-    Per query, in order:
-      1. history verdict `resolved`  -> that one article
-      2. history verdict `ambiguous` -> those articles, as options
-      3. history `partial` / `none`  -> fall through to the full catalog
-
-    "partial" deliberately falls through: a partial history match is one where
-    some word the client said is covered by NOTHING they have ever bought, so
-    the honest move is to widen the search rather than offer a near-miss.
-
-    Scores on history hits are all EQUAL (1.0) on purpose. _query_verdict's
-    "leading" tier would otherwise auto-pick the most-frequently-ordered
-    candidate and merely mention the rest — the bot acting on purchase history
-    instead of asking. Equal scores force >1 candidate to become a question,
-    and 1.0 stays under the 2.0 exact-code short-circuit.
-
-    Only code, name and brand cross over from a history match (agent_view()).
-    The order statistics stay in code: the history resolves WHICH product is
-    meant, it does not give the bot the ability to discuss past orders.
+    Against ~8,000 articles "el shampoo de coco" is unresolvable; against the
+    40-300 this client has bought it usually resolves outright. Whether one
+    candidate is taken or several become a question is decided downstream
+    (llm.resolver). Every history hit scores a flat 1.0 so purchase frequency
+    never silently picks a product. Near-misses ("partial") go out with
+    covers_query=False, so they can only become a question.
     """
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    clean = [q for q in queries if isinstance(q, str) and q.strip()]
-    if not clean:
+    out: Dict[str, List[Dict[str, Any]]] = {q: [] for q in queries if isinstance(q, str) and q.strip()}
+    if not out or not client_code:
+        if out:
+            logger.info(f"[RAG] No client code: {len(out)} mention(s) can only resolve by typed code.")
         return out
-
-    # --- tier 1: this client's order history -------------------------------
-    from_history: Dict[str, List[Dict[str, Any]]] = {}
-    blocked_queries: Dict[str, List[str]] = {}
-    # The history layer running or not is the single biggest factor in whether
-    # a vague mention resolves, and it used to be INVISIBLE when it was skipped:
-    # three debugging rounds went by before the missing log line was noticed.
-    if not client_code:
-        logger.info(f"[RAG] Historial OFF (sin código de cliente) para {len(clean)} consulta(s)"
-                    + (" — y RAG_HISTORY_ONLY está activo, así que este cliente NO tiene "
-                       "ninguna fuente: todo se pedirá por código o irá al comercial."
-                       if HISTORY_ONLY else ""))
-    elif scope == "catalogo":
-        logger.info(f"[RAG] Historial OMITIDO por ámbito='catalogo' para {client_code}")
-    if client_code and scope in ("auto", "pedidos"):
-        try:
-            products, hstats = await client_history.load(client_code)
-            verdicts: List[str] = []
-            for q in clean:
-                res = client_history.match(q, products, limit=top_k)
-                verdicts.append(f"{q!r}->{res.verdict}"
-                                + (f"({len(res.matches)})" if res.matches else "")
-                                + (f"[bloq:{','.join(m.codigo for m in res.blocked)}]"
-                                   if res.blocked else ""))
-                if res.verdict in ("resolved", "ambiguous") and res.matches:
-                    from_history[q] = [_history_hit(m) for m in res.matches[:top_k]]
-                elif HISTORY_ONLY and res.verdict == "partial" and res.matches:
-                    # No catalog to fall through to, so the near-misses are all
-                    # there is. They go out with covers_query=False and the
-                    # uncovered words attached — the honesty channel the triage
-                    # already reads — so they can only ever become a QUESTION,
-                    # never a silent commitment.
-                    from_history[q] = [
-                        {**_history_hit(m), "covers_query": False,
-                         "query_uncovered": list(m.uncovered)}
-                        for m in res.matches[:top_k]]
-                elif res.verdict == "blocked":
-                    # The client's wording fully matches something they buy
-                    # regularly, but K_BOT keeps it out of the bot's catalog.
-                    # Offered anyway — see the note by the tier-1 constants.
-                    blocked_queries[q] = [m.codigo for m in res.blocked]
-                    from_history[q] = [_history_hit(m) for m in res.blocked[:top_k]]
-            # ALWAYS log the verdicts, hits or not. Logging only the successes
-            # is what made two debugging rounds impossible: a history layer that
-            # silently declined looked identical to one that was never called.
-            logger.info(f"[RAG] Historial {client_code} ({hstats.status}, "
-                        f"{hstats.n_products} vendibles / {hstats.n_excluded} excl.): "
-                        + " | ".join(verdicts))
-            if blocked_queries:
-                logger.warning(
-                    f"[RAG] {client_code} pide artículos que COMPRA pero K_BOT excluye "
-                    f"del catálogo: " + "; ".join(f"{q!r}->{c}" for q, c in blocked_queries.items())
-                    + ". SE OFRECEN igual (el comercial valida el pedido). "
-                    "Si deberían ser vendibles, el arreglo está en K_BOT: "
-                    "tampoco entran en la ingesta a Qdrant.")
-        except Exception as e:
-            # The history layer is an optimisation. If it fails, the catalog
-            # still answers — never let it break a live conversation.
-            logger.warning(f"[RAG] Capa de historial no disponible para {client_code}: {e}")
-            from_history, blocked_queries = {}, {}
-
-    # --- tier 2: the full catalog, for whatever history didn't settle ------
-    for q in clean:
-        if q in from_history:
-            out[q] = from_history[q]
-            continue
-        if q in blocked_queries:
-            out[q] = from_history.get(q, [])   # decided in tier 1
-            continue
-        if scope == "pedidos":
-            out[q] = []          # pinned to past orders: no catalog fallback
-            continue
-        if HISTORY_ONLY:
-            # Nothing in this client's orders matches, and the catalog is not
-            # trusted right now: say we do not have it rather than guess.
-            out[q] = []
-            continue
-        hits = await rag_service.retrieve(q, top_k=top_k)
-        out[q] = [{
-            "CodigoArticulo": h.get("CodigoArticulo") or h.get("id"),
-            "DescripcionArticulo": h.get("DescripcionArticulo") or h.get("content"),
-            "MarcaProducto": h.get("MarcaProducto") or "",
-            "relevance_score": h.get("relevance_score", 0.0),
-            "covers_query": bool(h.get("covers_query", False)),
-            "query_uncovered": list(h.get("query_uncovered") or []),
-            "fuente": "catalogo",
-        } for h in hits]
+    try:
+        products, hstats = await client_history.load(client_code)
+    except Exception as e:
+        logger.warning(f"[RAG] History unavailable for {client_code}: {e}")
+        return out
+    verdicts: List[str] = []
+    for q in out:
+        res = client_history.match(q, products, limit=top_k)
+        verdicts.append(f"{q!r}->{res.verdict}")
+        if res.verdict in ("resolved", "ambiguous") and res.matches:
+            out[q] = [_history_hit(m) for m in res.matches[:top_k]]
+        elif res.verdict == "partial" and res.matches:
+            out[q] = [{**_history_hit(m), "covers_query": False, "query_uncovered": list(m.uncovered)}
+                      for m in res.matches[:top_k]]
+        elif res.verdict == "blocked":
+            # He buys it regularly but K_BOT hides it: offered anyway, the
+            # salesman validates every order.
+            out[q] = [_history_hit(m) for m in res.blocked[:top_k]]
+    logger.info(f"[RAG] History {client_code} ({hstats.status}, {hstats.n_products} products): "
+                + " | ".join(verdicts))
     return out
 
 
