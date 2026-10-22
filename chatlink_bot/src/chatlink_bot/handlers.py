@@ -24,6 +24,8 @@ import asyncio
 import logging
 import os
 import re
+from dataclasses import dataclass, field
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -36,12 +38,12 @@ from .ai.parsers import (
     extract_text_from_image_bytes_async,
     transcribe_audio_bytes_async,
 )
-from .ai.rag import rag_service
+from .ai.rag import HISTORY_ONLY, client_history, rag_service
 from .database import AsyncSessionPG, AsyncSessionSQL
 from .events import event_bus
 from .logic.fsm import fsm
 from .logic.lifecycle import conversation_mode, lifecycle_after_turn
-from .models import Chat, ConversationSession, EmailChat, InputType, MSClient, User
+from .models import Chat, ConversationSession, EmailChat, InputType, MSArticle, MSClient, User
 from .transport.email import email_transport
 from .transport.outbox import bot_outbox, same_text, sim_capture
 from .logic.sim_clients import sim_client_cache
@@ -86,38 +88,205 @@ def _norm_phone(phone: str) -> str:
     return digits[-9:] if len(digits) >= 9 else digits
 
 
-async def _find_client_by_phone(phone: str) -> Optional[Any]:
+def _only_digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+# Punctuation that manual data entry puts inside SAGE phone numbers. Stripped on
+# BOTH sides (SQL and Python) before comparing.
+_PHONE_PUNCT = (" ", "-", ".", "(", ")", "+", "/")
+# Cap on candidate rows. If a phone matches more than this, the data is bad
+# enough that we do not want to resolve it automatically anyway.
+_MAX_CANDIDATE_ROWS = 25
+
+
+@dataclass
+class ClientIdentity:
+    """Result of resolving an identifier (phone or email) against SAGE.
+
+    WHY THIS EXISTS. The previous lookup was
+        LIKE '%last 9 digits%' over Telefono/Telefono2/Telefono3
+        ... .scalars().first()   with no ORDER BY
+    and a wrong hit only got the greeting name wrong. The moment product
+    resolution leans on that client's ORDER HISTORY, a wrong hit makes the bot
+    confidently propose somebody else's product. So ambiguity is now a
+    first-class outcome instead of being collapsed into `first()`:
+
+      client   the SAGE row used for the name (fully compatible with the old
+               behaviour: the first candidate of the best tier)
+      code     CodigoCliente, ONLY when unambiguous; None when in doubt
+      unique   whether `code` can be trusted to read the order history
+
+    Operating rule: without `unique`, the history layer stays off and the bot
+    falls back to the catalog. We would rather ask than be accidentally right.
+
+    SAGE data notes: CodigoCliente is zero-padded ('000139'), so string
+    comparison only, never an int cast. The same client appears once per
+    CodigoEmpresa — several rows with the SAME CodigoCliente are not ambiguity;
+    several with different codes are.
+    """
+
+    client: Optional[Any] = None
+    code: Optional[str] = None
+    unique: bool = False
+    source: str = "none"                  # sim | sage | none
+    match_kind: str = "none"              # suffix | contains | email | sim | none
+    candidate_codes: List[str] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return (getattr(self.client, "Nombre", "") or "").strip()
+
+    @property
+    def found(self) -> bool:
+        return self.client is not None
+
+    @property
+    def history_allowed(self) -> bool:
+        """The history layer only turns on for an unambiguous CodigoCliente."""
+        return bool(self.code) and self.unique
+
+    def describe(self) -> str:
+        return (f"source={self.source} kind={self.match_kind} unique={self.unique} "
+                f"code={self.code or '-'} candidates={self.candidate_codes}")
+
+
+def _sim_identity(obj: Any) -> ClientIdentity:
+    code = (getattr(obj, "CodigoCliente", "") or "").strip() or None
+    return ClientIdentity(client=obj, code=code, unique=bool(code),
+                          source="sim", match_kind="sim",
+                          candidate_codes=[code] if code else [])
+
+
+def _strip_punct_sql(col):
+    """Nested REPLACE to drop punctuation server-side.
+
+    Required because the WHERE clause must be a SUPERSET of what we later
+    filter in Python: if SQL does not normalize, '+34 600-123.456' never
+    contains '600123456' and the row never reaches the tie-break.
+    """
+    expr = col
+    for ch in _PHONE_PUNCT:
+        expr = func.replace(expr, ch, "")
+    return expr
+
+
+def _pick_identity(rows: List[Any], kind: str) -> ClientIdentity:
+    """Build the identity from one tier's rows."""
+    if not rows:
+        return ClientIdentity()
+    codes: List[str] = []
+    for r in rows:
+        code = (getattr(r, "CodigoCliente", "") or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    unique = len(codes) == 1
+    return ClientIdentity(client=rows[0], code=codes[0] if unique else None,
+                          unique=unique, source="sage", match_kind=kind,
+                          candidate_codes=codes)
+
+
+async def resolve_client_by_phone(phone: str) -> ClientIdentity:
     # 1) Simulation client cache (test entries, never in SAGE). Empty in
     #    production -> one dict lookup, zero behavior change.
     sim = sim_client_cache.resolve(phone)
     if sim is not None:
         logger.info(f"[MSG_FLOW] Client {phone} resolved from SIMULATION cache.")
-        return sim
-    # 2) SAGE (source of truth).
+        return _sim_identity(sim)
+
     term = _norm_phone(phone)
     if len(term) < 9:
-        return None
+        return ClientIdentity()
+
+    # 2) SAGE (source of truth). ONE query with the widest filter (contains);
+    #    the tier tie-break happens in Python, where it is testable.
+    #    ORDER BY is not optional: `.limit()` becomes TOP, and a TOP without
+    #    ORDER BY returns ARBITRARY rows — ambiguity detection would then be
+    #    nondeterministic and two runs could disagree.
     async with AsyncSessionSQL() as s:
         cols = (MSClient.Telefono, MSClient.Telefono2, MSClient.Telefono3)
-        stmt = select(MSClient).where(or_(*(
-            func.replace(func.replace(c, " ", ""), "-", "").like(f"%{term}%") for c in cols
-        )))
-        return (await s.execute(stmt)).scalars().first()
+        stmt = (
+            select(MSClient)
+            .where(or_(*(_strip_punct_sql(c).like(f"%{term}%") for c in cols)))
+            .order_by(MSClient.CodigoCliente, MSClient.CodigoEmpresa)
+            .limit(_MAX_CANDIDATE_ROWS)
+        )
+        rows = list((await s.execute(stmt)).scalars().all())
+
+    if not rows:
+        return ClientIdentity()
+
+    # Two match tiers, and they are never mixed — mixing them is what produced
+    # the false positive:
+    #   suffix    the stored number ENDS in those 9 digits. Covers '600123456',
+    #             '+34600123456', '34 600-123-456'. The real case.
+    #   contains  the digits appear mid-string. Covers junk like
+    #             '600123456 (movil)' but also longer numbers that happen to
+    #             contain those digits.
+    suffix_rows, contains_rows = [], []
+    for r in rows:
+        values = [_only_digits(getattr(r, c, "") or "")
+                  for c in ("Telefono", "Telefono2", "Telefono3")]
+        if any(v.endswith(term) for v in values if v):
+            suffix_rows.append(r)
+        elif any(term in v for v in values if v):
+            contains_rows.append(r)
+
+    ident = (_pick_identity(suffix_rows, "suffix") if suffix_rows
+             else _pick_identity(contains_rows, "contains"))
+    if not ident.found:
+        # Came through the server-side LIKE but does not survive Python
+        # normalization (e.g. the digits matched some other column).
+        return ClientIdentity()
+    if not ident.unique:
+        logger.warning(f"[MSG_FLOW] Phone {phone} is AMBIGUOUS in SAGE "
+                       f"({ident.match_kind}): {ident.candidate_codes}. "
+                       f"Order history DISABLED for this conversation.")
+    return ident
 
 
-async def _find_client_by_email(email: str) -> Optional[Any]:
+async def resolve_client_by_email(email: str) -> ClientIdentity:
     sim = sim_client_cache.resolve(email)      # 1) simulation cache
     if sim is not None:
         logger.info(f"[MSG_FLOW] Client {email} resolved from SIMULATION cache.")
-        return sim
+        return _sim_identity(sim)
+
     addr = (email or "").strip().lower()       # 2) SAGE
     if "@" not in addr:
-        return None
+        return ClientIdentity()
     async with AsyncSessionSQL() as s:
-        stmt = select(MSClient).where(
-            or_(func.lower(MSClient.EMail1) == addr, func.lower(MSClient.EMail2) == addr)
+        stmt = (
+            select(MSClient)
+            .where(or_(func.lower(MSClient.EMail1) == addr,
+                       func.lower(MSClient.EMail2) == addr))
+            .order_by(MSClient.CodigoCliente, MSClient.CodigoEmpresa)
+            .limit(_MAX_CANDIDATE_ROWS)
         )
-        return (await s.execute(stmt)).scalars().first()
+        rows = list((await s.execute(stmt)).scalars().all())
+
+    ident = _pick_identity(rows, "email")
+    if ident.found and not ident.unique:
+        logger.warning(f"[MSG_FLOW] Email {email} is AMBIGUOUS in SAGE: "
+                       f"{ident.candidate_codes}. Order history DISABLED.")
+    return ident
+
+
+async def resolve_client_identity(identifier: str) -> ClientIdentity:
+    """Convenience: pick the lookup by the shape of the identifier."""
+    return await (resolve_client_by_email(identifier) if "@" in (identifier or "")
+                  else resolve_client_by_phone(identifier))
+
+
+# These two keep returning the row (or None), so the ingestion gatekeepers and
+# handle_ai_trigger are byte-for-byte unaffected. The NEW information — whether
+# the CodigoCliente is unambiguous — comes from resolve_client_* above, which is
+# what the history layer will use.
+async def _find_client_by_phone(phone: str) -> Optional[Any]:
+    return (await resolve_client_by_phone(phone)).client
+
+
+async def _find_client_by_email(email: str) -> Optional[Any]:
+    return (await resolve_client_by_email(email)).client
 
 
 async def _get_user_by_phone(db: AsyncSession, phone: str) -> Optional[User]:
@@ -447,6 +616,14 @@ async def handle_new_message(payload: Dict[str, Any]) -> None:
                 last = _admin_help_cache.get(cache_key)
                 if not last or (now - last).total_seconds() > 10:
                     _admin_help_cache[cache_key] = now
+                    # RECEIVER -> SENDER, exactly like the admin-command block
+                    # above: the card is sent FROM the device that received the
+                    # message (to_jid = the admin number) TO whoever sent it.
+                    # NOT `device_jid`: on this path user_from is truthy, so
+                    # device_jid was set to from_jid — the SENDER's device — and
+                    # using it would send salesman -> salesman, the same
+                    # sender->sender bug documented above. Empty -> default device.
+                    admin_device = getattr(msg, "to_jid", None)
                     _send_system_wa(to_phone=from_phone, text=ADMIN_HELP_TEXT,
                                     from_jid=admin_device, peer_phone=to_phone)
             return
@@ -602,11 +779,171 @@ async def handle_new_email(payload: Dict[str, Any]) -> None:
 
 
 # -------------------------------------------------------------------- RAG glue
-async def _build_rag_candidates(queries: List[str], top_k: int = 3) -> Dict[str, List[Dict[str, Any]]]:
-    """Run retrieval per query and normalize hits for the agent prompt."""
+
+
+def _history_hit(m, fuente: str = "pedidos") -> Dict[str, Any]:
+    """One history match in the shape the agent prompt expects.
+
+    Only code, name and brand cross over (agent_view()). The order statistics
+    stay in code: the history resolves WHICH product is meant, it does not give
+    the bot the ability to discuss past orders.
+
+    covers_query is True and query_uncovered empty because full token coverage
+    is exactly what earned the verdict — a fact, not an assumption. The score is
+    a flat 1.0 for every history hit on purpose: _query_verdict's "leading" tier
+    would otherwise auto-pick the most-frequently-ordered candidate and merely
+    mention the rest, i.e. the bot acting on purchase history instead of asking.
+    Equal scores force >1 candidate to become a question, and 1.0 stays under
+    the 2.0 exact-code short-circuit.
+    """
+    view = m.agent_view()
+    return {
+        "CodigoArticulo": view["codigo"],
+        "DescripcionArticulo": view["nombre"],
+        "MarcaProducto": view["marca"],
+        "relevance_score": 1.0,
+        "covers_query": True,
+        "query_uncovered": [],
+        "fuente": fuente,
+    }
+
+
+# Candidates retrieved per mention. Three was too tight for near-identical
+# product families: for "adhesivo ardell transparente" the fused top-3 came back
+# as one real match plus two products sharing only the word "ardell", while the
+# other genuine transparent adhesives sat at rank 4-5 and never reached the
+# match helper — so there was nothing left to offer as a choice. Widening costs
+# a slightly larger match payload and nothing else; the triage still shows at
+# most 3 options.
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+
+# An article the client REGULARLY BUYS whose K_BOT keeps it out of the catalog
+# is offered anyway: they demonstrably buy it from this company, it appears in
+# recent orders, and the salesman validates every order before it ships. The
+# two alternatives both proved worse in testing — asking for a code that is not
+# in the catalog either is a dead end, and falling through to the catalog is
+# what committed a DIFFERENT adhesive in the first place.
+
+
+async def _build_rag_candidates(queries: List[str], top_k: int = RAG_TOP_K,
+                                client_code: Optional[str] = None,
+                                scope: str = "auto"
+                                ) -> Dict[str, List[Dict[str, Any]]]:
+    """Resolve each mention, order history FIRST, catalog as the fallback.
+
+    WHY HISTORY FIRST. Against 8000 articles "el shampoo de coco" is
+    irresolvable; against the 40-300 that THIS client has actually bought it
+    usually resolves outright. The narrower set is what makes a vague name
+    identifiable at all.
+
+    WHY THE DOWNSTREAM LOGIC IS UNTOUCHED. This function only decides WHERE the
+    candidates come from. Whether one candidate gets committed or several
+    trigger a question is decided, exactly as before, by _query_verdict and
+    _triage_results in ai/llm.py: one hit -> resolved (add it and say so);
+    several -> ambiguous (numbered options, and if none fit, ask for the exact
+    name or the product code); more than two unresolved -> collapse into a
+    single ask. Feeding history hits through that SAME pipeline is what makes
+    the behaviour identical by construction instead of by duplication.
+
+    Per query, in order:
+      1. history verdict `resolved`  -> that one article
+      2. history verdict `ambiguous` -> those articles, as options
+      3. history `partial` / `none`  -> fall through to the full catalog
+
+    "partial" deliberately falls through: a partial history match is one where
+    some word the client said is covered by NOTHING they have ever bought, so
+    the honest move is to widen the search rather than offer a near-miss.
+
+    Scores on history hits are all EQUAL (1.0) on purpose. _query_verdict's
+    "leading" tier would otherwise auto-pick the most-frequently-ordered
+    candidate and merely mention the rest — the bot acting on purchase history
+    instead of asking. Equal scores force >1 candidate to become a question,
+    and 1.0 stays under the 2.0 exact-code short-circuit.
+
+    Only code, name and brand cross over from a history match (agent_view()).
+    The order statistics stay in code: the history resolves WHICH product is
+    meant, it does not give the bot the ability to discuss past orders.
+    """
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for q in queries:
-        if not isinstance(q, str) or not q.strip():
+    clean = [q for q in queries if isinstance(q, str) and q.strip()]
+    if not clean:
+        return out
+
+    # --- tier 1: this client's order history -------------------------------
+    from_history: Dict[str, List[Dict[str, Any]]] = {}
+    blocked_queries: Dict[str, List[str]] = {}
+    # The history layer running or not is the single biggest factor in whether
+    # a vague mention resolves, and it used to be INVISIBLE when it was skipped:
+    # three debugging rounds went by before the missing log line was noticed.
+    if not client_code:
+        logger.info(f"[RAG] Historial OFF (sin código de cliente) para {len(clean)} consulta(s)"
+                    + (" — y RAG_HISTORY_ONLY está activo, así que este cliente NO tiene "
+                       "ninguna fuente: todo se pedirá por código o irá al comercial."
+                       if HISTORY_ONLY else ""))
+    elif scope == "catalogo":
+        logger.info(f"[RAG] Historial OMITIDO por ámbito='catalogo' para {client_code}")
+    if client_code and scope in ("auto", "pedidos"):
+        try:
+            products, hstats = await client_history.load(client_code)
+            verdicts: List[str] = []
+            for q in clean:
+                res = client_history.match(q, products, limit=top_k)
+                verdicts.append(f"{q!r}->{res.verdict}"
+                                + (f"({len(res.matches)})" if res.matches else "")
+                                + (f"[bloq:{','.join(m.codigo for m in res.blocked)}]"
+                                   if res.blocked else ""))
+                if res.verdict in ("resolved", "ambiguous") and res.matches:
+                    from_history[q] = [_history_hit(m) for m in res.matches[:top_k]]
+                elif HISTORY_ONLY and res.verdict == "partial" and res.matches:
+                    # No catalog to fall through to, so the near-misses are all
+                    # there is. They go out with covers_query=False and the
+                    # uncovered words attached — the honesty channel the triage
+                    # already reads — so they can only ever become a QUESTION,
+                    # never a silent commitment.
+                    from_history[q] = [
+                        {**_history_hit(m), "covers_query": False,
+                         "query_uncovered": list(m.uncovered)}
+                        for m in res.matches[:top_k]]
+                elif res.verdict == "blocked":
+                    # The client's wording fully matches something they buy
+                    # regularly, but K_BOT keeps it out of the bot's catalog.
+                    # Offered anyway — see the note by the tier-1 constants.
+                    blocked_queries[q] = [m.codigo for m in res.blocked]
+                    from_history[q] = [_history_hit(m) for m in res.blocked[:top_k]]
+            # ALWAYS log the verdicts, hits or not. Logging only the successes
+            # is what made two debugging rounds impossible: a history layer that
+            # silently declined looked identical to one that was never called.
+            logger.info(f"[RAG] Historial {client_code} ({hstats.status}, "
+                        f"{hstats.n_products} vendibles / {hstats.n_excluded} excl.): "
+                        + " | ".join(verdicts))
+            if blocked_queries:
+                logger.warning(
+                    f"[RAG] {client_code} pide artículos que COMPRA pero K_BOT excluye "
+                    f"del catálogo: " + "; ".join(f"{q!r}->{c}" for q, c in blocked_queries.items())
+                    + ". SE OFRECEN igual (el comercial valida el pedido). "
+                    "Si deberían ser vendibles, el arreglo está en K_BOT: "
+                    "tampoco entran en la ingesta a Qdrant.")
+        except Exception as e:
+            # The history layer is an optimisation. If it fails, the catalog
+            # still answers — never let it break a live conversation.
+            logger.warning(f"[RAG] Capa de historial no disponible para {client_code}: {e}")
+            from_history, blocked_queries = {}, {}
+
+    # --- tier 2: the full catalog, for whatever history didn't settle ------
+    for q in clean:
+        if q in from_history:
+            out[q] = from_history[q]
+            continue
+        if q in blocked_queries:
+            out[q] = from_history.get(q, [])   # decided in tier 1
+            continue
+        if scope == "pedidos":
+            out[q] = []          # pinned to past orders: no catalog fallback
+            continue
+        if HISTORY_ONLY:
+            # Nothing in this client's orders matches, and the catalog is not
+            # trusted right now: say we do not have it rather than guess.
+            out[q] = []
             continue
         hits = await rag_service.retrieve(q, top_k=top_k)
         out[q] = [{
@@ -616,19 +953,52 @@ async def _build_rag_candidates(queries: List[str], top_k: int = 3) -> Dict[str,
             "relevance_score": h.get("relevance_score", 0.0),
             "covers_query": bool(h.get("covers_query", False)),
             "query_uncovered": list(h.get("query_uncovered") or []),
+            "fuente": "catalogo",
         } for h in hits]
     return out
 
 
+async def _sage_code_lookup(codes: List[str]) -> Dict[str, Optional[Dict[str, str]]]:
+    """D4: un código TECLEADO por el cliente se acepta si existe LITERALMENTE
+    en SAGE, esté o no en su historial y sea cual sea su K_BOT — verbatim del
+    cliente no es ni invención ni sustitución. La línea llega al comercial
+    marcada en el xlsx (columna origen) para que la revise. Un código que no
+    existe en SAGE no se apunta: se dice y se deriva (lo decide la tubería)."""
+    out: Dict[str, Optional[Dict[str, str]]] = {c: None for c in codes}
+    if not codes:
+        return out
+    try:
+        async with AsyncSessionSQL() as sql:
+            res = await sql.execute(
+                select(MSArticle).where(MSArticle.CodigoArticulo.in_(codes)))
+            for a in res.scalars():
+                out[str(a.CodigoArticulo)] = {
+                    "code": str(a.CodigoArticulo),
+                    "name": str(a.DescripcionArticulo or ""),
+                    "brand": str(a.MarcaProducto or "")}
+    except Exception as e:
+        logger.warning(f"[AI_FLOW] code_lookup SAGE no disponible: {e}")
+    return out
+
+
 def _xlsx_from_cart(cart: List[Dict[str, Any]]) -> bytes:
+    """The order sheet the salesman receives: código, cantidad, origen. Spanish, because
+    it is read by Spanish-speaking staff and pasted into SAGE, whose own column
+    is CodigoArticulo."""
     import io
     from openpyxl import Workbook
     wb = Workbook()
     ws = wb.active
-    ws.title = "order"
-    ws.append(["code", "qty"])
+    ws.title = "pedido"
+    ws.append(["codigo", "cantidad", "origen"])
     for item in cart:
-        ws.append([item.get("code") or "", int(item.get("qty") or 1)])
+        # "codigo_cliente (revisar)": el cliente tecleó el código y se aceptó
+        # por existir en SAGE aunque K_BOT lo excluya (D4) — revisión manual.
+        origen = "codigo_cliente (revisar)" if item.get("fuente") == "codigo_cliente" else ""
+        ws.append([item.get("code") or "", int(item.get("qty") or 1), origen])
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 24
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -754,11 +1124,24 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
             working_open_items: List[Dict[str, Any]] = [] if ended else (getattr(session, "open_items", None) or [])
             working_guide_shown = False if ended else bool(getattr(session, "guide_shown", False))
 
-            client_obj = await (_find_client_by_phone(client_id) if channel == "whatsapp"
-                                else _find_client_by_email(client_id))
+            # Identity: `resolve_client_identity` dispatches on the SHAPE of the
+            # identifier, not on the channel. Dispatching by channel looked
+            # equivalent and is not: an email arriving on the whatsapp channel
+            # (the simulator can produce exactly that) went to the phone lookup,
+            # which strips every non-digit, resolved to nothing, and fell back
+            # to the FAKE001 mock client — whose order history is empty. The bot
+            # then searched the whole catalog and substituted a product, with no
+            # sign in the log that the real client had never been found.
+            identity = await resolve_client_identity(client_id)
+            client_obj = identity.client
             if not client_obj and is_simulation:
                 client_obj = _fake_client(client_id)
+                identity = _sim_identity(client_obj)
             client_name = (getattr(client_obj, "Nombre", "") or "").strip() or "Cliente"
+            history_code = identity.code if identity.history_allowed else None
+            logger.info(f"[AI_FLOW] Identidad {client_id} -> {identity.describe()} | "
+                        f"historial={'ON ' + str(history_code) if history_code else 'OFF'}")
+            retriever = partial(_build_rag_candidates, client_code=history_code)
 
             # 4. Agent turn (search -> ground -> reply in one loop).
             result: AgentResult = await run_agent(
@@ -772,7 +1155,8 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                 recent_history=_history_lines(history),
                 current_message=current_message,
                 intro_mode=intro_mode,
-                search=_build_rag_candidates,
+                search=retriever,
+                code_lookup=_sage_code_lookup,
             )
 
             # 5. Decide the outgoing text first (canned messages are code, not
@@ -857,7 +1241,7 @@ async def handle_ai_trigger(payload: Dict[str, Any]) -> None:
                         subject=f"Pedido confirmado ({client_id})",
                         body=f"Pedido confirmado para {client_id} ({client_name}).\n\n"
                              f"Items: {result.cart}",
-                        attachments=[("order.xlsx",
+                        attachments=[("pedido.xlsx",
                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                       _xlsx_from_cart(result.cart))],
                     )

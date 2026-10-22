@@ -34,7 +34,7 @@ from sqlalchemy import select
 
 from .cima_client import CimaClient
 from ..database import AsyncSessionSQL
-from ..models import MSArticle
+from ..models import MSArticle, es_vendible_articulo
 
 logger = logging.getLogger("Qdrant")
 
@@ -65,6 +65,9 @@ class _SourceDoc:
     point_id: Any                 # int (numeric codes) or deterministic UUID str
     text: str                     # what gets embedded
     payload: Dict[str, Any]       # stored alongside the vector (includes content_hash)
+
+
+_MIN_DT = __import__('datetime').datetime.min
 
 
 def _content_hash(text: str) -> str:
@@ -194,19 +197,43 @@ class QdrantService:
         return int(code) if code.isdigit() else str(uuid.uuid5(uuid.NAMESPACE_DNS, code))
 
     async def _load_source_products(self) -> Dict[str, _SourceDoc]:
-        """ONE query over SAGE (K_BOT = 0), deduped by code -> {str(point_id): doc}."""
+        """ONE query over SAGE, filtered by es_vendible (K_BOT=-1 + MERCH +
+        palabras, ver models.es_vendible), deduped by code AND by
+        CodigoAlternativo (gemelos por reinscripción de EAN: se queda el de
+        FechaAlta más alto) -> {str(point_id): doc}."""
         async with AsyncSessionSQL() as s:
             rows = (await s.execute(
-                select(MSArticle).where(MSArticle.K_BOT == 0).order_by(MSArticle.CodigoArticulo)
+                select(MSArticle).order_by(MSArticle.CodigoArticulo)
             )).scalars().all()
 
-        docs: Dict[str, _SourceDoc] = {}
-        seen_codes: set[str] = set()
+        # 1) filtro de vendibilidad (predicado único) + dedup por código
+        vend: Dict[str, MSArticle] = {}
         for a in rows:
             code = str(a.CodigoArticulo or "").strip()
-            if not code or code in seen_codes:
+            if not code or code in vend:
                 continue  # same article repeats once per company -> one point
-            seen_codes.add(code)
+            if not es_vendible_articulo(a):
+                continue
+            vend[code] = a
+
+        # 2) dedup por CodigoAlternativo (EAN): entre gemelos, el más nuevo
+        #    (FechaAlta mayor). Los que no tienen EAN quedan tal cual.
+        by_ean: Dict[str, MSArticle] = {}
+        keep: Dict[str, MSArticle] = {}
+        for code, a in vend.items():
+            ean = str(getattr(a, "CodigoAlternativo", "") or "").strip()
+            if not ean:
+                keep[code] = a
+                continue
+            prev = by_ean.get(ean)
+            if prev is None or (getattr(a, "FechaAlta", None) or _MIN_DT) > \
+                    (getattr(prev, "FechaAlta", None) or _MIN_DT):
+                by_ean[ean] = a
+        for a in by_ean.values():
+            keep[str(a.CodigoArticulo).strip()] = a
+
+        docs: Dict[str, _SourceDoc] = {}
+        for code, a in keep.items():
             content = self._build_product_text(a)
             if not content:
                 continue
@@ -221,7 +248,8 @@ class QdrantService:
                     "DescripcionLinea": a.DescripcionLinea,
                     "ComentarioArticulo": a.ComentarioArticulo,
                     "MarcaProducto": a.MarcaProducto,
-                    "K_BOT": int(a.K_BOT or -1),
+                    "K_BOT": int(a.K_BOT if a.K_BOT is not None else -1),
+                    "FechaAlta": a.FechaAlta.isoformat() if getattr(a, "FechaAlta", None) else "",
                     "content": content,
                     "content_hash": _content_hash(content),
                 },

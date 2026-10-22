@@ -1,189 +1,1583 @@
 # chatlink_bot/src/chatlink_bot/ai/llm.py
 """
-Kapa, as a TWO-PASS orchestrator: one cheap deterministic triage helper,
-then the tool-driven agent loop.
+Kapa v2 — tubería tipada por turno. SUSTITUYE al bucle de agente completo.
 
-PASS 1 — INTENT & SPECIFICITY TRIAGE (temperature 0.0, format=json).
-A tiny isolated inference before the agent loop parses the compound client
-message ("Quiero los 5 delineadores, 4 cremas para la cara y 3 L'ACTION
-mascarilla facial antiedad 8 grs") into structured intents:
+    Etapa 0  código   preproceso estructural            (§ PREPROCESO)
+    Etapa 1  LLM #1   extracción -> actos               (§ ACTOS + § TURNO)
+    Etapa 2  código   resolución de referencias         (§ RESOLUCION)
+             LLM #2   match por lotes, solo ambiguos
+    Etapa 3  código   reductor: ÚNICO escritor          (§ REDUCTOR)
+    Etapa 4  código   renderizado desde estado          (§ RENDER)
+             LLM #3   reescritura de tono (validada)
+    commit   verificar -> (handlers persiste y envía)
 
-    escalada    the client explicitly demands the human salesman, shows real
-                anger, or raises an uncommercial dispute. When the message
-                itself corroborates it, the orchestrator SHORT-CIRCUITS with
-                strict silence (<NO_REPLY> semantics: reply="" + handoff=True
-                + silent=True) so the salesman takes over without a canned
-                bot line. Uncorroborated flags are demoted to a hint the
-                agent sees (it can still call handoff_to_human).
-    WORTHY      product mentions carrying a brand (L'Action, Nivea…), line
-                attributes, exact measurements (8 grs, 150 ml) or a code —
-                specific enough to hit Qdrant IMMEDIATELY, even on turn one.
-    AMBIGUOUS   bare category talk ("crema de cara", "unos delineadores"):
-                never searched blind; queued in open_items under
-                estado="enriquecer" and Kapa amably asks for detail,
-                emphasizing that the código de producto is the fastest,
-                safest way to secure the item.
+Techo duro: 4 llamadas/turno (extracción + match + reescritura + re-muestreo
+de reserva). El modelo nunca ejecuta, nunca redacta el mensaje base y nunca
+emite códigos: solo spans del mensaje, enums e índices. Los invariantes viven
+en el reductor y el renderizador; `verificar` es el cinturón (expectativa de
+disparos ~0; cada disparo es un bug, D12).
 
-This REPLACES every hardcoded semantic word list. The `first_talk` code-only
-gate (which swept high-quality descriptions into `held` and spat a robotic
-canned speech) is gone. So are ALL keyword/vocabulary heuristics —
-generic-noun sets, handoff/opt-out signal words, repeat-order signal words,
-attribute-color lists, correction-phrase tuples, search-promise regexes.
-Every semantic judgement is now made by one of THREE isolated temperature-0.0
-helpers, keeping each individual prompt tiny (< 70% context budget):
+Interfaz idéntica a la versión anterior: run_agent(...) -> AgentResult y
+health_check(). handlers.py llama igual; con dos parches opcionales activa
+D4 (code_lookup) y la marca en el xlsx.
 
-    run_triage       (per turn)      message-level: escalation + evidence,
-                                     rechazo_bot, derivacion, repetir_ultimo,
-                                     per-item WORTHY/AMBIGUOUS/ATTRIBUTE.
-    run_query_gate   (on demand)     query-level: SEARCHABLE / GENERIC /
-                                     ATTRIBUTE for mid-loop queries Pass-1
-                                     never saw. Fails PERMISSIVE (run it).
-    run_reply_audit  (on demand)     draft-level: announced-but-not-executed
-                                     searches; humility invitation on media
-                                     proposals. Fails PERMISSIVE (skip nudge).
-
-What remains in code is purely STRUCTURAL, never vocabulary: code shapes
-(compact token with a digit), proposal-line parsing ('N) CODE — NAME'),
-verbatim-repetition detection, pipeline media markers our own handlers
-inject, evidence-quote containment, and token-overlap fuzzy matching.
-
-PASS 2 — THE AGENT TURN (temperature 0.55).
-The Pass-1 JSON is injected into Kapa's user context block as a "TRIAJE
-PREVIO" section, and it gates retrieval in code: WORTHY / code-shaped /
-pending-enrichment queries run against Qdrant; AMBIGUOUS ones are held and
-queued; ATTRIBUTE ones are grounded with the structural topic from the bot's
-own last proposal. Everything else is the proven single agent loop:
-
-    search_products  -> executed LIVE (retriever injected by the caller);
-                        results are appended as a tool message and the model
-                        is called again (up to MAX_STEPS), so it can refine
-                        its query before answering. This is what implements
-                        "nicely redirect the client to exact catalog names".
-    add_item / remove_item / set_qty -> cart edits, validated IN CODE.
-                        add_item only accepts codes the model has actually
-                        seen (current cart or this turn's search results);
-                        unseen codes are demoted to a search — hallucinated
-                        codes are impossible, not merely discouraged.
-    close_order      -> order_status = CLOSED (final confirmation).
-    handoff_to_human -> caller sends the canned "the salesman will contact
-                        you" message; no LLM text is delivered.
-    opt_out_client   -> caller persists bot_enabled=False for this
-                        conversation; the bot goes permanently silent there.
-    note             -> one-line rolling summary kept across turns.
-    (no tool calls + empty/NO_REPLY text) -> silence.
-
-All state invariants live in `_ToolExecutor`; the model can make a wrong
-edit but can never corrupt the cart, duplicate codes, or set invalid enums.
-Everything is stdlib + the existing CimaClient.
+Un solo fichero a propósito (decisión de proyecto: refactor sin módulos
+nuevos). Las secciones están marcadas con `# ===` y son independientes:
+ninguna sección inferior escribe estado de una superior; el único escritor
+de carrito/open_items es `aplicar()` (§ REDUCTOR).
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
 import time
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .cima_client import CimaClient, Message
+from .rag import coverage_rank, tokenize, variants
 
 logger = logging.getLogger("LLM")
 
+
+# ============================================================================
+# ACTOS — esquema, parseo y validación mecánica (invariante 4)
+# ============================================================================
+
+TIPOS = ("pedir", "modificar", "elegir", "rechazar", "confirmar",
+         "cerrar", "repetir_ultimo", "cantidad_global", "otro")
+MODOS = ("total", "incremento", "decremento", "eliminar", "sin_cambio")
+SUBTIPOS_OTRO = ("saludo", "despedida", "agradecimiento", "estado_pedido",
+                 "pide_comercial", "fuera_ambito",
+                 "precio_stock_factura", "especificacion", "queja",
+                 "escalada", "rechazo_bot", "pregunta_bot")
+
+# Numerales cuya presencia en la evidencia de un `eliminar` lo degrada a
+# pregunta ("¿quito la línea o resto N?"). Clase cerrada: dígitos + cardinales
+# bajos. Es estructura, no vocabulario semántico.
+_RE_NUMERAL = re.compile(
+    r"\d+|\b(un[oa]?|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b", re.I)
+
+_RE_DIGITS = re.compile(r"\d+")
+
+# Numerales en palabra: cuentan como evidencia de su valor (invariante 4).
+# Clase cerrada y estructural — no es "detección de intención por vocabulario",
+# es la tabla de conversión palabra->número del idioma.
+_PALABRA_NUM = {"un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4,
+                "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9,
+                "diez": 10, "once": 11, "doce": 12, "docena": 12, "trece": 13,
+                "catorce": 14, "quince": 15, "veinte": 20}
+
+
+def _numeros_en(texto: str) -> set:
+    """Todos los números presentes en un texto: dígitos + numerales en palabra
+    ('media docena' -> 6)."""
+    t = (texto or "").lower()
+    nums = {int(d) for d in _RE_DIGITS.findall(t)}
+    palabras = re.findall(r"[a-záéíóúñ]+", t)
+    for i, w in enumerate(palabras):
+        if w in _PALABRA_NUM:
+            v = _PALABRA_NUM[w]
+            if w == "docena" and i > 0 and palabras[i - 1] == "media":
+                v = 6
+            nums.add(v)
+    return nums
+
+
+@dataclass
+class Cantidad:
+    modo: str = "sin_cambio"           # MODOS
+    valor: Optional[int] = None        # obligatorio salvo sin_cambio/eliminar
+
+
+@dataclass
+class Acto:
+    tipo: str
+    evidencia: str = ""                # span literal del mensaje
+    producto_texto: str = ""           # pedir
+    objetivo_texto: str = ""           # modificar / elegir / rechazar
+    cantidad: Cantidad = field(default_factory=Cantidad)
+    valor: Optional[int] = None        # cantidad_global
+    subtipo: str = ""                  # otro
+    # marcas que añade la validación (no vienen del modelo):
+    eliminar_con_numeral: bool = False
+
+    def as_log(self) -> str:
+        c = f"{self.cantidad.modo}:{self.cantidad.valor}" if self.tipo in ("pedir", "modificar") else ""
+        return (f"{self.tipo}({self.producto_texto or self.objetivo_texto or self.subtipo or self.valor}"
+                + (f" {c}" if c else "") + f" | ev={self.evidencia[:40]!r})")
+
+
+# ---------------------------------------------------------------- JSON schema
+# Plano a propósito: los motores estilo Ollama restringen bien objetos planos
+# con enums; oneOf/anyOf por tipo no es fiable. La coherencia por-tipo la
+# valida `validar_actos`.
+ACTOS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "actos": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tipo": {"type": "string", "enum": list(TIPOS)},
+                    "evidencia": {"type": "string"},
+                    "producto_texto": {"type": "string"},
+                    "objetivo_texto": {"type": "string"},
+                    "cantidad_modo": {"type": "string", "enum": list(MODOS)},
+                    "cantidad_valor": {"type": ["integer", "null"]},
+                    "valor": {"type": ["integer", "null"]},
+                    "subtipo": {"type": "string", "enum": list(SUBTIPOS_OTRO) + [""]},
+                },
+                "required": ["tipo", "evidencia"],
+            },
+        }
+    },
+    "required": ["actos"],
+}
+
+# Schema del match por lotes (resolucion.py): salida por índice, jamás código.
+MATCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "integer"},
+                    "veredicto": {"type": "string", "enum": ["unico", "varios", "ninguno"]},
+                    "indice": {"type": ["integer", "null"]},
+                },
+                "required": ["item", "veredicto"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+
+# ------------------------------------------------------------------ parseo
+def _to_int(v: Any) -> Optional[int]:
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        n = int(v)
+        return n if 0 <= n <= 100000 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_actos(data: Any) -> List[Acto]:
+    """Dict (ya json.loads) -> [Acto]. Tolerante en tipos, estricto en enums."""
+    out: List[Acto] = []
+    bruto = data.get("actos") if isinstance(data, dict) else None
+    if not isinstance(bruto, list):     # el 2B a veces devuelve int/str/dict aquí
+        bruto = []
+    for raw in bruto:
+        if not isinstance(raw, dict):
+            continue
+        tipo = str(raw.get("tipo") or "").strip()
+        if tipo not in TIPOS:
+            continue
+        out.append(Acto(
+            tipo=tipo,
+            evidencia=str(raw.get("evidencia") or "").strip(),
+            producto_texto=str(raw.get("producto_texto") or "").strip(),
+            objetivo_texto=str(raw.get("objetivo_texto") or "").strip(),
+            cantidad=Cantidad(
+                modo=(raw.get("cantidad_modo") if raw.get("cantidad_modo") in MODOS
+                      else "sin_cambio"),
+                valor=_to_int(raw.get("cantidad_valor")),
+            ),
+            valor=_to_int(raw.get("valor")),
+            subtipo=(raw.get("subtipo") if raw.get("subtipo") in SUBTIPOS_OTRO else ""),
+        ))
+    return out
+
+
+# -------------------------------------------------------------- validación
+def validar_actos(actos: List[Acto], mensaje: str) -> List[Acto]:
+    """Filtro mecánico post-schema. Deja pasar solo actos coherentes:
+
+    - invariante 4: un `valor` de cantidad debe aparecer como dígitos en la
+      EVIDENCIA (o en el mensaje si la evidencia vino recortada). Si no, la
+      cantidad se degrada a sin_cambio/None: nunca entra un número inventado.
+    - la evidencia debe existir en el mensaje (subcadena, espacios laxos);
+      si no, se conserva el acto pero la evidencia se vacía (no bloquea:
+      bloquear aquí silenciaría pedidos, inv. 7).
+    - `eliminar` con numeral en la evidencia -> se marca para que el reductor
+      pregunte en vez de borrar (caso 7 del catálogo).
+    - coherencia por tipo: pedir sin producto_texto se descarta; modificar/
+      elegir/rechazar sin objetivo_texto se descartan (nada que ligar).
+    """
+    msg_flat = re.sub(r"\s+", " ", mensaje or "").lower()
+    ok: List[Acto] = []
+    for a in actos:
+        ev_flat = re.sub(r"\s+", " ", a.evidencia).lower()
+        if ev_flat and ev_flat not in msg_flat:
+            a.evidencia = ""
+            ev_flat = ""
+
+        base = ev_flat or msg_flat
+
+        # invariante 4 por string: el valor debe estar en la evidencia
+        # (dígitos o numeral en palabra); si no, jamás entra un número.
+        if a.cantidad.valor is not None and a.cantidad.valor not in _numeros_en(base):
+            a.cantidad = Cantidad(modo="sin_cambio", valor=None)
+        if a.tipo == "cantidad_global" and a.valor is not None \
+                and a.valor not in _numeros_en(base):
+            a.valor = None
+
+        if a.cantidad.modo in ("total", "incremento", "decremento") and a.cantidad.valor is None:
+            a.cantidad = Cantidad(modo="sin_cambio", valor=None)
+
+        if a.tipo == "modificar" and a.cantidad.modo == "eliminar" \
+                and _RE_NUMERAL.search(a.evidencia or ""):
+            a.eliminar_con_numeral = True
+
+        # Sin evidencia = el modelo no lo sacó del mensaje (típico: repite la
+        # lista que la Etapa 0 ya consumió, o rellena de memoria). Un acto que
+        # TOCA el pedido sin fundamento en el texto no entra. `otro`,
+        # `confirmar`, `cerrar` y `repetir_ultimo` se libran: pueden nacer de
+        # un mensaje muy corto ("sí", "vale") cuya evidencia es trivial.
+        if not a.evidencia and a.tipo in ("pedir", "modificar", "elegir",
+                                          "rechazar", "cantidad_global"):
+            continue
+        if a.tipo == "pedir" and not a.producto_texto:
+            continue
+        if a.tipo in ("modificar", "elegir", "rechazar") and not a.objetivo_texto:
+            if a.tipo == "rechazar":
+                a.objetivo_texto = ""   # rechazo global de la última pregunta: permitido
+            else:
+                continue
+        if a.tipo == "cantidad_global" and a.valor is None:
+            continue
+        if a.tipo == "otro" and not a.subtipo:
+            a.subtipo = "fuera_ambito"
+        ok.append(a)
+    return ok
+
+# ============================================================================
+# PREPROCESO — Etapa 0, estructural puro
+# ============================================================================
+
+# Marcadores que inyecta handlers._MEDIA_PREFIX (+ el genérico de documentos).
+_MEDIA_MARKERS = ("[Texto en Imagen]:", "[Audio transcrito]:", "[Documento]:")
+
+# Marcas de repetición al inicio de línea: "" "" | " " | «» | ídem | id.
+_RE_DITTO = re.compile(r'^\s*[-•*\u2022]?\s*((?:["\u201c\u201d\u00ab\u00bb]{1,2}\s*)+|idem\b\.?|ídem\b\.?|id\.\s)',
+                       re.I)
+_RE_DITTO_MARK = re.compile(r'["\u201c\u201d\u00ab\u00bb]{1,2}|idem\.?|ídem\.?|id\.', re.I)
+
+_RE_BULLET = re.compile(r'^\s*[-•*\u2022]\s*')
+
+# "6 de cada uno" / "de cada una 6" / "todas a 6" / "6 de cada" / "6 de todos"
+_RE_GLOBAL_QTY = re.compile(
+    r'^\s*(?:'
+    r'(\d{1,4})\s*(?:uds?\.?|unidades?)?\s*de\s+cada(?:\s+un[oa]s?)?'
+    r'|de\s+cada\s+un[oa]?\s+(\d{1,4})'
+    r'|tod[oa]s\s+a\s+(\d{1,4})'
+    r'|(\d{1,4})\s+de\s+tod[oa]s'
+    r')\s*\.?\s*$', re.I)
+
+_RE_CODE_SHAPE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-\./]{2,20}$')
+
+# Línea de pedido con cantidad EXPLÍCITA al final: ", 12" o "12 uds" (la
+# unidad o la coma son obligatorias — "KAJAL 401" es nombre, no 401 uds).
+_RE_TRAIL_QTY = re.compile(
+    r'^(?P<name>.+?)(?:'
+    r'[,;]\s*(?P<q1>\d{1,4})\s*(?:uds?|unds?|unidades|u)?\.?'      # "..., 10" / "..., 10u"
+    r'|\s+x?\s*(?P<q2>\d{1,4})\s*(?:uds?|unds?|unidades|u)\.?'     # "... 10u" / "... x10 uds"
+    r')\s*$', re.I)
+
+
+def _parse_linea_pedido(line: str) -> Tuple[str, Optional[int]]:
+    """(nombre, cantidad|None) de una línea de lista. Estructura pura."""
+    body = _RE_BULLET.sub("", line).strip()
+    m = _RE_TRAIL_QTY.match(body)
+    if m:
+        return m.group("name").strip(" .,;-"), int(m.group("q1") or m.group("q2"))
+    return body.strip(" .,;-"), None
+
+
+def code_shaped(token: str) -> bool:
+    """Token compacto con al menos un dígito y sin espacios: forma de código."""
+    t = (token or "").strip()
+    return bool(t) and bool(_RE_CODE_SHAPE.match(t)) and any(c.isdigit() for c in t) \
+        and not t.isdigit() or (t.isdigit() and len(t) >= 5)
+
+
+def codes_in_text(text: str) -> List[str]:
+    return [t for t in re.split(r"[\s,;:()]+", text or "") if t and code_shaped(t)]
+
+
+@dataclass
+class PreResult:
+    texto: str                       # resto del mensaje (lo que SÍ es lenguaje)
+    lineas: List[str] = field(default_factory=list)
+    # líneas de lista consumidas estructuralmente: (nombre, qty|None, línea):
+    pedidos: List[Tuple[str, Optional[int], str]] = field(default_factory=list)
+    fuente_media: bool = False
+    cantidad_global: Optional[int] = None   # solo formas canónicas (regex)
+    log: List[str] = field(default_factory=list)
+
+
+def _expand_ditto_line(line: str, prev_expanded: str) -> Tuple[str, bool]:
+    """k marcas al inicio -> hereda los primeros k tokens de la línea anterior
+    expandida. El resto de la línea se conserva tal cual."""
+    m = _RE_DITTO.match(line)
+    if not m or not prev_expanded:
+        return line, False
+    marks = _RE_DITTO_MARK.findall(m.group(1))
+    k = max(1, len(marks))
+    prev_name, _ = _parse_linea_pedido(prev_expanded)   # sin su cantidad final
+    name_tokens = prev_name.split()
+    inherited = name_tokens[:k]
+    rest = line[m.end():].strip()
+    bullet = _RE_BULLET.match(line)
+    prefix = bullet.group(0) if bullet else ""
+    return (prefix + " ".join(inherited) + (" " + rest if rest else "")).rstrip(), True
+
+
+def preprocesar(mensaje: str) -> PreResult:
+    fuente_media = False
+    text = mensaje or ""
+    for mk in _MEDIA_MARKERS:
+        if mk in text:
+            fuente_media = True
+            text = text.replace(mk, " ")
+    raw_lines = [ln.rstrip() for ln in text.splitlines()]
+
+    expanded: List[str] = []
+    n_ditto = 0
+    prev = ""
+    for ln in raw_lines:
+        if not ln.strip():
+            expanded.append(ln)
+            continue
+        new_ln, did = _expand_ditto_line(ln, prev)
+        if did:
+            n_ditto += 1
+        expanded.append(new_ln)
+        prev = new_ln if new_ln.strip() else prev
+
+    cantidad_global: Optional[int] = None
+    kept: List[str] = []
+    pedidos: List[Tuple[str, Optional[int], str]] = []
+    for ln in expanded:
+        m = _RE_GLOBAL_QTY.match(ln)
+        if m:
+            val = next((g for g in m.groups() if g), None)
+            if val:
+                cantidad_global = int(val)
+                continue  # la línea se consume: es una instrucción, no un producto
+        # Una línea con viñeta es un renglón de pedido: estructura, no
+        # lenguaje. Se consume aquí y NO pasa por la extracción — el 2B ha
+        # demostrado perder renglones al enumerar listas (log 18:21/18:22).
+        if _RE_BULLET.match(ln):
+            nombre, qty = _parse_linea_pedido(ln)
+            if nombre:
+                pedidos.append((nombre, qty, ln.strip()))
+                continue
+        kept.append(ln)
+
+    res = PreResult(
+        texto="\n".join(kept).strip(),
+        lineas=[ln for ln in kept if ln.strip()],
+        pedidos=pedidos,
+        fuente_media=fuente_media,
+        cantidad_global=cantidad_global,
+    )
+    if pedidos:
+        res.log.append(f"lineas_pedido={len(pedidos)}")
+    if n_ditto:
+        res.log.append(f"ditto x{n_ditto}")
+    if cantidad_global is not None:
+        res.log.append(f"cantidad_global={cantidad_global} (canónica)")
+    if fuente_media:
+        res.log.append("fuente_media")
+    return res
+
+# ============================================================================
+# REDUCTOR — Etapa 3, único escritor de estado
+# ============================================================================
+
+SI_NO_TIPOS = ("propuesta_media", "propuesta_repetir", "propuesta_cierre", "propuesta_baja")
+
+# Un producto que sigue sin resolverse tras este nº de turnos con el cliente
+# aportando datos SIN progreso -> se deja al comercial (no forzar el pedido).
+MAX_INTENTOS_PRODUCTO = int(os.getenv("PIPE_MAX_INTENTOS_PRODUCTO", "2"))
+
+
+# ------------------------------------------------------------------- estado
+def _coerce_open_item(it: Any) -> Optional[Dict[str, Any]]:
+    """Tolera formatos antiguos de open_items (estado='enriquecer', claves
+    pedido/consulta) convirtiéndolos al contenedor tipado."""
+    if not isinstance(it, dict):
+        return None
+    if it.get("tipo") in ("producto",) + SI_NO_TIPOS + ("conflicto_cantidad",):
+        return dict(it)
+    texto = str(it.get("texto") or it.get("pedido") or it.get("consulta") or "").strip()
+    if not texto:
+        return None
+    ops = []
+    for o in it.get("opciones") or []:
+        if isinstance(o, dict):
+            ops.append({"code": str(o.get("code") or o.get("codigo") or ""),
+                        "name": str(o.get("name") or o.get("nombre") or ""),
+                        "brand": str(o.get("brand") or o.get("marca") or ""),
+                        "distintivo": str(o.get("distintivo") or "")})
+    qty = it.get("qty") if isinstance(it.get("qty"), int) else (
+        it.get("cantidad") if isinstance(it.get("cantidad"), int) else None)
+    return {"tipo": "producto", "texto": texto, "qty": qty,
+            "opciones": ops, "rechazados": list(it.get("rechazados") or [])}
+
+
+@dataclass
+class Estado:
+    order_status: str = "IDLE"                      # IDLE | BUILDING | CLOSED
+    cart: List[Dict[str, Any]] = field(default_factory=list)   # {code, qty, name?, fuente?}
+    open_items: List[Dict[str, Any]] = field(default_factory=list)
+    last_closed_cart: List[Dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_session(cls, s: Dict[str, Any]) -> "Estado":
+        items = [ci for it in (s.get("open_items") or []) if (ci := _coerce_open_item(it))]
+        cart = []
+        for c in (s.get("cart") or []):
+            if isinstance(c, dict) and c.get("code"):
+                cart.append({"code": str(c["code"]), "qty": int(c.get("qty") or 1),
+                             "name": str(c.get("name") or ""),
+                             "fuente": str(c.get("fuente") or "")})
+        return cls(order_status=str(s.get("order_status") or "IDLE"),
+                   cart=cart, open_items=items,
+                   last_closed_cart=list(s.get("last_closed_cart") or []))
+
+    # helpers --------------------------------------------------------------
+    def linea(self, code: str) -> Optional[Dict[str, Any]]:
+        return next((l for l in self.cart if l["code"] == code), None)
+
+    def si_no_vivo(self) -> Optional[Dict[str, Any]]:
+        return next((i for i in self.open_items if i.get("tipo") in SI_NO_TIPOS), None)
+
+    def productos_abiertos(self) -> List[Dict[str, Any]]:
+        return [i for i in self.open_items if i.get("tipo") == "producto"]
+
+
+# -------------------------------------------------------------------- hechos
+@dataclass
+class Hecho:
+    """Unidad tipada de 'qué se dirá'. El renderizador serializa; nada más."""
+    tipo: str
+    datos: Dict[str, Any] = field(default_factory=dict)
+
+    # tipos:
+    # confirmado {code,name,qty}            eliminado {code,name}
+    # actualizado {code,name,qty}           sin_cambio_confirmado {code,name,qty}
+    # pregunta_opciones {texto,qty,opciones,indistinguibles}
+    # conflicto_cantidad {code,name,opciones_qty}
+    # pregunta_baja {code,name}             pregunta_eliminar_o_restar {code,name,n}
+    # sin_candidatos {texto}                codigo_no_existe {code}
+    # rechazo_registrado {texto}            referencia_ambigua {texto,candidatas}
+    # propuesta {tipo,items,titulo}         cerrado {cart}
+    # derivacion {motivo}                   opt_out {}   escalada {}
+    # cortesia {subtipo}                    sin_entender {}
+    # recordatorio_pendiente {item}         guia {}
+
+
+@dataclass
+class ResultadoTurno:
+    estado: Estado
+    hechos: List[Hecho] = field(default_factory=list)
+    descartes: List[str] = field(default_factory=list)   # log de actos vetados
+
+    @property
+    def handoff(self) -> bool:
+        return any(h.tipo in ("derivacion", "escalada", "aviso_comercial") for h in self.hechos)
+
+    @property
+    def opt_out(self) -> bool:
+        return any(h.tipo == "opt_out" for h in self.hechos)
+
+
+# ---------------------------------------------------------------- operaciones
+# Producidas por resolucion.py. Shape (dicts para mantener la frontera fina):
+#   {"op":"add","code","name","qty":int|None,"fuente":str,"brand":str}
+#   {"op":"modificar","code","name","modo","valor":int|None,
+#    "eliminar_con_numeral":bool,"valor_numeral":int|None}
+#   {"op":"opciones","texto","qty":int|None,"opciones":[opt],"indistinguibles":bool}
+#   {"op":"sin_candidatos","texto","qty":int|None}
+#   {"op":"codigo_no_existe","code"}
+#   {"op":"rechazo","item_texto":str|None}
+#   {"op":"elige","item_texto","code","name"}          (opción resuelta)
+#   {"op":"elige_qty","code","valor"}                  (conflicto resuelto)
+#   {"op":"referencia_ambigua","texto","candidatas":[str]}
+#   {"op":"confirmar"} {"op":"cerrar"} {"op":"cantidad_global","valor"}
+#   {"op":"repetir_ultimo","qty_override":int|None}
+#   {"op":"otro","subtipo"}
+
+
+def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
+            *, fuente_media: bool = False,
+            cantidad_global_pre: Optional[int] = None) -> ResultadoTurno:
+    e = copy.deepcopy(estado_in)
+    hechos: List[Hecho] = []
+    descartes: List[str] = []
+    # códigos añadidos/actualizados ESTE turno sin cantidad explícita (regla 11)
+    added_no_qty: List[str] = []
+    # adds de este turno agrupados para la regla 3
+    seen_adds: Dict[str, List[Optional[int]]] = {}
+    media_batch: List[Dict[str, Any]] = []
+
+    def _emit(_t: str, **datos: Any) -> None:
+        hechos.append(Hecho(tipo=_t, datos=datos))
+
+    def _nueva_si_no(item: Dict[str, Any], titulo: str) -> bool:
+        """Regla 10: una sola propuesta sí/no viva."""
+        if e.si_no_vivo() is not None:
+            descartes.append(f"si_no duplicada vetada: {item.get('tipo')}")
+            return False
+        e.open_items.append(item)
+        _emit("propuesta", tipo=item["tipo"], items=item.get("items") or [], titulo=titulo)
+        return True
+
+    def _set_qty(code: str, name: str, modo: str, valor: Optional[int]) -> None:
+        ln = e.linea(code)
+        if ln is None:
+            descartes.append(f"modificar sobre código fuera de carrito: {code}")
+            _emit("referencia_ambigua", texto=name or code, candidatas=[])
+            return
+        actual = int(ln["qty"])
+        if modo == "sin_cambio" or valor is None:
+            _emit("sin_cambio_confirmado", code=code, name=ln.get("name") or name, qty=actual)
+            return
+        nuevo = {"total": valor,
+                 "incremento": actual + valor,
+                 "decremento": actual - valor}.get(modo, actual)
+        if nuevo <= 0:
+            # D7: no escribe, no borra; pregunta.
+            if _nueva_si_no({"tipo": "propuesta_baja", "code": code,
+                             "name": ln.get("name") or name, "items": []},
+                            titulo=""):
+                hechos.pop()  # propuesta genérica fuera; hecho específico:
+                _emit("pregunta_baja", code=code, name=ln.get("name") or name)
+            return
+        ln["qty"] = nuevo
+        _emit("actualizado", code=code, name=ln.get("name") or name, qty=nuevo)
+
+    def _add(code: str, name: str, brand: str, qty: Optional[int], fuente: str) -> None:
+        seen_adds.setdefault(code, []).append(qty)
+        ln = e.linea(code)
+        if ln is not None:
+            actual = int(ln["qty"])
+            if qty is None:
+                # ya estaba con cantidad: se conserva (B4.2), y se dice.
+                _emit("sin_cambio_confirmado", code=code, name=ln.get("name") or name, qty=actual)
+                return
+            if qty == actual:
+                _emit("sin_cambio_confirmado", code=code, name=ln.get("name") or name, qty=actual)
+                return
+            # D2: pedir con número sobre código ya en carrito con otra cantidad
+            # -> conflicto con números precalculados. Nadie suma salvo el código.
+            e.open_items = [i for i in e.open_items
+                            if not (i.get("tipo") == "conflicto_cantidad" and i.get("code") == code)]
+            opciones_qty = sorted({qty, actual, qty + actual})
+            e.open_items.append({"tipo": "conflicto_cantidad", "code": code,
+                                 "name": ln.get("name") or name, "opciones_qty": opciones_qty})
+            _emit("conflicto_cantidad", code=code, name=ln.get("name") or name,
+                  opciones_qty=opciones_qty)
+            return
+        q = qty if qty is not None else 1     # default 1 SOLO aquí: línea nueva
+        e.cart.append({"code": code, "qty": q, "name": name, "fuente": fuente,
+                       **({"brand": brand} if brand else {})})
+        if qty is None:
+            added_no_qty.append(code)
+        e.order_status = "BUILDING" if e.order_status != "CLOSED" else e.order_status
+        _emit("confirmado", code=code, name=name, qty=q,
+              marcado=(fuente == "codigo_cliente"))
+
+    # ---- pase 1: operaciones --------------------------------------------
+    for op in ops:
+        k = op.get("op")
+
+        if k == "add":
+            if fuente_media:
+                media_batch.append({"code": op["code"], "name": op.get("name") or "",
+                                    "qty": op.get("qty"), "fuente": op.get("fuente") or ""})
+                continue
+            _add(op["code"], op.get("name") or "", op.get("brand") or "",
+                 op.get("qty"), op.get("fuente") or "")
+
+        elif k == "modificar":
+            if op.get("modo") == "eliminar":
+                ln = e.linea(op["code"])
+                if ln is None:
+                    descartes.append(f"eliminar sobre código fuera de carrito: {op.get('code')}")
+                    continue
+                if op.get("eliminar_con_numeral"):
+                    _emit("pregunta_eliminar_o_restar", code=ln["code"],
+                          name=ln.get("name") or "", n=op.get("valor_numeral") or 1)
+                    continue
+                e.cart = [l for l in e.cart if l["code"] != ln["code"]]
+                _emit("eliminado", code=ln["code"], name=ln.get("name") or "")
+            else:
+                _set_qty(op["code"], op.get("name") or "", op.get("modo") or "sin_cambio",
+                         op.get("valor"))
+
+        elif k == "opciones":
+            # (re)abre o actualiza un producto pendiente con sus opciones vivas
+            it = next((i for i in e.productos_abiertos()
+                       if i.get("texto") == op["texto"]), None)
+            if it is None:
+                it = {"tipo": "producto", "texto": op["texto"], "qty": op.get("qty"),
+                      "opciones": [], "rechazados": [], "_nuevo": True}
+                e.open_items.append(it)
+            if op.get("qty") is not None:
+                it["qty"] = op["qty"]
+            it["opciones"] = [o for o in op.get("opciones") or []
+                              if o.get("code") not in set(it.get("rechazados") or [])]
+            _emit("pregunta_opciones", texto=it["texto"], qty=it.get("qty"),
+                  opciones=it["opciones"],
+                  indistinguibles=bool(op.get("indistinguibles")))
+
+        elif k == "sin_candidatos":
+            it = next((i for i in e.productos_abiertos()
+                       if i.get("texto") == op["texto"]), None)
+            if it is None:
+                e.open_items.append({"tipo": "producto", "texto": op["texto"],
+                                     "qty": op.get("qty"), "opciones": [], "rechazados": [],
+                                     "_nuevo": True})
+            _emit("sin_candidatos", texto=op["texto"])
+
+        elif k == "codigo_no_existe":
+            _emit("codigo_no_existe", code=op.get("code") or "")
+
+        elif k == "rechazo":
+            objetivo = op.get("item_texto")
+            items = e.productos_abiertos()
+            it = next((i for i in items if i.get("texto") == objetivo), None) \
+                or (items[0] if len(items) == 1 else None)
+            if it is None:
+                descartes.append("rechazo sin ítem ligable")
+                _emit("referencia_ambigua", texto=objetivo or "eso",
+                      candidatas=[i["texto"] for i in items])
+                continue
+            it["rechazados"] = sorted(set(it.get("rechazados") or [])
+                                      | {o.get("code") for o in it.get("opciones") or [] if o.get("code")})
+            it["opciones"] = []
+            _emit("rechazo_registrado", texto=it["texto"])
+
+        elif k == "elige":
+            it = next((i for i in e.productos_abiertos()
+                       if i.get("texto") == op.get("item_texto")), None)
+            qty = (it or {}).get("qty")          # regla 6: hereda la cantidad
+            if it is not None:
+                e.open_items.remove(it)
+            _add(op["code"], op.get("name") or "", op.get("brand") or "", qty,
+                 op.get("fuente") or "")
+
+        elif k == "elige_qty":
+            it = next((i for i in e.open_items
+                       if i.get("tipo") == "conflicto_cantidad" and i.get("code") == op.get("code")), None)
+            if it is None or op.get("valor") not in (it.get("opciones_qty") or []):
+                descartes.append(f"elige_qty inválido: {op}")
+                continue
+            e.open_items.remove(it)
+            ln = e.linea(op["code"])
+            if ln is None:
+                e.cart.append({"code": op["code"], "qty": int(op["valor"]),
+                               "name": it.get("name") or "", "fuente": ""})
+                e.order_status = "BUILDING" if e.order_status != "CLOSED" else e.order_status
+                _emit("confirmado", code=op["code"], name=it.get("name") or "",
+                      qty=int(op["valor"]), marcado=False)
+            else:
+                ln["qty"] = int(op["valor"])
+                _emit("actualizado", code=op["code"], name=ln.get("name") or "", qty=ln["qty"])
+
+        elif k == "referencia_ambigua":
+            _emit("referencia_ambigua", texto=op.get("texto") or "",
+                  candidatas=op.get("candidatas") or [])
+
+        elif k == "cantidad_global":
+            cantidad_global_pre = op.get("valor") or cantidad_global_pre
+
+        elif k == "repetir_ultimo":
+            if not e.last_closed_cart:
+                _emit("derivacion", motivo="repetir_sin_historial")
+                continue
+            qo = op.get("qty_override")
+            items = [{"code": c.get("code"), "qty": int(qo or c.get("qty") or 1),
+                      "name": c.get("name") or ""} for c in e.last_closed_cart if c.get("code")]
+            _nueva_si_no({"tipo": "propuesta_repetir", "items": items}, titulo="repetir")
+
+        elif k == "cerrar":
+            if not e.cart:
+                _emit("sin_entender")
+                continue
+            _nueva_si_no({"tipo": "propuesta_cierre",
+                          "items": [dict(l) for l in e.cart]}, titulo="cierre")
+
+        elif k == "confirmar":
+            vivo = e.si_no_vivo()
+            if vivo is None:
+                _emit("cortesia", subtipo="confirmacion_sin_pregunta")   # caso 4: jamás escribe
+                continue
+            e.open_items.remove(vivo)
+            t = vivo["tipo"]
+            if t == "propuesta_cierre":
+                e.order_status = "CLOSED"
+                _emit("cerrado", cart=[dict(l) for l in e.cart])
+            elif t == "propuesta_baja":
+                code = vivo.get("code")
+                ln = e.linea(code)
+                if ln:
+                    e.cart = [l for l in e.cart if l["code"] != code]
+                    _emit("eliminado", code=code, name=vivo.get("name") or "")
+            else:  # propuesta_media / propuesta_repetir
+                for itx in vivo.get("items") or []:
+                    _add(itx["code"], itx.get("name") or "", "", int(itx.get("qty") or 1),
+                         "media" if t == "propuesta_media" else "repetir")
+
+        elif k == "otro":
+            st = op.get("subtipo") or "fuera_ambito"
+            if st in ("escalada", "pide_comercial"):
+                _emit("aviso_comercial")     # "aviso a X para que se conecte"
+            elif st == "rechazo_bot":
+                _emit("opt_out")
+            elif st in ("precio_stock_factura", "especificacion", "queja", "fuera_ambito"):
+                _emit("derivacion", motivo=st)
+            elif st == "estado_pedido":
+                _emit("recap_pedido")
+            elif st in ("saludo", "despedida", "agradecimiento", "pregunta_bot"):
+                _emit("cortesia", subtipo=st)
+
+        else:
+            descartes.append(f"op desconocida: {k}")
+
+    # ---- pase 2: reglas transversales ------------------------------------
+    # media: los add resueltos van a propuesta, no al carrito (B9).
+    if media_batch:
+        for m in media_batch:
+            if m["qty"] is None:
+                m["qty"] = 1
+        _nueva_si_no({"tipo": "propuesta_media", "items": media_batch}, titulo="media")
+
+    # regla 3 en-mensaje: mismo código, cantidades distintas (caso 3).
+    for code, qtys in seen_adds.items():
+        distintas = sorted({q for q in qtys if q is not None})
+        if len(distintas) > 1:
+            ln = e.linea(code)
+            opciones_qty = sorted(set(distintas) | {sum(distintas)})
+            # la línea escrita queda en suspenso: se retira y se pregunta
+            name = (ln or {}).get("name") or code
+            e.cart = [l for l in e.cart if l["code"] != code]
+            hechos[:] = [h for h in hechos
+                         if not (h.tipo in ("confirmado", "actualizado", "sin_cambio_confirmado")
+                                 and h.datos.get("code") == code)]
+            e.open_items = [i for i in e.open_items
+                            if not (i.get("tipo") == "conflicto_cantidad" and i.get("code") == code)]
+            e.open_items.append({"tipo": "conflicto_cantidad", "code": code,
+                                 "name": name, "opciones_qty": opciones_qty})
+            _emit("conflicto_cantidad", code=code, name=name, opciones_qty=opciones_qty)
+
+    # regla 11 (D1): cantidad global solo sobre líneas de ESTE turno sin qty.
+    if cantidad_global_pre is not None:
+        for code in added_no_qty:
+            ln = e.linea(code)
+            if ln is not None:
+                ln["qty"] = int(cantidad_global_pre)
+                _emit("actualizado", code=code, name=ln.get("name") or "", qty=ln["qty"])
+        # y sobre ítems abiertos de este turno sin cantidad
+        for it in e.productos_abiertos():
+            if it.get("qty") is None:
+                it["qty"] = int(cantidad_global_pre)
+
+    # ¿hubo progreso en el pedido este turno? Progreso = algo se resolvió
+    # (se apuntó/actualizó una línea, se cerró un pendiente, se eligió opción).
+    # Mientras el pedido AVANCE, ningún irresoluble suma intentos: la
+    # conversación fluye y solo se estanca lo que de verdad no se mueve.
+    hubo_progreso = any(h.tipo in ("confirmado", "actualizado", "eliminado",
+                                   "conflicto_cantidad", "cerrado", "rechazo_registrado")
+                        for h in hechos)
+
+    # regla 7 (B5): toda duda viva emite hecho; sin duplicar los ya emitidos.
+    ya = {(h.tipo, h.datos.get("texto") or h.datos.get("code")) for h in hechos}
+    for it in e.open_items:
+        t = it.get("tipo")
+        if t == "producto":
+            key = ("pregunta_opciones", it.get("texto"))
+            key2 = ("sin_candidatos", it.get("texto"))
+            key3 = ("rechazo_registrado", it.get("texto"))
+            recien_tratado = key in ya or key2 in ya or key3 in ya
+            # Un producto SIN opciones que ya venía de un turno anterior y sigue
+            # sin resolverse suma un intento. Agotados los intentos, no se
+            # repregunta: se deja al comercial (no forzar el pedido).
+            if not it.get("opciones"):
+                # sube intento solo si el ítem ya venía de antes Y el turno no
+                # avanzó en NADA del pedido. Si hubo progreso, se reinicia: el
+                # cliente está aclarando otros y este puede esperar.
+                if it.get("_nuevo") or hubo_progreso:
+                    it["intentos"] = 0 if hubo_progreso else int(it.get("intentos") or 0)
+                else:
+                    it["intentos"] = int(it.get("intentos") or 0) + 1
+                if it["intentos"] >= MAX_INTENTOS_PRODUCTO:
+                    it["_derivar"] = True
+                    _emit("derivacion", motivo="producto_no_encontrado", texto=it["texto"])
+                    continue
+            if recien_tratado:
+                continue
+            if it.get("opciones"):
+                _emit("pregunta_opciones", texto=it["texto"], qty=it.get("qty"),
+                      opciones=it["opciones"], indistinguibles=False)
+            else:
+                _emit("recordatorio_pendiente", item=it["texto"])
+        elif t == "conflicto_cantidad" and ("conflicto_cantidad", it.get("code")) not in ya:
+            _emit("conflicto_cantidad", code=it["code"], name=it.get("name") or "",
+                  opciones_qty=it.get("opciones_qty") or [])
+        elif t in SI_NO_TIPOS and not any(h.tipo == "propuesta" and h.datos.get("tipo") == t
+                                          for h in hechos) \
+                and not any(h.tipo in ("pregunta_baja", "cerrado") for h in hechos):
+            if t == "propuesta_baja":
+                _emit("pregunta_baja", code=it.get("code"), name=it.get("name") or "")
+            else:
+                _emit("propuesta", tipo=t, items=it.get("items") or [], titulo="")
+
+    # los productos que agotaron intentos salen del estado (ya derivados)
+    e.open_items = [it for it in e.open_items if not it.get("_derivar")]
+    for it in e.open_items:
+        it.pop("_nuevo", None)   # marca efímera de "creado este turno"
+
+    # invariante 7: un turno con ops y cero hechos es imposible; y con cero
+    # ops sobre un mensaje no vacío, resolucion ya emitió sin_entender.
+    if ops and not hechos:
+        _emit("sin_entender")
+
+    return ResultadoTurno(estado=e, hechos=hechos, descartes=descartes)
+
+# ============================================================================
+# RESOLUCION — Etapa 2, ligado de referencias + retrieval + match
+# ============================================================================
+
+
+MATCH_MAX_ITEMS = int(os.getenv("PIPE_MATCH_MAX_ITEMS", "5"))
+MAX_OPCIONES = int(os.getenv("PIPE_MAX_OPCIONES", "4"))
+
+Retriever = Callable[[List[str]], Awaitable[Dict[str, List[Dict[str, Any]]]]]
+CodeLookup = Callable[[List[str]], Awaitable[Dict[str, Optional[Dict[str, str]]]]]
+# match_call(items) -> [{"item":i,"veredicto":...,"indice":...}]  (llm.py lo inyecta)
+MatchCall = Callable[[List[Dict[str, Any]]], Awaitable[Optional[List[Dict[str, Any]]]]]
+
+
+def _canon_tokens(name: str) -> frozenset:
+    """Tokens de nombre plegados por el léxico: cada token se representa por
+    el mínimo de su clase de variantes, para que CHAMPU y SHAMPOO colisionen
+    y los subconjuntos de la dominancia se cumplan donde deben."""
+    out = set()
+    for t in tokenize(name or ""):
+        out.add(min(variants(t)))
+    return frozenset(out)
+
+
+@dataclass
+class Ligado:
+    """Resultado de ligar una referencia textual contra un espacio cerrado."""
+    unico: Optional[Dict[str, Any]] = None
+    varios: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _ligar(texto: str, espacio: List[Tuple[str, str, Dict[str, Any]]]) -> Ligado:
+    """espacio: [(key, texto_matchable, objeto)]. Cobertura total y mínimo de
+    extras; empate exacto -> varios (pregunta)."""
+    if not espacio:
+        return Ligado()
+    ranked = coverage_rank(texto, [(k, t, t) for k, t, _ in espacio])
+    q_len = len(set(tokenize(texto)))
+    if not ranked or q_len == 0:
+        return Ligado()
+    by_key = {k: obj for k, _, obj in espacio}
+    top_cov = ranked[0][1]
+    if top_cov == 0:
+        return Ligado()
+    best = [r for r in ranked if r[1] == top_cov]
+    min_extra = min(r[2] for r in best)
+    best = [r for r in best if r[2] == min_extra]
+    if len(best) == 1:
+        return Ligado(unico=by_key[best[0][0]])
+    return Ligado(varios=[by_key[r[0]] for r in best])
+
+
+def _hit_opt(h: Dict[str, Any]) -> Dict[str, str]:
+    # `fecha` = lo más nuevo que traiga el recuperador para desempatar gemelos
+    # de nombre (FechaAlta del artículo, o la última compra). Cadena ISO
+    # comparable, o "" si el retriever aún no la incluye.
+    fecha = h.get("FechaAlta") or ""   # campo canónico para "el más nuevo"
+    return {"code": str(h.get("CodigoArticulo") or ""),
+            "name": str(h.get("DescripcionArticulo") or ""),
+            "brand": str(h.get("MarcaProducto") or ""),
+            "fuente": str(h.get("fuente") or "pedidos"),
+            "fecha": str(fecha),
+            "distintivo": ""}
+
+
+def _norm_nombre(name: str) -> str:
+    """Normalización mínima (acentos/mayúsculas/espacios) para detectar nombres
+    LITERALMENTE iguales. No intenta juzgar 'casi iguales': eso es semántico y
+    lo decide el match LLM, no una regla."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", (name or "").lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return " ".join(t.split())
+
+
+def _colapsar_gemelos(cands: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Colapsa SOLO códigos con nombre idéntico (misma cadena): son el mismo
+    producto reinscrito tras cambio de EAN. Se queda el más nuevo por `fecha`,
+    sin preguntar. Nombres que difieren aunque sea poco NO se tocan aquí — si
+    son variantes reales o el mismo producto es juicio del match LLM."""
+    grupos: Dict[str, List[Dict[str, str]]] = {}
+    orden: List[str] = []
+    for c in cands:
+        k = _norm_nombre(c["name"])
+        if k not in grupos:
+            grupos[k] = []; orden.append(k)
+        grupos[k].append(c)
+    out = []
+    for k in orden:
+        g = grupos[k]
+        out.append(max(g, key=lambda c: c.get("fecha") or "") if any(c.get("fecha") for c in g) else g[0])
+    return out
+
+
+def _es_tester(c: Dict[str, str]) -> bool:
+    """Tester / muestra / PLV: no es producto vendible normal. Se reconoce por
+    el nombre ('TESTER'/'TEST') o el código acabado en 'T'. El cliente que pide
+    'stay matte 402' nunca quiere el tester."""
+    name = (c.get("name") or "").upper()
+    code = (c.get("code") or "").upper()
+    return "TESTER" in name or " TEST " in f" {name} " or code.endswith("T")
+
+
+def _dedup(cands: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Una entrada por código; nunca ofrecer el mismo artículo dos veces."""
+    vistos, out = set(), []
+    for c in cands:
+        if c["code"] and c["code"] not in vistos:
+            vistos.add(c["code"]); out.append(c)
+    return out
+
+
+def _dominancia(cands: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """D5: elimina candidatos ESTRICTAMENTE dominados: B cae si existe A con
+    tokens(A) ⊊ tokens(B). Producto vs tester/etiqueta PLV. Solo poda; nunca
+    desempata entre conjuntos incomparables (15ml vs 25ml siguen los dos)."""
+    toks = [(_canon_tokens(c["name"]), c) for c in cands]
+    keep: List[Dict[str, str]] = []
+    for tb, b in toks:
+        dominado = any(ta < tb for ta, _ in toks)   # subconjunto PROPIO
+        if not dominado:
+            keep.append(b)
+    return keep or cands
+
+
+def _distintivos(opciones: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], bool]:
+    """Nombra cada opción por lo que la DIFERENCIA (A4). Si nada las
+    diferencia tras normalizar+léxico -> indistinguibles (D6)."""
+    if len(opciones) < 2:
+        return opciones, False
+    sets = [_canon_tokens(o["name"]) for o in opciones]
+    inter = set.intersection(*map(set, sets)) if sets else set()
+    indist = all(s == sets[0] for s in sets)
+    if indist:
+        return opciones, True
+    for o, s in zip(opciones, sets):
+        diff = [t for t in tokenize(o["name"]) if min(variants(t)) not in inter]
+        o["distintivo"] = " ".join(diff[:4])
+    return opciones, False
+
+
+@dataclass
+class Resolucion:
+    ops: List[Dict[str, Any]] = field(default_factory=list)
+    llm_match_usada: bool = False
+    log: List[str] = field(default_factory=list)
+
+
+async def resolver(actos: List[Acto], estado, *, search: Retriever,
+                   code_lookup: Optional[CodeLookup],
+                   match_call: MatchCall,
+                   cantidad_global_pre: Optional[int]) -> Resolucion:
+    r = Resolucion()
+    ops = r.ops
+
+    # espacios cerrados ------------------------------------------------------
+    cart_space = [(l["code"], f"{l.get('name','')} {l['code']}", l) for l in estado.cart]
+    prod_items = estado.productos_abiertos()
+    conflictos = [i for i in estado.open_items if i.get("tipo") == "conflicto_cantidad"]
+
+    def _opciones_space() -> List[Tuple[str, str, Dict[str, Any]]]:
+        sp = []
+        for it in prod_items:
+            for o in it.get("opciones") or []:
+                sp.append((o["code"], f"{o.get('name','')} {o['code']}",
+                           {"item": it, "opt": o}))
+        return sp
+
+    # separa pedir para retrieval en bloque ----------------------------------
+    pedir_actos: List[Acto] = []
+
+    for a in actos:
+        if a.tipo == "pedir":
+            # Un pedir cuyo texto es SOLO un número que casa con un conflicto de
+            # cantidad vivo es en realidad la RESPUESTA a ese conflicto (el 2B
+            # suele emitir "13" como pedir, no como elegir). Resolverlo aquí en
+            # vez de crear un pedido nuevo de 13 uds (bug 21:54).
+            num = a.producto_texto.strip()
+            if num.isdigit() and conflictos:
+                cf = next((c for c in conflictos
+                           if int(num) in (c.get("opciones_qty") or [])), None)
+                if cf is not None:
+                    ops.append({"op": "elige_qty", "code": cf["code"], "valor": int(num)})
+                    continue
+            pedir_actos.append(a)
+
+        elif a.tipo == "modificar":
+            lig = _ligar(a.objetivo_texto, cart_space)
+            if lig.unico is None and not lig.varios and len(estado.cart) == 1:
+                lig = Ligado(unico=estado.cart[0])   # "quítalo" con una sola línea
+            if lig.unico is None:
+                ops.append({"op": "referencia_ambigua", "texto": a.objetivo_texto,
+                            "candidatas": [c.get("name") or c["code"] for c in lig.varios]})
+                continue
+            ln = lig.unico
+            ops.append({"op": "modificar", "code": ln["code"], "name": ln.get("name") or "",
+                        "modo": a.cantidad.modo, "valor": a.cantidad.valor,
+                        "eliminar_con_numeral": a.eliminar_con_numeral,
+                        "valor_numeral": a.cantidad.valor})
+
+        elif a.tipo == "elegir":
+            # 1) ¿resuelve un conflicto de cantidad? (respuesta "19")
+            num = a.objetivo_texto.strip()
+            if num.isdigit() and conflictos:
+                cf = next((c for c in conflictos if int(num) in (c.get("opciones_qty") or [])),
+                          None)
+                if cf is not None:
+                    ops.append({"op": "elige_qty", "code": cf["code"], "valor": int(num)})
+                    continue
+            # 2) ¿un código tecleado de entre las opciones?
+            typed = codes_in_text(a.objetivo_texto)
+            opt_space = _opciones_space()
+            if typed:
+                hitk = next(((k, obj) for k, _, obj in opt_space if k in typed), None)
+                if hitk:
+                    it, o = hitk[1]["item"], hitk[1]["opt"]
+                    ops.append({"op": "elige", "item_texto": it["texto"],
+                                "code": o["code"], "name": o.get("name") or "",
+                                "brand": o.get("brand") or "", "fuente": o.get("fuente") or ""})
+                    continue
+                # código fuera de las opciones -> se trata como pedir por código
+                pedir_actos.append(Acto(tipo="pedir", evidencia=a.evidencia,
+                                        producto_texto=a.objetivo_texto,
+                                        cantidad=a.cantidad))
+                continue
+            # 3) por descripción contra las opciones vivas
+            lig = _ligar(a.objetivo_texto, opt_space)
+            if lig.unico is not None:
+                it, o = lig.unico["item"], lig.unico["opt"]
+                ops.append({"op": "elige", "item_texto": it["texto"],
+                            "code": o["code"], "name": o.get("name") or "",
+                            "brand": o.get("brand") or "", "fuente": o.get("fuente") or ""})
+            else:
+                ops.append({"op": "referencia_ambigua", "texto": a.objetivo_texto,
+                            "candidatas": [v["opt"].get("name") or v["opt"]["code"]
+                                           for v in lig.varios]})
+
+        elif a.tipo == "rechazar":
+            objetivo = None
+            if a.objetivo_texto:
+                lig = _ligar(a.objetivo_texto,
+                             [(i["texto"], i["texto"], i) for i in prod_items])
+                if lig.unico is not None:
+                    objetivo = lig.unico["texto"]
+            ops.append({"op": "rechazo", "item_texto": objetivo})
+
+        elif a.tipo == "cantidad_global":
+            ops.append({"op": "cantidad_global", "valor": a.valor})
+
+        elif a.tipo == "repetir_ultimo":
+            ops.append({"op": "repetir_ultimo",
+                        "qty_override": a.cantidad.valor if a.cantidad.modo == "total" else None})
+
+        elif a.tipo in ("confirmar", "cerrar"):
+            ops.append({"op": a.tipo})
+
+        elif a.tipo == "otro":
+            ops.append({"op": "otro", "subtipo": a.subtipo})
+
+    # ---- pedir que en realidad elige una opción viva por código ------------
+    #      ("El LML58752" puede llegar como pedir; si el código está entre las
+    #      opciones vivas, es un elegir — hereda cantidad y cierra el ítem.)
+    opt_space_now = _opciones_space()
+    pedir_filtrados: List[Acto] = []
+    for a in pedir_actos:
+        typed = codes_in_text(a.producto_texto)
+        hitk = next(((k, obj) for k, _, obj in opt_space_now if k in typed), None) \
+            if typed else None
+        if hitk is not None:
+            it, o = hitk[1]["item"], hitk[1]["opt"]
+            if a.cantidad.valor is not None:
+                it["qty"] = a.cantidad.valor
+            ops.append({"op": "elige", "item_texto": it["texto"],
+                        "code": o["code"], "name": o.get("name") or "",
+                        "brand": o.get("brand") or "", "fuente": o.get("fuente") or ""})
+        else:
+            pedir_filtrados.append(a)
+    pedir_actos = pedir_filtrados
+
+    # ---- pedir: enriquecimiento de open_items (caso 3.9) -------------------
+    restantes: List[Acto] = []
+    for a in pedir_actos:
+        lig = _ligar(a.producto_texto, [(i["texto"], i["texto"], i) for i in prod_items])
+        it = lig.unico
+        if it is not None:
+            # hereda: cantidad ya dicha y rechazos persistentes
+            if a.cantidad.valor is not None:
+                it["qty"] = a.cantidad.valor
+            a._open_item = it        # type: ignore[attr-defined]
+        restantes.append(a)
+
+    # ---- pedir: códigos tecleados (D4) --------------------------------------
+    con_texto: List[Acto] = []
+    typed_codes: Dict[str, Acto] = {}
+    for a in restantes:
+        codes = codes_in_text(a.producto_texto) or codes_in_text(a.evidencia)
+        only_code = codes and len(tokenize(a.producto_texto)) <= 1
+        if codes and only_code:
+            typed_codes[codes[0]] = a
+        else:
+            con_texto.append(a)
+
+    if typed_codes and code_lookup is not None:
+        found = await code_lookup(list(typed_codes.keys()))
+        for code, a in typed_codes.items():
+            row = (found or {}).get(code)
+            if row:
+                ops.append({"op": "add", "code": row.get("code") or code,
+                            "name": row.get("name") or "", "brand": row.get("brand") or "",
+                            "qty": a.cantidad.valor, "fuente": "codigo_cliente"})
+            else:
+                ops.append({"op": "codigo_no_existe", "code": code})
+        typed_codes = {}
+    # sin code_lookup cableado: los códigos tecleados van por retrieval igual
+    con_texto.extend(typed_codes.values())
+
+    # ---- pedir: retrieval en bloque ----------------------------------------
+    ambiguos: List[Dict[str, Any]] = []
+    if con_texto:
+        queries = [a.producto_texto for a in con_texto]
+        results = await search(queries)
+        for a in con_texto:
+            hits = results.get(a.producto_texto) or []
+            it_prev = getattr(a, "_open_item", None)
+            qty = a.cantidad.valor if a.cantidad.valor is not None else \
+                (it_prev or {}).get("qty")
+            rechazados = set((it_prev or {}).get("rechazados") or [])
+
+            full = [h for h in hits if h.get("covers_query")]
+            cands = _dedup(_dominancia([_hit_opt(h) for h in (full or hits)]))
+            cands = [c for c in cands if c["code"] and c["code"] not in rechazados]
+            # gemelos de nombre (mismo producto, varios EAN) -> el más nuevo,
+            # sin preguntar. Salvo que el cliente teclee un código concreto:
+            # entonces ese código (si está en los hits/activo) manda -> se
+            # conserva el grupo para que el match exacto de abajo lo elija.
+            typed_here = set(codes_in_text(a.producto_texto))
+            if not (typed_here & {c["code"] for c in cands}):
+                cands = _colapsar_gemelos(cands)
+            # Testers fuera salvo que TODO lo hallado sea tester (o el cliente
+            # los pidiera explícitamente en el texto).
+            pidio_tester = "tester" in (a.producto_texto or "").lower() or \
+                           "test" in (a.producto_texto or "").lower()
+            if not pidio_tester:
+                sin_test = [c for c in cands if not _es_tester(c)]
+                if sin_test:
+                    cands = sin_test
+            # Si el cliente dijo un número de referencia (403, 402...), ese
+            # número es un discriminador estructural: descarta candidatos cuyo
+            # nombre NO lo contiene (el tester 401 y el insta-micro 402 sobran
+            # ante "brow pencil 403"). Solo poda si con ello queda >=1.
+            nums_ref = {t for t in re.split(r"[^0-9]+", a.producto_texto) if len(t) == 3}
+            if nums_ref:
+                filtrados = [c for c in cands
+                             if any(n in c["name"] for n in nums_ref)]
+                if filtrados:
+                    cands = filtrados
+
+            # código exacto tecleado dentro del texto y presente en hits
+            typed = set(codes_in_text(a.producto_texto))
+            exact = next((c for c in cands if c["code"] in typed), None)
+
+            if not cands:
+                ops.append({"op": "sin_candidatos", "texto": a.producto_texto, "qty": qty})
+            elif exact is not None:
+                if it_prev is not None:
+                    ops.append({"op": "elige", "item_texto": it_prev["texto"],
+                                "code": exact["code"], "name": exact["name"],
+                                "brand": exact["brand"], "fuente": exact["fuente"]})
+                else:
+                    ops.append({"op": "add",
+                                **{k: exact[k] for k in ("code", "name", "brand", "fuente")},
+                                "qty": qty})
+            elif len(cands) == 1 and full:
+                c = cands[0]
+                if it_prev is not None:
+                    ops.append({"op": "elige", "item_texto": it_prev["texto"],
+                                "code": c["code"], "name": c["name"],
+                                "brand": c["brand"], "fuente": c["fuente"]})
+                else:
+                    ops.append({"op": "add", **{k: c[k] for k in ("code", "name", "brand", "fuente")},
+                                "qty": qty})
+            else:
+                opciones, indist = _distintivos(cands[:MAX_OPCIONES])
+                if indist or not full:
+                    # D6 / cobertura parcial: pregunta directa, sin match.
+                    ops.append({"op": "opciones", "texto": a.producto_texto, "qty": qty,
+                                "opciones": opciones, "indistinguibles": indist})
+                else:
+                    ambiguos.append({"texto": a.producto_texto, "qty": qty,
+                                     "opciones": opciones, "item_prev": it_prev})
+
+    # ---- match por lotes (una llamada, tope) --------------------------------
+    if ambiguos:
+        lote = ambiguos[:MATCH_MAX_ITEMS]
+        resto = ambiguos[MATCH_MAX_ITEMS:]
+        payload = [{"i": i, "texto": x["texto"],
+                    "opciones": [o["name"] for o in x["opciones"]]}
+                   for i, x in enumerate(lote)]
+        verdicts = await match_call(payload)
+        r.llm_match_usada = verdicts is not None
+        vmap = {v.get("item"): v for v in (verdicts or []) if isinstance(v, dict)}
+        for i, x in enumerate(lote):
+            v = vmap.get(i) or {"veredicto": "varios"}
+            idx = v.get("indice")
+            if v.get("veredicto") == "unico" and isinstance(idx, int) \
+                    and 0 <= idx < len(x["opciones"]):
+                c = x["opciones"][idx]
+                if x.get("item_prev") is not None:
+                    ops.append({"op": "elige", "item_texto": x["item_prev"]["texto"],
+                                "code": c["code"], "name": c["name"],
+                                "brand": c["brand"], "fuente": c.get("fuente") or ""})
+                else:
+                    ops.append({"op": "add", "code": c["code"], "name": c["name"],
+                                "brand": c["brand"], "fuente": c.get("fuente") or "",
+                                "qty": x["qty"]})
+            elif v.get("veredicto") == "ninguno":
+                ops.append({"op": "sin_candidatos", "texto": x["texto"], "qty": x["qty"]})
+            else:
+                ops.append({"op": "opciones", "texto": x["texto"], "qty": x["qty"],
+                            "opciones": x["opciones"], "indistinguibles": False})
+        for x in resto:   # degradación determinista: solo puede producir preguntas
+            ops.append({"op": "opciones", "texto": x["texto"], "qty": x["qty"],
+                        "opciones": x["opciones"], "indistinguibles": False})
+
+    return r
+
+# ============================================================================
+# RENDER — Etapa 4, plantilla + reescritura validada + verificar
+# ============================================================================
+
+
+BOT_SIGNATURE = os.getenv("AGENT_BOT_SIGNATURE", "— Kapa 🤖")
+COLAPSO_UMBRAL = int(os.getenv("PIPE_COLAPSO_UMBRAL", "2"))   # >N sin resolver -> colapsa
+
+_RE_MD = re.compile(r"[*_#`]|^\s*[-•]\s", re.M)
+_RE_DIGITS = re.compile(r"\d+")
+
+
+def _n(name: str, code: str) -> str:
+    return (name or "").strip().title() or code
+
+
+def _linea_producto(name: str, qty: int, code: str, marcado: bool = False) -> str:
+    star = " *" if marcado else ""
+    return f"{_n(name, code)}, {qty} uds ({code}){star}"
+
+
+def _saludo(intro_mode: str, client_name: str, salesman_name: str) -> str:
+    if intro_mode == "new":
+        return (f"¡Hola{', ' + client_name.split()[0].title() if client_name and client_name != 'Cliente' else ''}! "
+                f"Soy Kapa, el asistente de pedidos de {salesman_name}. "
+                "Te ayudo a dejar tu pedido apuntado y él lo confirma.")
+    if intro_mode == "renew":
+        return f"¡Hola de nuevo! Soy Kapa, el asistente de {salesman_name}."
+    return ""
+
+
+def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
+           client_name: str, salesman_name: str, commercial_turn: bool) -> str:
+    """hechos -> texto plano WhatsApp-safe. Determinista."""
+    conf: List[str] = []
+    preguntas: List[str] = []
+    otras: List[str] = []
+    cortesias: List[str] = []
+    cierre: Optional[str] = None
+    derivacion: Optional[str] = None
+
+    # colapso (inv. 9): cuenta ítems que acabarán pidiendo elección/datos
+    pend = [h for h in hechos if h.tipo in ("pregunta_opciones", "sin_candidatos",
+                                            "rechazo_registrado", "recordatorio_pendiente",
+                                            "referencia_ambigua")]
+    colapsar = len(pend) > COLAPSO_UMBRAL
+
+    for h in hechos:
+        d = h.datos
+        if h.tipo == "confirmado":
+            conf.append("Apuntado: " + _linea_producto(d["name"], d["qty"], d["code"],
+                                                       d.get("marcado", False)))
+        elif h.tipo == "actualizado":
+            conf.append("Actualizado: " + _linea_producto(d["name"], d["qty"], d["code"]))
+        elif h.tipo == "sin_cambio_confirmado":
+            conf.append("Eso ya lo tienes en el pedido: "
+                        + _linea_producto(d["name"], d["qty"], d["code"]) + ".")
+        elif h.tipo == "eliminado":
+            conf.append(f"Quitado del pedido: {_n(d['name'], d['code'])} ({d['code']}).")
+
+        elif h.tipo == "pregunta_opciones" and not colapsar:
+            ops = d.get("opciones") or []
+            if d.get("indistinguibles"):
+                cods = ", ".join(o["code"] for o in ops)
+                preguntas.append(
+                    f"De \"{d['texto']}\" tengo varias referencias con exactamente el mismo "
+                    f"nombre, así que solo puedo distinguirlas por código: {cods}. "
+                    "¿Cuál de esos códigos es el tuyo?")
+            else:
+                partes = []
+                for o in ops:
+                    tag = o.get("distintivo") or _n(o.get("name", ""), o["code"])
+                    partes.append(f"{tag.strip().lower()} ({o['code']})")
+                qty_txt = f" (me dijiste {d['qty']} uds)" if d.get("qty") else ""
+                preguntas.append(
+                    f"De \"{d['texto']}\"{qty_txt} tengo " + " y ".join(partes) +
+                    ". ¿Cuál quieres?")
+        elif h.tipo == "sin_candidatos" and not colapsar:
+            preguntas.append(
+                f"\"{d['texto']}\" no lo encuentro entre lo que sueles pedir. "
+                "¿Me pasas el nombre completo o el código? Si no, se lo dejo a "
+                f"{salesman_name} para que lo mire.")
+        elif h.tipo == "rechazo_registrado" and not colapsar:
+            preguntas.append(
+                f"Entendido, esas opciones de \"{d['texto']}\" no son. "
+                "Pásame el código o el nombre completo del que buscas y lo apunto.")
+        elif h.tipo == "recordatorio_pendiente" and not colapsar:
+            preguntas.append(f"Sigo con \"{d['item']}\" pendiente: dime el código o el "
+                             "nombre completo cuando puedas.")
+
+        elif h.tipo == "conflicto_cantidad":
+            nums = " , ".join(str(x) for x in d.get("opciones_qty") or [])
+            preguntas.append(
+                f"De {_n(d['name'], d['code'])} ({d['code']}) me has dado dos cantidades "
+                f"distintas. ¿Con cuál me quedo: {nums}?")
+        elif h.tipo == "pregunta_baja":
+            preguntas.append(f"Con eso {_n(d['name'], d['code'])} ({d['code']}) se quedaría "
+                             "en 0. ¿Te lo quito del pedido?")
+        elif h.tipo == "pregunta_eliminar_o_restar":
+            preguntas.append(f"De {_n(d['name'], d['code'])} ({d['code']}): ¿quito la línea "
+                             f"entera o resto {d.get('n') or 1}?")
+        elif h.tipo == "referencia_ambigua" and not colapsar:
+            cands = list(dict.fromkeys(d.get("candidatas") or []))   # dedup, orden
+            if cands:
+                preguntas.append(
+                    f"De \"{d['texto']}\" no sé cuál quieres: "
+                    + " o ".join(cands[:3]) + ". ¿Me lo confirmas?")
+            else:
+                preguntas.append(
+                    f"Perdona, no acabo de encontrar \"{d['texto']}\". "
+                    "¿Me das la marca o el código y lo apunto?")
+        elif h.tipo == "codigo_no_existe":
+            otras.append(f"El código {d['code']} no me consta en el sistema; puede ser "
+                         f"antiguo o de otro proveedor. Se lo paso a {salesman_name} "
+                         "para que lo revise.")
+
+        elif h.tipo == "propuesta":
+            items = d.get("items") or []
+            lineas = "; ".join(_linea_producto(i.get("name", ""), int(i.get("qty") or 1),
+                                               i.get("code", "")) for i in items)
+            if d.get("tipo") == "propuesta_repetir":
+                preguntas.append(f"Como tu último pedido quedaría: {lineas}. "
+                                 "¿Lo apunto así?")
+            elif d.get("tipo") == "propuesta_media":
+                preguntas.append(f"De lo que me has mandado he sacado: {lineas}. "
+                                 "Al venir de una foto/audio prefiero confirmarlo: ¿lo apunto?")
+            elif d.get("tipo") == "propuesta_cierre":
+                preguntas.append(f"Tu pedido queda: {lineas}. ¿Lo confirmo y se lo paso a "
+                                 f"{salesman_name}?")
+        elif h.tipo == "cerrado":
+            items = d.get("cart") or []
+            lineas = "; ".join(_linea_producto(i.get("name", ""), int(i.get("qty") or 1),
+                                               i.get("code", "")) for i in items)
+            cierre = (f"¡Pedido confirmado! {lineas}. Se lo paso ahora a {salesman_name}, "
+                      "que lo valida antes del envío. Gracias.")
+
+        elif h.tipo == "derivacion":
+            if d.get("motivo") == "producto_no_encontrado":
+                cual = f" \"{d['texto']}\"" if d.get("texto") else ""
+                derivacion = (f"No consigo localizar{cual} entre lo que tenemos. Se lo paso a "
+                              f"{salesman_name}, que se conectará en cuanto pueda para ayudarte con eso.")
+            else:
+                derivacion = (f"De eso te informa {salesman_name} directamente; le aviso para "
+                              "que te escriba en cuanto pueda.")
+        elif h.tipo == "aviso_comercial":
+            derivacion = (f"Aviso a {salesman_name} para que se conecte lo antes posible "
+                          "y te atienda.")
+        elif h.tipo == "opt_out":
+            derivacion = (f"Entendido, no te escribo más. Aviso a {salesman_name} para que "
+                          "te atienda personalmente.")
+        elif h.tipo == "recap_pedido":
+            if estado.cart:
+                lineas = "; ".join(_linea_producto(l.get("name", ""), int(l["qty"]), l["code"])
+                                   for l in estado.cart)
+                otras.append(f"Ahora mismo llevas apuntado: {lineas}. ¿Añades algo más o lo cerramos?")
+            else:
+                otras.append("Todavía no tienes nada apuntado en este pedido. ¿Qué te pongo?")
+        elif h.tipo == "cortesia":
+            st = d.get("subtipo")
+            if st == "confirmacion_sin_pregunta":
+                cortesias.append("¡De acuerdo!")
+            elif st in ("saludo",):
+                # si el turno ya lleva saludo de presentación, no dupliques "¡Hola!"
+                habra_intro = (intro_mode == "new" or (intro_mode == "renew" and commercial_turn))
+                if not habra_intro:
+                    cortesias.append("¡Hola!")
+            elif st in ("agradecimiento", "despedida"):
+                cortesias.append("¡Gracias a ti! Aquí estoy si necesitas apuntar algo más.")
+            elif st == "pregunta_bot":
+                cortesias.append("Soy Kapa, un asistente: apunto tu pedido y "
+                                 f"{salesman_name} lo confirma antes de enviar nada.")
+        elif h.tipo == "sin_entender":
+            preguntas.append("No estoy seguro de haberte entendido. Dime producto y "
+                             "cantidad (mejor con el código si lo tienes) y lo apunto.")
+
+    if colapsar:
+        textos = sorted({(h.datos.get("texto") or h.datos.get("item") or "").strip()
+                         for h in pend if (h.datos.get("texto") or h.datos.get("item"))})
+        preguntas.append(
+            "Me quedan varios artículos por concretar (" + ", ".join(f"\"{t}\"" for t in textos)
+            + "). Para no marearte con opciones: ¿me pasas el nombre completo o el código "
+              "de cada uno?")
+
+    bloques: List[str] = []
+    sal = _saludo(intro_mode, client_name, salesman_name) if \
+        (intro_mode == "new" or (intro_mode == "renew" and commercial_turn)) else ""
+    if sal:
+        bloques.append(sal)
+    if cierre:
+        bloques.extend(conf)
+        bloques.append(cierre)
+    else:
+        bloques.extend(conf)
+        bloques.extend(preguntas)
+        bloques.extend(otras)
+    if derivacion:
+        bloques.append(derivacion)
+    if not any((conf, preguntas, otras, cierre, derivacion)) and cortesias:
+        bloques.extend(cortesias)
+    elif cortesias and not (conf or preguntas or cierre):
+        bloques.extend(cortesias)
+
+    cuerpo = "\n".join(b for b in bloques if b).strip()
+    if not cuerpo:
+        return ""
+    return cuerpo + "\n" + BOT_SIGNATURE
+
+
+# --------------------------------------------------------------- reescritura
+def lineas_congeladas(plantilla: str) -> List[str]:
+    """Toda línea que contenga un paréntesis con código o un dígito de
+    cantidad queda congelada: debe aparecer verbatim en la reescritura."""
+    out = []
+    for ln in plantilla.splitlines():
+        if re.search(r"\(\S+\)", ln) or _RE_DIGITS.search(ln):
+            out.append(re.sub(r"\s+", " ", ln).strip())
+    return out
+
+
+def validar_reescritura(plantilla: str, reescrito: str) -> Tuple[bool, str]:
+    if not reescrito or not reescrito.strip():
+        return False, "vacía"
+    flat = re.sub(r"\s+", " ", reescrito).strip()
+    for ln in lineas_congeladas(plantilla):
+        if ln and ln not in flat:
+            return False, f"línea congelada ausente: {ln[:60]!r}"
+    if Counter(_RE_DIGITS.findall(plantilla)) != Counter(_RE_DIGITS.findall(reescrito)):
+        return False, "multiconjunto de dígitos distinto"
+    if _RE_MD.search(reescrito.replace(BOT_SIGNATURE, "")):
+        return False, "markdown/viñetas"
+    low = reescrito.lower()
+    for veto in ("instrucci", "interno", "system", "prompt", "como ia", "modelo de lenguaje"):
+        if veto in low:
+            return False, f"veto: {veto}"
+    if len(reescrito) > int(len(plantilla) * 1.4) + 80:
+        return False, "longitud desproporcionada"   # margen para conectores, no para inventar
+    return True, ""
+
+
+# ------------------------------------------------------------------ verificar
+def verificar(mensaje: str, estado: Estado, codigos_permitidos: set) -> Tuple[bool, str]:
+    """Cinturón del invariante 6 sobre el mensaje FINAL:
+    - todo token con forma (COD) ∈ permitidos (carrito ∪ retrieval del turno
+      ∪ opciones vivas ∪ last_closed),
+    - toda línea 'N uds (COD)' de un código EN CARRITO debe casar con su qty.
+    """
+    if not mensaje:
+        return True, ""
+    en_parens = set(re.findall(r"\(([A-Za-z0-9\-\./]{3,21})\)", mensaje))
+    en_parens = {c for c in en_parens if any(ch.isdigit() for ch in c)}
+    fuera = en_parens - codigos_permitidos
+    if fuera:
+        return False, f"códigos no fundados en el mensaje: {sorted(fuera)}"
+    qty_by_code = {l["code"]: int(l["qty"]) for l in estado.cart}
+    for m in re.finditer(r"(\d+)\s*uds?\s*\(([A-Za-z0-9\-\./]{3,21})\)", mensaje, re.I):
+        qty, code = int(m.group(1)), m.group(2)
+        if code in qty_by_code and qty != qty_by_code[code]:
+            return False, f"cantidad {qty} no casa con carrito ({qty_by_code[code]}) para {code}"
+    return True, ""
+
+
+def mensaje_seguro(estado_viejo: Estado, salesman_name: str) -> str:
+    """D12: fallo de verificar -> mensaje desde el ESTADO VIEJO, que sigue
+    siendo verdad, pidiendo reenviar lo último."""
+    if estado_viejo.cart:
+        lineas = "; ".join(_linea_producto(l.get("name", ""), int(l["qty"]), l["code"])
+                           for l in estado_viejo.cart)
+        cuerpo = (f"No he podido procesar bien tu último mensaje. Tu pedido sigue como "
+                  f"estaba: {lineas}. ¿Me reenvías lo último que querías cambiar o añadir?")
+    else:
+        cuerpo = ("No he podido procesar bien tu último mensaje. ¿Me lo reenvías? "
+                  f"Si lo prefieres, se lo paso a {salesman_name}.")
+    return cuerpo + "\n" + BOT_SIGNATURE
+
+# ============================================================================
+# TURNO — orquestador, llamadas LLM y contrato con handlers
+# ============================================================================
+
 CIMA_URL = os.getenv("CIMA_URL", "http://cima:8000")
 CIMA_MODEL = os.getenv("CIMA_MODEL", "unsloth/gemma-4-E2B-it-GGUF:Q8_0")
-CTX_WINDOW = int(os.getenv("CIMA_CTX_WINDOW", "8192"))
-MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "3"))          # LLM calls per turn
-MAX_HISTORY_CHARS = int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000"))
-AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.55"))  # variety without breaking tool JSON
+CIMA_CTX_WINDOW = int(os.getenv("CIMA_CTX_WINDOW", "8192"))  # ventana; resumen al 60%
 
-
-# Every non-empty reply carries a short signature so the client can never
-# mistake Kapa for the human salesman. Deterministic (appended in code, not
-# left to the 2B model). Configurable; keep it short.
-BOT_SIGNATURE = os.getenv("AGENT_BOT_SIGNATURE", "— Kapa 🤖")
-
-# ---- Pass-1 triage helper (isolated, single-task, deterministic) -----------
-TRIAGE_TEMPERATURE = 0.0                                            # never configurable: determinism is the contract
-TRIAGE_TIMEOUT_S = float(os.getenv("AGENT_TRIAGE_TIMEOUT_S", "90"))
-TRIAGE_MAX_TOKENS = int(os.getenv("AGENT_TRIAGE_MAX_TOKENS", "1400"))  # long lists need room
-TRIAGE_MSG_MAX_CHARS = int(os.getenv("AGENT_TRIAGE_MSG_MAX_CHARS", "1600"))
-TRIAGE_HISTORY_MAX_CHARS = int(os.getenv("AGENT_TRIAGE_HISTORY_MAX_CHARS", "600"))
-
-# ---- context budget -------------------------------------------------------
-# The assembled prompt (system + state + history + message + tool results)
-# must stay under AGENT_CTX_BUDGET_PCT of the model's window. The gemma-E2B
-# degrades visibly on long contexts (the <|token-soup|> tool-call leak appeared
-# there), so the budget is deliberately tight — 60% — and the heavy lifting is
-# DISTRIBUTED to the single-task helper calls (triage, query-gate, match,
-# reconcile, audit), each of which sees only a tiny focused context. When the
-# main prompt doesn't fit, sacrifices are ordered by value: history is trimmed
-# tail-first (the persisted `note` summary — always present as "Memoria" —
-# carries older context), then oversized messages are middle-cut, then tool
-# results are capped, then _fit_messages drops the oldest loop chatter.
-CTX_BUDGET_TOKENS = int(CTX_WINDOW * float(os.getenv("AGENT_CTX_BUDGET_PCT", "0.60")))
-MAX_MESSAGE_CHARS = int(os.getenv("AGENT_MESSAGE_MAX_CHARS", "2000"))
-MAX_RESULTS_CHARS = int(os.getenv("AGENT_RESULTS_MAX_CHARS", "2400"))
-_GENERATION_SLACK_TOKENS = 96   # role markers, chat template overhead
-
-
-def _est_tokens(text: str) -> int:
-    """Conservative estimate (~3 chars/token for Spanish)."""
-    return max(1, len(text) // 3)
-
-
-def _cap_middle(text: str, max_chars: int) -> str:
-    """Keep head and tail of oversized text (media extractions can be huge)."""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.75)
-    tail = max_chars - head
-    return text[:head].rstrip() + "\n…[recortado]…\n" + text[-tail:].lstrip()
-
-
-def _tail_lines_to_fit(history: str, max_chars: int) -> str:
-    """Newest history lines that fit the budget; older context lives in Memoria."""
-    if max_chars <= 0:
-        return ""
-    if len(history) <= max_chars:
-        return history
-    kept: List[str] = []
-    used = 0
-    for line in reversed(history.splitlines()):
-        cost = len(line) + 1
-        if used + cost > max_chars:
-            break
-        kept.append(line)
-        used += cost
-    return "\n".join(reversed(kept))
-
-
-def _messages_tokens(msgs: List["Message"]) -> int:
-    """Estimated tokens for the whole message list actually sent to the model,
-    including per-message chat-template overhead."""
-    return sum(_est_tokens(m.content or "") + 4 for m in msgs)
-
-
-def _fit_messages(msgs: List["Message"], budget: int) -> List["Message"]:
-    """Guarantee the assembled context stays under `budget` tokens even after
-    the loop has appended tool results and nudges. The system prompt (msgs[0]),
-    the main state/context turn (msgs[1]) and the most recent turn are always
-    kept; the OLDEST middle chatter (stale tool results, superseded tool-call
-    announcements, spent nudges) is dropped first — its information already
-    lives in the cart/open_items state and the persisted note summary."""
-    if len(msgs) <= 3 or _messages_tokens(msgs) <= budget:
-        return msgs
-    head, middle, tail = msgs[:2], msgs[2:-1], msgs[-1:]
-    while middle and _messages_tokens(head + middle + tail) > budget:
-        middle.pop(0)
-    return head + middle + tail
-
-VALID_STATUS = ("IDLE", "BUILDING", "CLOSED")
-
-# Retriever signature: queries -> {query: [{"CodigoArticulo", "DescripcionArticulo", ...}]}
-Retriever = Callable[[List[str]], Awaitable[Dict[str, List[Dict[str, Any]]]]]
+MAX_LLM_CALLS = int(os.getenv("PIPE_MAX_LLM_CALLS", "4"))
+EXTRACT_TIMEOUT_S = float(os.getenv("PIPE_EXTRACT_TIMEOUT_S", "90"))
+MATCH_TIMEOUT_S = float(os.getenv("PIPE_MATCH_TIMEOUT_S", "60"))
+REWRITE_TIMEOUT_S = float(os.getenv("PIPE_REWRITE_TIMEOUT_S", "60"))
+EXTRACT_MAX_TOKENS = int(os.getenv("PIPE_EXTRACT_MAX_TOKENS", "700"))
+MATCH_MAX_TOKENS = int(os.getenv("PIPE_MATCH_MAX_TOKENS", "300"))
+REWRITE_MAX_TOKENS = int(os.getenv("PIPE_REWRITE_MAX_TOKENS", "450"))
+REWRITE_ON = os.getenv("RENDER_REWRITE", "on").strip().lower() not in ("0", "off", "false", "no")
+MSG_MAX_CHARS = int(os.getenv("PIPE_MSG_MAX_CHARS", "2400"))
 
 _client: Optional[CimaClient] = None
 
@@ -196,12 +1590,11 @@ def _get_client() -> CimaClient:
 
 
 async def health_check() -> Dict[str, Any]:
-    """cima reachability probe (used by /api/healthz)."""
+    """cima reachability probe (usada por /api/healthz)."""
     url = f"{CIMA_URL}/api/version"
     try:
         code = await asyncio.to_thread(
-            lambda: urllib.request.urlopen(url, timeout=3).getcode()
-        )
+            lambda: urllib.request.urlopen(url, timeout=3).getcode())
         return {"status": "ok" if code == 200 else "error", "code": code, "url": url}
     except Exception as e:
         return {"status": "error", "error": str(e), "url": url}
@@ -210,2199 +1603,454 @@ async def health_check() -> Dict[str, Any]:
 # --------------------------------------------------------------------- result
 @dataclass
 class AgentResult:
-    """Everything handle_ai_trigger needs to act and persist. `reply == ""` means silence."""
+    """Contrato con handle_ai_trigger, sin cambios. reply == "" es silencio."""
     reply: str = ""
     order_status: str = "IDLE"
     cart: List[Dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     handoff: bool = False
     opt_out: bool = False
-    # Triage-driven escalation (Pass 1): handoff WITHOUT the canned message —
-    # strict silence so the human salesman takes over. handlers.py checks it.
     silent: bool = False
-    # Multi-item work queue (unresolved products with their option snapshots):
     open_items: List[Dict[str, Any]] = field(default_factory=list)
-    # One-time capability guidance already delivered in this conversation:
     guide_shown: bool = False
-    # Context-window telemetry for the console gauge (est. tokens):
     ctx: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------- tools
-_TOOLS: List[Dict[str, Any]] = [
-    {"type": "function", "function": {
-        "name": "search_products",
-        "description": ("Busca en el catálogo real. Códigos de producto (KG001399, 65012A…) "
-                        "SIEMPRE como queries individuales y primero; después descripciones. "
-                        "Incluye los códigos que aparezcan en [Texto en Imagen], [Audio transcrito] "
-                        "o [Documento]. No busques lo que ya está en el carrito."),
-        "parameters": {"type": "object", "properties": {
-            "queries": {"type": "array", "items": {"type": "string"}}}, "required": ["queries"]},
-    }},
-    {"type": "function", "function": {
-        "name": "add_item",
-        "description": ("Añade un producto CONFIRMADO al carrito. SOLO cuando el cliente valida "
-                        "explícitamente ('sí, ese', 'apúntame 2'). Buscar o mencionar NO es confirmar. "
-                        "El código debe venir de los resultados de búsqueda."),
-        "parameters": {"type": "object", "properties": {
-            "code": {"type": "string"}, "qty": {"type": "integer"}}, "required": ["code", "qty"]},
-    }},
-    {"type": "function", "function": {
-        "name": "remove_item",
-        "description": "Quita un producto del carrito cuando el cliente lo pide explícitamente.",
-        "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
-    }},
-    {"type": "function", "function": {
-        "name": "set_qty",
-        "description": "Corrige la cantidad de un producto YA confirmado ('ponme 5 en vez de 3').",
-        "parameters": {"type": "object", "properties": {
-            "code": {"type": "string"}, "qty": {"type": "integer"}}, "required": ["code", "qty"]},
-    }},
-    {"type": "function", "function": {
-        "name": "close_order",
-        "description": "El cliente confirma el ENVÍO FINAL del pedido completo. Cierra el pedido.",
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "handoff_to_human",
-        "description": ("El cliente pide hablar con el comercial, o pregunta por precios, stock, "
-                        "promociones, facturación, incidencias, el estado/envío de un pedido ya "
-                        "enviado, o pide consejo sobre productos (para qué sirve, cuál es mejor). "
-                        "NUNCA la uses para preguntas sobre CÓMO hacer un pedido, sobre ti o "
-                        "para identificar un producto del catálogo: eso lo respondes tú."),
-        "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}},
-    }},
-    {"type": "function", "function": {
-        "name": "opt_out_client",
-        "description": ("El cliente expresa que NO quiere hablar con un asistente/bot. "
-                        "Silencia el bot en esta conversación PARA SIEMPRE. Úsalo a la primera señal clara."),
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "note",
-        "description": "Resumen brevísimo (1 frase) del estado de la conversación, para memoria interna.",
-        "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
-    }},
-]
+# ---------------------------------------------------------------- LLM helpers
+class _Budget:
+    def __init__(self, limit: int = MAX_LLM_CALLS) -> None:
+        self.limit = limit
+        self.used = 0
+        self.detail: List[Dict[str, Any]] = []
 
-_SYSTEM = """\
-Eres Kapa, el asistente de pedidos de {salesman_name} (cosmética). Atiendes a \
-sus clientes por WhatsApp cuando él no está. Hablas natural y breve, en el \
-idioma del cliente, con algún emoji; no mencionas sistemas ni IA. {intro_rule}
+    def can(self) -> bool:
+        return self.used < self.limit
 
-LO QUE SÍ HACES: localizar productos del catálogo (search_products, por nombre \
-o código de producto) y montar el pedido. Di siempre "código de producto".
-
-LO QUE NO HACES (lo lleva {salesman_name}): mostrar el catálogo entero, dar \
-precios, stock, facturas, incidencias/devoluciones, envíos o consejo de \
-producto. Ante eso, dilo con naturalidad ("eso te lo confirma {salesman_name}") \
-y sigue con lo que sí puedas. No hace falta derivar por esto.
-
-CÓMO TRABAJAS:
-- Busca solo PRODUCTOS concretos (nombre o código). Una marca o categoría sola \
-("gelfix", "una crema") no basta para buscar: el cliente tiene el catálogo, \
-así que pídele el producto concreto o el código. Nunca digas "un momento / voy \
-a mirar": busca ya o responde con lo que tienes.
-- Solo existen los productos que devuelve la búsqueda: NUNCA inventes códigos, \
-nombres ni marcas. Muestra solo lo que encaje; si no encaja, dilo y pide \
-detalle o el código.
-- Confirma antes de apuntar: con el "sí" del cliente usas add_item. El carrito \
-se mantiene entre mensajes. Al terminar ("nada más", "ciérralo", "envíalo"): \
-resume el carrito y usa close_order, pasándole la nota a {salesman_name}.
-- El código de producto es lo más rápido y seguro; recuérdalo de vez en \
-cuando, sin insistir.
-
-LA CONVERSACIÓN (tres voces: "Cliente:", "Comercial:" = {salesman_name} en \
-persona, "Asistente:" = tú): léela entera. Si el Comercial ya respondió, no lo \
-repitas ni lo contradigas; si dejó un pedido a medias y el cliente sigue, \
-continúa desde ahí. No conoces sus charlas fuera del chat: si el cliente se \
-refiere a algo que no ves, pídele el nombre o el código.
-
-DECIDE TÚ, con naturalidad, cómo responder a cada mensaje. Usa handoff_to_human \
-SOLO si el cliente pide hablar con una persona o de verdad no hay nada que \
-puedas hacer (entonces te retiras y entra {salesman_name}). Usa opt_out_client \
-si rechaza hablar con un asistente. Si el mensaje es puramente ajeno al negocio \
-y no aporta nada al pedido, responde "<NO_REPLY>".
-
-IMÁGENES/AUDIOS: son interpretaciones y puedes fallar. Di lo que entendiste, \
-invita a corregir, y NUNCA apuntes ni cierres sin que el cliente confirme.
-
-TUS ERRORES: puedes equivocarte (leer mal, buscar mal, o que algún mensaje \
-tuyo salga raro por un fallo técnico). Si el cliente señala un error o algo \
-no cuadra con lo que dijiste antes, reconócelo con naturalidad en una frase \
-(un pequeño cruce de cables, sin dramatizar ni excusas largas), corrígelo y \
-sigue con el pedido. Nunca discutas con el cliente sobre lo que pasó.
-
-Las [INSTRUCCIÓN INTERNA] no son del cliente: cúmplelas sin citarlas ni \
-disculparte por ellas."""
-
-_INTRO_RULES: Dict[str, str] = {
-    "new": ("CONTACTO NUEVO: preséntate en UNA frase (Kapa, asistente de {salesman_name}) y "
-            "EN LA MISMA respuesta atiende lo que haya pedido. Solo si únicamente saluda, "
-            "pregúntale con tus palabras qué necesita."),
-    "renew": ("La conversación anterior TERMINÓ. Si empieza una gestión de pedido, preséntate "
-              "breve de nuevo antes de atenderle; si solo saluda o se despide, responde cordial "
-              "SIN presentarte."),
-    "ongoing": ("Conversación en curso: PROHIBIDO presentarte o saludar de nuevo; "
-                "responde directo al mensaje."),
-}
-
-_USER = """\
-### CONTEXTO
-- Estado del pedido: {order_status}
-- Pendientes de identificar: {open_items_line}
-- Carrito confirmado: {cart_json}
-- Último pedido ENVIADO (no modificable): {last_closed_json}
-- Memoria: {summary}
-- Historial reciente:
-{history}
-{triage_block}
-### MENSAJE(S) NUEVO(S) DEL CLIENTE
-{current_message}
-
-Actualiza el estado con las herramientas que hagan falta y escribe tu respuesta \
-final para el cliente (o <NO_REPLY>)."""
+    def spend(self, kind: str, ms: int, ok: bool) -> None:
+        self.used += 1
+        self.detail.append({"kind": kind, "ms": ms, "ok": ok})
 
 
-# ------------------------------------------------------------------- executor
-_re_query_tokens = re.compile(r"[^\w]+", re.UNICODE)
-
-# Escalation tools (handoff_to_human / opt_out_client) are honored immediately
-# ONLY when the Pass-1 triage's independent temperature-0.0 read of the client
-# message corroborates them (`derivacion` / `rechazo_bot`) — observed live:
-# "¿cómo hago un pedido?" triggered handoff_to_human because 'pedido' smells
-# like salesman territory to a 2B model, bouncing a trivial process question
-# to a human. Uncorroborated calls are demoted once with a nudge to answer
-# directly; if the model INSISTS on a second call, it is honored (covers real
-# cases no classifier can foresee). No keyword lists anywhere: two model
-# opinions at different temperatures must agree, or the model must insist.
-
-
-def _strip_accents_lower(s: str) -> str:
-    import unicodedata
-    s = (s or "").lower()
-    return "".join(c for c in unicodedata.normalize("NFD", s)
-                   if unicodedata.category(c) != "Mn")
-
-
-# A reply that ANNOUNCES a search without calling the tool leaves the client
-# waiting forever — observed live: "Busca un momento, reviso qué tengo" with
-# zero tool calls. Judged by the reply-audit helper (run_reply_audit, a
-# temperature-0.0 pass over the draft reply), not by a phrase regex.
-
-
-# One worked example in the prompt = a template a 2B model parrots verbatim —
-# observed live: three consecutive proposals with the identical skeleton and
-# zero reaction to the client's words. A PROPOSAL reply (>=2 numbered lines)
-# that reuses one of its framing sentences verbatim from a previous bot
-# message in the history is demoted once and rewritten.
-_re_numbered_line = re.compile(r"^\s*\d+\)")
-
-# Ungrounded proposals: the reply TEXT can name any code — from Memoria, the
-# last closed order, old history, or even the prompt's own worked examples —
-# and present it as "found". Observed live: a black-eyeliner search returned 3
-# products and the reply added 2 Gelfix items nobody asked about. Proposals
-# may only contain codes from THIS turn's search results (plus the cart; plus
-# the last closed order when the Pass-1 triage says the client asked to
-# REPEAT their usual order — `repetir_ultimo`, no keyword matching). One
-# rewrite nudge; then offending lines are stripped and the list renumbered.
-_re_item = re.compile(r"\d+\)\s*([A-Za-z0-9][A-Za-z0-9\-./]{1,})\s*[—-]")
-_re_item_span = re.compile(r"\d+\)\s*([A-Za-z0-9][A-Za-z0-9\-./]{1,})\s*[—-][^\n]*?(?=\s*\d+\)|$)")
-_re_item_marker = re.compile(r"\d+\)")
-
-
-def _proposal_codes(reply: str) -> List[str]:
-    """Codes offered as catalog items ('N) CODE — NAME'), including proposals
-    flattened onto one line. The 'CODE —' shape keeps narrative enumerations
-    ('1) Me dices los productos...') out of scope."""
-    return [_sane_code(c) for c in _re_item.findall(reply or "")]
-
-
-def _strip_ungrounded_lines(reply: str, bad_codes: set) -> str:
-    """Remove ungrounded item spans (whole line if it only carries bad items,
-    surgical within mixed lines), then renumber all items sequentially."""
-    kept: List[str] = []
-    for line in reply.splitlines():
-        codes = {_sane_code(c) for c in _re_item.findall(line)}
-        if codes and codes <= bad_codes:
-            continue
-        if codes & bad_codes:
-            line = _re_item_span.sub(
-                lambda m: "" if _sane_code(m.group(1)) in bad_codes else m.group(0), line).rstrip()
-        kept.append(line)
-    text = "\n".join(kept)
-    counter = [0]
-
-    def renum(m):
-        counter[0] += 1
-        return f"{counter[0]})"
-    return _re_item_marker.sub(renum, text).strip()
-
-
-def _is_parroting(reply: str, recent_history: str) -> bool:
-    lines = reply.splitlines()
-    is_proposal = sum(1 for l in lines if _re_numbered_line.match(l)) >= 2
-    previous_bot_text = " | ".join(
-        re.sub(r"\s+", " ", _strip_accents_lower(l.split(":", 1)[1]))
-        for l in recent_history.splitlines() if l.startswith("Asistente:")
-    )
-    if not previous_bot_text:
-        return False
-    for line in lines:
-        if _re_numbered_line.match(line):
-            continue
-        normalized = re.sub(r"\s+", " ", _strip_accents_lower(line)).strip()
-        if is_proposal and len(normalized) >= 12 and normalized in previous_bot_text:
-            return True
-    if not is_proposal:
-        # Non-proposal replies (e.g. the how-it-works talk) parrot when they
-        # replay >= 2 long verbatim sentences from prior bot turns; a single
-        # reused formula ("¿Añadimos algo más...?") stays exempt.
-        sents = [re.sub(r"\s+", " ", _strip_accents_lower(s)).strip()
-                 for s in re.split(r"[.!?\n]+", reply)]
-        return sum(1 for s in sents if len(s) >= 25 and s in previous_bot_text) >= 2
-    return False
-
-
-# A bare ATTRIBUTE (color, size, finish, variant number) identifies nothing in
-# an 8k-product catalog — observed live: after three messages about Gelfix
-# eyeliners, "El negro" was searched as 'negro' and returned black files and
-# clips. WHICH queries are attribute-only is judged by the helpers (Pass-1
-# `clase: ATTRIBUTE`, or the query-gate helper for mid-loop queries — no
-# color/size word list). The current product family is still derived
-# STRUCTURALLY from the bot's own last numbered proposal in the history
-# (tokens repeated across its items, e.g. DELINEADOR/KATAI), so attribute
-# queries are grounded in code: 'negro' -> 'delineador katai negro'. No topic
-# available -> the item is queued and the model asks which product it refers to.
-_re_proposal_item = re.compile(r"\d+\)\s*[A-Za-z0-9\-./]+\s*—\s*([^0-9)][^)]{2,80}?)(?=\s+\d+\)|$)")
-
-
-def _topic_from_history(recent_history: str) -> List[str]:
-    """Product-family tokens from the newest bot proposal in the history:
-    purely structural — tokens (len >= 4) REPEATED across >= 2 item names of
-    the same numbered list. Repetition across variants of one family is what
-    identifies the family ('DELINEADOR KATAI NEGRO' / 'DELINEADOR KATAI AZUL'
-    -> ['delineador', 'katai']); no vocabulary list involved. No proposal =
-    no established product context."""
-    from collections import Counter
-    for line in reversed((recent_history or "").splitlines()):
-        if not line.startswith("Asistente:"):
-            continue
-        names = _re_proposal_item.findall(line)
-        if len(names) < 2:
-            continue
-        counts: Counter = Counter()
-        for name in names:
-            counts.update({
-                t for t in _re_query_tokens.split(_strip_accents_lower(name))
-                if len(t) >= 4
-            })
-        # Tokens shared by ALL items first (the family), then by most.
-        common = [t for t, c in counts.most_common(6) if c >= 2][:2]
-        if common:
-            return common
-    return []
-
-
-
-
-# The `note` tool sometimes leaks as visible text ("Nota: el cliente quiere
-# hacer un pedido") instead of a tool call. Scrub such trailing lines from the
-# client-facing reply and reroute them to the session summary.
-_re_leaked_note = re.compile(r"^\s*\(?\s*(nota|nota interna|memoria|resumen)\s*[:\-]\s*(.+?)\)?\s*$",
-                             re.IGNORECASE)
-
-
-def _split_leaked_note(reply: str) -> Tuple[str, str]:
-    kept: List[str] = []
-    note = ""
-    for line in (reply or "").splitlines():
-        m = _re_leaked_note.match(line)
-        if m:
-            note = m.group(2).strip()
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip(), note
-
-
-# Humility guard (media turns): a proposal built from an image/audio/document
-# interpretation must acknowledge fallibility and invite correction (keywords,
-# brand, or the exact code). Whether the draft actually invites correction is
-# judged SEMANTICALLY by the reply-audit helper (run_reply_audit, temperature
-# 0.0) — no phrase list — so the wording stays the model's own and no fixed
-# formula can calcify into a template. One nudge; never fires on plain-text
-# turns. _MEDIA_MARKERS are NOT client language: they are literal protocol
-# markers OUR OWN pipeline (handlers._MEDIA_PREFIX) injects — structural.
-_MEDIA_MARKERS = ("[Texto en Imagen]", "[Audio transcrito]", "[Documento")
-
-
-def _is_media_message(message: str) -> bool:
-    return any(m in (message or "") for m in _MEDIA_MARKERS)
-
-
-# ------------------------------------------------ Pass 1: triage helper
-# An isolated, single-task inference at temperature 0.0 that runs BEFORE the
-# agent loop. It answers exactly three questions about the raw client
-# message: (a) is this an escalation the bot must stay out of, (b) which
-# product mentions are specific enough to search immediately (WORTHY), and
-# (c) which are generic category talk that needs conversational narrowing
-# (AMBIGUOUS). Multi-round helpers like this one are the house pattern:
-# each prompt stays tiny (well under the 70% context budget) and a 2B model
-# does one job well instead of many jobs badly.
-
-TRIAGE_WORTHY = "WORTHY"
-TRIAGE_AMBIGUOUS = "AMBIGUOUS"
-TRIAGE_ATTRIBUTE = "ATTRIBUTE"
-
-
-@dataclass(frozen=True)
-class TriageItem:
-    mention: str        # verbatim-ish client mention ("3 L'ACTION mascarilla…")
-    query: str          # clean search terms ("l'action mascarilla facial antiedad 8 grs")
-    qty: int
-    cls: str            # WORTHY | AMBIGUOUS | ATTRIBUTE
-
-
-@dataclass
-class TriageResult:
-    ok: bool = False                 # False -> helper failed; agent extracts queries itself
-    repeat_order: bool = False       # asks to repeat the usual / last order (grounding hint only)
-    items: List[TriageItem] = field(default_factory=list)
-    elapsed_ms: float = 0.0
-
-    @property
-    def worthy(self) -> List[TriageItem]:
-        return [i for i in self.items if i.cls == TRIAGE_WORTHY]
-
-    @property
-    def ambiguous(self) -> List[TriageItem]:
-        return [i for i in self.items if i.cls == TRIAGE_AMBIGUOUS]
-
-    @property
-    def attributes(self) -> List[TriageItem]:
-        return [i for i in self.items if i.cls == TRIAGE_ATTRIBUTE]
-
-
-_TRIAGE_SYSTEM = """\
-Extraes los PRODUCTOS que el cliente quiere pedir de su mensaje. NO conversas: \
-devuelves SOLO un objeto JSON válido con esta forma:
-{"repetir_ultimo": false, "articulos": [{"mencion": "…", "consulta": "…", \
-"cantidad": 1, "clase": "WORTHY"}]}
-
-- "articulos": una entrada por producto que el cliente pide. [] si el mensaje \
-no pide productos (saludos, dudas, precios, cierre, charla… no son artículos).
-  - "mencion": el fragmento del cliente, con su cantidad si la dice.
-  - "consulta": términos de búsqueda cortos (producto + marca/atributo/medida). \
-Sin cantidades, sin verbos, sin la frase entera.
-  - "cantidad": el número pedido (1 si no lo dice).
-  - "clase":
-    · "WORTHY" = hay un PRODUCTO buscable: tipo/nombre con marca, medida, \
-atributo de línea o código (KG001399, 14-1127). Una marca sola ("gelfix") NO \
-es WORTHY.
-    · "AMBIGUOUS" = genérico: categoría sola ("una crema"), marca sola sin \
-producto, o algo demasiado vago para buscar sin ruido.
-    · "ATTRIBUTE" = solo un atributo/variante del producto del que ya se \
-hablaba ("el negro", "la grande", "la 2").
-- "repetir_ultimo": true solo si pide repetir su pedido habitual/anterior \
-("lo de siempre", "lo mismo que la última vez")."""
-
-_TRIAGE_USER = """\
-Historial reciente (solo contexto, NO lo clasifiques):
-{history}
-
-MENSAJE NUEVO DEL CLIENTE (extrae SOLO de esto):
-{message}
-
-Devuelve el JSON."""
-
-
-def _parse_triage_json(raw: str) -> Optional[TriageResult]:
-    """Strict-but-forgiving parse. On a long list the model may hit the token
-    cap and cut the JSON off mid-array; rather than lose the whole turn, we
-    salvage every COMPLETE object already emitted. None only when nothing
-    usable can be recovered."""
-    text = (raw or "").strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
-    start = text.find("{")
-    if start == -1:
+async def _chat_json(system: str, user: str, schema: Dict[str, Any], *,
+                     max_tokens: int, timeout: float, temperature: float,
+                     budget: _Budget, kind: str,
+                     fmt: Any = None) -> Optional[Dict[str, Any]]:
+    """Una llamada que devuelve JSON. `fmt` por defecto es el schema (cima
+    puede restringir con él); pasar fmt="json" fuerza el modo laxo, para
+    cuando el motor NO respeta el schema-dict y hay que apoyarse en el prompt.
+    None = fallo (HTTP o JSON ilegible)."""
+    if not budget.can():
+        logger.warning(f"[PIPE] presupuesto agotado; se omite {kind}")
         return None
-    data: Optional[dict] = None
-    end = text.rfind("}")
-    if end > start:
-        try:
-            data = json.loads(text[start:end + 1])
-        except Exception:
-            data = None
-    if not isinstance(data, dict):
-        # Truncated output: reconstruct the repeat flag and every complete
-        # {...} object already emitted inside the (unterminated) array.
-        data = {}
-        m = re.search(r'"repetir_ultimo"\s*:\s*(true|false)', text[start:])
-        if m:
-            data["repetir_ultimo"] = m.group(1) == "true"
-        head = text[start:]
-        arr = head.find('"articulos"')
-        objs: List[dict] = []
-        if arr != -1:
-            depth, obj_start = 0, -1
-            for i in range(arr, len(head)):
-                c = head[i]
-                if c == "{":
-                    if depth == 0:
-                        obj_start = i
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0 and obj_start != -1:
-                        try:
-                            objs.append(json.loads(head[obj_start:i + 1]))
-                        except Exception:
-                            pass
-                        obj_start = -1
-        data["articulos"] = objs
-        if not objs and "repetir_ultimo" not in data:
-            return None
-        logger.info(f"[TRIAGE] Recovered {len(objs)} items from truncated output.")
-    items: List[TriageItem] = []
-    for it in (data.get("articulos") or []):
-        if not isinstance(it, dict):
-            continue
-        query = str(it.get("consulta") or it.get("mencion") or "").strip()
-        if not query:
-            continue
-        cls = str(it.get("clase") or "").strip().upper()
-        if cls not in (TRIAGE_WORTHY, TRIAGE_AMBIGUOUS, TRIAGE_ATTRIBUTE):
-            # Unknown label from the 2B model: judge by shape — codes are
-            # always worthy; otherwise be conservative and ask.
-            cls = TRIAGE_WORTHY if _code_shaped(query) else TRIAGE_AMBIGUOUS
-        items.append(TriageItem(
-            mention=str(it.get("mencion") or query).strip()[:120],
-            query=query[:120],
-            qty=_sane_qty(it.get("cantidad")),
-            cls=cls,
-        ))
-    return TriageResult(
-        ok=True,
-        repeat_order=bool(data.get("repetir_ultimo")),
-        items=items[:24],
-    )
-
-
-async def run_triage(current_message: str, recent_history: str) -> TriageResult:
-    """Pass 1. Never raises: any failure returns TriageResult(ok=False) and
-    the agent-loop gates fall back to the conservative heuristics."""
-    msg = _cap_middle((current_message or "").strip(), TRIAGE_MSG_MAX_CHARS)
-    if not msg:
-        return TriageResult(ok=True)   # nothing to classify; not a failure
-    hist = _tail_lines_to_fit(recent_history or "", TRIAGE_HISTORY_MAX_CHARS) or "(sin historial)"
-    messages = [
-        Message(role="system", content=_TRIAGE_SYSTEM),
-        Message(role="user", content=_TRIAGE_USER.format(history=hist, message=msg)),
-    ]
-    t0 = time.perf_counter()
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL, messages,
-            fmt="json",
-            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0,
-                     "num_predict": TRIAGE_MAX_TOKENS},
-            timeout=TRIAGE_TIMEOUT_S,
-        )
-    except Exception as e:
-        logger.warning(f"[TRIAGE] Helper call failed ({e}); falling back to heuristics.")
-        return TriageResult(ok=False, elapsed_ms=(time.perf_counter() - t0) * 1000)
-    parsed = _parse_triage_json(resp.content)
-    elapsed = (time.perf_counter() - t0) * 1000
-    if parsed is None:
-        logger.warning(f"[TRIAGE] Unparseable helper output ({resp.content[:120]!r}); "
-                       "falling back to heuristics.")
-        return TriageResult(ok=False, elapsed_ms=elapsed)
-    parsed.elapsed_ms = elapsed
-    logger.info(f"[TRIAGE] ok in {elapsed:.0f}ms: repetir={parsed.repeat_order} "
-                f"worthy={[i.query for i in parsed.worthy]} "
-                f"ambiguous={[i.query for i in parsed.ambiguous]} "
-                f"attribute={[i.query for i in parsed.attributes]}")
-    return parsed
-
-
-def _classify_query(query: str, triage: TriageResult) -> Optional[str]:
-    """Match an agent-emitted search query against the Pass-1 items by token
-    overlap; return that item's class, or None when the triage didn't cover
-    it (agent-derived from history, or helper unavailable)."""
-    if not triage.ok or not triage.items:
-        return None
-    q_tokens = set(_query_tokens(query))
-    if not q_tokens:
-        return None
-    best_cls, best_score = None, 0.0
-    for item in triage.items:
-        i_tokens = set(_query_tokens(item.query)) | set(_query_tokens(item.mention))
-        if not i_tokens:
-            continue
-        inter = q_tokens & i_tokens
-        if not inter:
-            continue
-        score = len(inter) / min(len(q_tokens), len(i_tokens))
-        if score > best_score:
-            best_score, best_cls = score, item.cls
-    return best_cls if best_score >= 0.5 else None
-
-
-def _triage_qty(query: str, triage: TriageResult) -> int:
-    """Quantity the client attached to the triage item this query matches."""
-    q_tokens = set(_query_tokens(query))
-    for item in triage.items:
-        i_tokens = set(_query_tokens(item.query)) | set(_query_tokens(item.mention))
-        if q_tokens and i_tokens and len(q_tokens & i_tokens) / min(len(q_tokens), len(i_tokens)) >= 0.5:
-            return item.qty
-    return 1
-
-
-def _same_item(a: str, b: str) -> bool:
-    """Two query strings that talk about the same product (token overlap)."""
-    ta, tb = set(_query_tokens(a)), set(_query_tokens(b))
-    if not ta or not tb:
-        return a.strip().lower() == b.strip().lower()
-    return len(ta & tb) / min(len(ta), len(tb)) >= 0.5
-
-
-def _triage_block(triage: TriageResult) -> str:
-    """Pass-1 product extraction injected into Kapa's context — search guidance
-    only. All intent handling (greet, close, refer, handoff, small talk) is the
-    model's job now, driven by the brief system prompt and its tools."""
-    if not triage.ok or (not triage.items and not triage.repeat_order):
-        return ""
-    lines: List[str] = ["### PRODUCTOS DETECTADOS EN EL MENSAJE (análisis interno; el cliente NO lo ve)"]
-    if triage.worthy:
-        lines.append("- Concretos, BUSCA YA con search_products (una consulta por artículo): " +
-                     "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.worthy))
-    if triage.ambiguous:
-        lines.append("- Genéricos o solo marca, NO los busques: " +
-                     "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.ambiguous) +
-                     ". Resume lo que entendiste y pide el producto concreto o el código.")
-    if triage.attributes:
-        lines.append("- Variantes del producto en curso (búscalas COMBINADAS con el producto "
-                     "del que hablabais): " +
-                     "; ".join(f'"{i.query}" (x{i.qty})' for i in triage.attributes))
-    if triage.repeat_order:
-        lines.append("- Pide REPETIR su pedido habitual: usa el 'Último pedido ENVIADO' del "
-                     "contexto como base (add_item con esos códigos).")
-    lines.append("")
-    return "\n".join(lines)
-
-
-# --------------------------------------- helper: mid-loop query gate (0.0)
-# The agent invents queries MID-LOOP (from history, from tool results) that
-# Pass-1 never saw. Their searchability is judged by this second isolated
-# helper — again a model at temperature 0.0, not a noun list. Failure mode is
-# PERMISSIVE: an unjudged query runs, and the result triage (_query_verdict /
-# uncovered-token honesty) absorbs any noise it returns.
-
-_QUERY_GATE_SYSTEM = """\
-Eres un clasificador determinista de consultas de búsqueda para un catálogo \
-de miles de productos de cosmética. NO conversas: devuelves SOLO un objeto \
-JSON, con esta forma exacta:
-{"veredictos": [{"consulta": "…", "clase": "SEARCHABLE"}]}
-Repite cada consulta EXACTAMENTE como te llega, una entrada por consulta.
-
-CLASES:
-- "SEARCHABLE": nombra un PRODUCTO concreto (tipo de producto o su nombre \
-distintivo), a veces con marca/línea/medida, o un código: "crema kerapro", \
-"delineador katai", "mascarilla antiedad 8gr", "14-1127". La clave es que hay \
-un PRODUCTO, no solo una marca o una categoría.
-- "GENERIC": NO identifica un producto: solo una categoría ("crema", \
-"esmaltes", "champú"), solo una MARCA sin producto ("gelfix", "lamel", "de \
-nivea"), preguntar qué hay de una marca o en general ("qué productos tienes", \
-"qué tienes de gelfix", "el catálogo"), o palabras vacías ("algo barato"). \
-Buscar esto devolvería cientos de resultados o ninguno útil: hay que pedir al \
-cliente el producto o el código.
-- "ATTRIBUTE": solo un atributo o variante — color, tamaño, acabado, número \
-— que depende del producto del que se venía hablando ("negro", "el mate", \
-"la grande", "la 2")."""
-
-
-async def run_query_gate(queries: List[str]) -> Dict[str, str]:
-    """Classify ad-hoc agent queries not covered by Pass-1.
-    -> {query.lower(): SEARCHABLE|GENERIC|ATTRIBUTE}. {} on any failure —
-    the gate then stays permissive (run the search; result triage copes)."""
-    qs = [q for q in dict.fromkeys((x or "").strip() for x in queries) if q]
-    if not qs:
-        return {}
-    payload = json.dumps({"consultas": qs}, ensure_ascii=False)
+    t0 = time.monotonic()
+    ok = False
     try:
         resp = await asyncio.to_thread(
             _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_QUERY_GATE_SYSTEM),
-             Message(role="user", content=payload)],
-            fmt="json",
-            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0,
-                     "num_predict": TRIAGE_MAX_TOKENS},
-            timeout=TRIAGE_TIMEOUT_S,
-        )
-        text = (resp.content or "").strip()
-        start, end = text.find("{"), text.rfind("}")
-        data = json.loads(text[start:end + 1]) if start != -1 and end > start else {}
+            [Message(role="system", content=system),
+             Message(role="user", content=user)],
+            options={"temperature": temperature, "num_predict": max_tokens},
+            fmt=(fmt if fmt is not None else schema), timeout=timeout)
+        data = json.loads(resp.content or "{}")
+        ok = isinstance(data, dict)
+        return data if ok else None
     except Exception as e:
-        logger.warning(f"[QUERY_GATE] Helper failed ({e}); gate stays permissive.")
-        return {}
-    out: Dict[str, str] = {}
-    for v in (data.get("veredictos") or []):
-        if not isinstance(v, dict):
-            continue
-        q = str(v.get("consulta") or "").strip().lower()
-        c = str(v.get("clase") or "").strip().upper()
-        if q and c in ("SEARCHABLE", "GENERIC", "ATTRIBUTE"):
-            out[q] = c
-    logger.info(f"[QUERY_GATE] {out}")
-    return out
-
-
-# ----------------------------------------- helper: reply audit (0.0)
-# Two live-observed failure modes of the DRAFT reply, judged semantically
-# instead of by phrase regexes / keyword tuples:
-#   promete_busqueda   the text announces "voy a mirar / un momento" without
-#                      having called search_products -> the client waits forever.
-#   invita_correccion  media-derived proposals must own their fallibility and
-#                      invite correction (detail, brand, or the product code).
-# Failure mode is PERMISSIVE: if the audit is unavailable the guards are
-# skipped — a missed style nudge degrades polish, never state or safety.
-
-_AUDIT_SYSTEM = """\
-Eres un auditor determinista de borradores de respuesta de un asistente de \
-pedidos por WhatsApp. NO conversas: devuelves SOLO un objeto JSON:
-{"promete_busqueda": false, "invita_correccion": false}
-
-- "promete_busqueda": true si el texto ANUNCIA que va a buscar, mirar, \
-revisar o comprobar algo, o pide al cliente esperar un momento, en lugar de \
-dar ya el resultado.
-- "invita_correccion": true si el texto reconoce de algún modo que puede \
-haber leído o entendido mal (una imagen, un audio, una búsqueda) e invita \
-al cliente a corregir o confirmar con más detalle, la marca o el código de \
-producto."""
-
-
-async def run_reply_audit(reply: str) -> Optional[Dict[str, bool]]:
-    """-> {"promete_busqueda": bool, "invita_correccion": bool} | None."""
-    if not (reply or "").strip():
+        logger.warning(f"[PIPE] {kind} falló: {e}")
         return None
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_AUDIT_SYSTEM),
-             Message(role="user", content=f"BORRADOR:\n{reply[:1200]}\n\nDevuelve el JSON.")],
-            fmt="json",
-            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0, "num_predict": 80},
-            timeout=TRIAGE_TIMEOUT_S,
-        )
-        text = (resp.content or "").strip()
-        start, end = text.find("{"), text.rfind("}")
-        data = json.loads(text[start:end + 1]) if start != -1 and end > start else None
-    except Exception as e:
-        logger.warning(f"[REPLY_AUDIT] Helper failed ({e}); guards skipped this turn.")
-        return None
-    if not isinstance(data, dict):
-        return None
-    return {"promete_busqueda": bool(data.get("promete_busqueda")),
-            "invita_correccion": bool(data.get("invita_correccion"))}
+    finally:
+        ms = int((time.monotonic() - t0) * 1000)
+        budget.spend(kind, ms, ok)
+        logger.info(f"[PIPE] {kind} {'ok' if ok else 'FAIL'} in {ms}ms "
+                    f"({budget.used}/{budget.limit})")
 
 
-# ------------------------------------------- helper: open-items reconcile (0.0)
-# The thread breaks when nothing reconciles the RUNNING order against the new
-# client message: items the client abandons ("olvida los delineadores") linger
-# in the queue and get re-asked every turn, and a "sí / apunta 4" confirmation
-# of an already-located item isn't recognised as a commit. Observed live: the
-# bot kept re-surfacing forgotten items and asked "¿te apunto?" for an item it
-# had just said was apuntado. This isolated 0.0 pass reads the running queue +
-# the new message and returns, per queued item, what the CLIENT decided —
-# drop, confirm (with quantity), or leave pending. No keyword matching for
-# "olvida/quita/sí": the model reads intent; code only applies the verdict.
+# ------------------------------------------------------------ Etapa 1: prompt
+# D9: ningún literal con forma de código de producto en el texto de
+# instrucción ni en los ejemplos. Los códigos que aparezcan en el bloque de
+# CONTEXTO (carrito/opciones) son DATOS recuperados, no ejemplos.
+_EXTRACT_SYSTEM = """Eres el intérprete de mensajes de Kapa, un asistente que SOLO monta pedidos de cosmética profesional por WhatsApp mientras el comercial no está. Tu única tarea: convertir el mensaje del cliente en una lista de actos JSON. No respondes al cliente, no eliges productos, no calculas.
 
-_RECONCILE_SYSTEM = """\
-Eres un ayudante determinista que actualiza el estado de un pedido según el \
-ÚLTIMO mensaje del cliente. NO conversas: devuelves SOLO un objeto JSON:
-{"descartar": ["pedido…"], "confirmar": [{"pedido": "…", "codigo": "…", \
-"cantidad": 1}]}
+FRONTERA — decide primero de qué lado cae cada intención:
+· LO QUE KAPA ATIENDE (todo lo de montar el pedido): añadir productos, cambiar cantidades, quitar líneas, elegir/rechazar opciones, LEER el pedido actual, repetir un pedido anterior, cerrar el pedido. Esto se mapea a los tipos pedir/modificar/elegir/rechazar/confirmar/cerrar/repetir_ultimo/cantidad_global y a otro(estado_pedido). El estado del pedido lo sabe Kapa: NUNCA se deriva.
+· LO QUE KAPA DERIVA AL COMERCIAL (no lo puede atender): precios, descuentos, ofertas, stock/disponibilidad, plazos de entrega, envíos, facturas, pagos → otro(precio_stock_factura). Detalles o especificaciones del producto (ingredientes, uso, tono exacto, para qué sirve) → otro(especificacion). Quejas, reclamaciones, devoluciones → otro(queja). Cualquier otra cosa que no sea montar un pedido → otro(fuera_ambito).
+· LO QUE HACE QUE KAPA CALLE Y AVISE AL COMERCIAL: el cliente exige hablar con el comercial o está enfadado → otro(escalada). No quiere hablar con un asistente → otro(rechazo_bot).
+Ante la duda entre atender y derivar: si es sobre QUÉ productos van en el pedido, es de Kapa; si es sobre condiciones, detalles, dinero o problemas, es del comercial.
 
-Te doy la lista de artículos EN CURSO (cada uno con su "pedido", su "estado" \
-y, si ya está localizado, su "codigo") y el mensaje nuevo del cliente.
+TIPOS de acto:
+- pedir: el cliente quiere un artículo. producto_texto = sus palabras. Si dijo un número de unidades EN ESA LÍNEA: cantidad_modo="total", cantidad_valor=ese número. Si no dijo número: cantidad_modo="sin_cambio".
+- modificar: cambia una línea que ya está en EL PEDIDO ACTUAL. objetivo_texto = cómo la nombra. cantidad_modo: "total" (pon N / N en vez de M / deja N / que queden N), "incremento" (añade/suma N más), "decremento" (quita/resta N), "eliminar" (quita la línea / ya no lo quiero / bórralo).
+- elegir: responde a una pregunta pendiente indicando cuál quiere (por descripción, por código o con un número si la pregunta era de cantidades). objetivo_texto = sus palabras.
+- rechazar: dice que las opciones ofrecidas NO son lo que busca pero SIGUE queriendo el artículo ("ese no es", "ninguno de esos"). objetivo_texto = el artículo si lo nombra, si no vacío.
+- confirmar: respuesta afirmativa a la última pregunta del asistente ("sí", "vale", "ok", "perfecto", "eso es"). OJO: "apunta"/"ponme"/"anota" seguido de productos NO es confirmar, es parte de pedir.
+- cerrar: da el pedido por terminado y quiere enviarlo ("eso es todo", "mándalo", "confírmame el pedido", "ciérralo").
+- repetir_ultimo: pide lo mismo que el último pedido. Si dice "N de cada": cantidad_modo="total", cantidad_valor=N.
+- cantidad_global: una frase suelta que fija N unidades para todo lo anterior ("6 de cada uno", "todo a 6"). valor=N.
+- otro: nada de lo anterior. subtipo según la FRONTERA de arriba: estado_pedido | precio_stock_factura | especificacion | queja | fuera_ambito | escalada | rechazo_bot | saludo | despedida | agradecimiento | pregunta_bot (pregunta qué eres).
 
-- "descartar": los "pedido" que el cliente ya NO quiere — dice que los olvides, \
-los quita, los cancela, o cambia de idea sobre ellos. Copia el texto del \
-"pedido" tal cual.
-- "confirmar": los artículos YA localizados (estado "propuesto" o con \
-"codigo") que el cliente ACABA de aprobar en este mensaje ("sí", "apunta esos", \
-"ponme 4 de ese"). Incluye su "codigo" y la "cantidad" que diga el cliente \
-(si no dice número, usa 1). NO confirmes nada que el cliente no haya aprobado.
-- Si el cliente no descarta ni confirma nada, devuelve listas vacías.
-- No inventes pedidos ni códigos que no estén en la lista que te doy."""
+REGLAS:
+1. Un acto por intención; un mensaje puede tener varios actos.
+2. evidencia = el fragmento LITERAL del mensaje del que sale el acto. Cópialo tal cual.
+3. cantidad_valor SOLO puede ser un número que el cliente escribió. Nunca lo inventes ni lo calcules.
+4. Cada línea de una lista es su propio acto pedir, con SU cantidad. No mezcles cantidades entre líneas.
+5. "quita uno de X" es modificar decremento 1, NO eliminar. "quita X" (sin número) es eliminar.
+6. Si el mensaje nombra algo que aparece en PENDIENTES, suele ser elegir o rechazar, no pedir.
+7. LEE LA CONVERSACIÓN. Los mensajes cortos casi siempre se refieren a lo último que dijo el Asistente:
+   - "sí", "ese", "el segundo", "vale" tras una pregunta de opciones → elegir (objetivo_texto = lo que señala).
+   - un número suelto ("13") tras una pregunta de cantidades → elegir (objetivo_texto = ese número).
+   - "no, ese no", "ninguno" → rechazar.
+   - "quítame el otro", "agrégame 2 más" → modificar sobre la línea del PEDIDO ACTUAL a la que se refieren.
+   Sin la conversación no se pueden entender; úsala.
+8. No respondas nada fuera del JSON.
+9. "hablar": es false cuando el bot NO debe meterse. Dos casos: (a) charla no comercial suelta ("ok", "gracias", un comentario personal) que no responde a ninguna pregunta pendiente; (b) el cliente y el COMERCIAL ya están en una conversación que NO es de pedido —negociando precios, detalles del producto, una incidencia— y el mensaje continúa ESA charla (lo ves en el hilo: hay mensajes recientes del Comercial sobre el tema). En ese caso el bot no se interpone. Es true SIEMPRE que haya algún acto de pedido, una respuesta a una pregunta del asistente, o el cliente pida hablar con el comercial. Ante la duda, true.
+10. Si el cliente pide EXPLÍCITAMENTE hablar con el comercial ("que me llame", "quiero hablar con {comercial}", "pásame con una persona") -> otro(pide_comercial). Eso NO es silencio: el bot avisa al comercial.
 
-
-async def run_open_items_reconcile(
-    current_message: str, open_items: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """-> {"descartar": [pedido…], "confirmar": [{pedido, codigo, cantidad}]}
-    or None on any failure (callers then leave the queue untouched)."""
-    queue_view = [
-        {"pedido": i.get("pedido", ""), "estado": i.get("estado", ""),
-         "codigo": (i.get("opciones") or [{}])[0].get("codigo", "")}
-        for i in (open_items or []) if i.get("pedido")
-    ]
-    if not queue_view:
-        return None
-    payload = json.dumps({"articulos_en_curso": queue_view,
-                          "mensaje_cliente": (current_message or "")[:TRIAGE_MSG_MAX_CHARS]},
-                         ensure_ascii=False)
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_RECONCILE_SYSTEM),
-             Message(role="user", content=payload)],
-            fmt="json",
-            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0, "num_predict": TRIAGE_MAX_TOKENS},
-            timeout=TRIAGE_TIMEOUT_S,
-        )
-        text = (resp.content or "").strip()
-        start, end = text.find("{"), text.rfind("}")
-        data = json.loads(text[start:end + 1]) if start != -1 and end > start else None
-    except Exception as e:
-        logger.warning(f"[RECONCILE] Helper failed ({e}); queue left untouched.")
-        return None
-    if not isinstance(data, dict):
-        return None
-    descartar = [str(p).strip() for p in (data.get("descartar") or []) if str(p).strip()]
-    confirmar = []
-    for c in (data.get("confirmar") or []):
-        if isinstance(c, dict) and (c.get("codigo") or c.get("pedido")):
-            confirmar.append({"pedido": str(c.get("pedido") or "").strip(),
-                              "codigo": _sane_code(c.get("codigo")),
-                              "cantidad": _sane_qty(c.get("cantidad"))})
-    logger.info(f"[RECONCILE] descartar={descartar} confirmar={confirmar}")
-    return {"descartar": descartar, "confirmar": confirmar}
-#   _query_tokens   tokenizer used for FUZZY MATCHING (query <-> triage item,
-#                   query <-> pending-enrichment item, topic extraction). The
-#                   tiny stopword set only stabilises overlap ratios; it never
-#                   decides whether anything is searched, held, or escalated —
-#                   every semantic verdict comes from the 0.0-temperature
-#                   helpers (run_triage / run_query_gate / run_reply_audit).
-#   _code_shaped    a STRUCTURAL shape test (compact token containing a
-#                   digit), not vocabulary: a product code is a format, and
-#                   codes are always searchable — the exact-code path in RAG
-#                   is the judge of whether they exist.
-# Recovery ladder for held (needs-detail) items, unchanged and list-free:
-#   1. the model self-enriches from message/history context (one nudge),
-#   2. the client is asked for name/keywords/code (item queued as
-#      estado="enriquecer" so it is never lost),
-#   3. the client insists the product is really called just that ->
-#      the pending-enrichment bypass lets that exact query through.
-_QUERY_STOP = {"de", "la", "el", "los", "las", "un", "una", "unos", "unas",
-               "para", "por", "con", "y", "o", "del", "al", "en", "mi", "tu"}
+EJEMPLOS (los nombres son inventados):
+Mensaje: "ponme 12 del serum facial noche"
+actos: [pedir(producto_texto="serum facial noche", cantidad_modo="total", cantidad_valor=12, evidencia="ponme 12 del serum facial noche")]
+Mensaje: "quiero 3 de la mascara volumen"
+actos: [pedir(producto_texto="mascara volumen", cantidad_modo="total", cantidad_valor=3, evidencia="quiero 3 de la mascara volumen")]
+Mensaje: "ponme 6 de la crema de manos aloe y quita una del esmalte rojo, mejor dime tambien precios"
+actos: [pedir(producto_texto="crema de manos aloe", cantidad_modo="total", cantidad_valor=6, evidencia="ponme 6 de la crema de manos aloe"), modificar(objetivo_texto="el esmalte rojo", cantidad_modo="decremento", cantidad_valor=1, evidencia="quita una del esmalte rojo"), otro(subtipo="precio_stock_factura", evidencia="dime tambien precios")]
+Casi todo mensaje del cliente contiene al menos un acto. Devolver una lista vacía es casi siempre un error: si menciona un producto, es pedir."""
 
 
-def _query_tokens(q: str) -> List[str]:
-    norm = _strip_accents_lower(q)
-    return [t for t in re.split(r"[^a-z0-9ñ]+", norm)
-            if len(t) >= 3 and t not in _QUERY_STOP and not t.isdigit()]
-
-
-def _code_shaped(q: str) -> bool:
-    q = (q or "").strip()
-    return len(q) >= 4 and " " not in q and any(ch.isdigit() for ch in q)
-
-
-# ---------------------------------------------------------- multi-item triage
-# A client listing several products must be handled like a salesman with a
-# catalog: items whose top hit is unambiguous get confirmed in ONE line each;
-# exactly ONE doubtful item gets its options asked about; the rest wait in an
-# explicit queue that persists across turns (open_items). Without this, an
-# 8-product message produced a 24-line hit dump — technically complete,
-# humanly useless. The LLM only phrases the digest; code decides it.
-
-_MATCH_SYSTEM = """\
-Decides, para cada producto que pidió el cliente, qué candidatos del catálogo \
-son de verdad ESE producto. NO conversas: devuelves SOLO JSON:
-{"resultados": [{"pedido": "…", "codigos": ["…"]}]}
-
-Para cada "pedido" te doy candidatos del catálogo (código, nombre, marca). En \
-"codigos" pon los códigos de los candidatos que SON ese producto (mismo tipo, \
-marca y variante que pidió el cliente), del más probable al menos probable:
-- Si uno coincide claramente, pon solo ese.
-- Si varios encajan y no puedes distinguirlos con lo que dijo el cliente, \
-ponlos todos (para que el cliente elija).
-- Si NINGÚN candidato es ese producto, "codigos": [].
-Usa SOLO códigos de los candidatos que te doy; nunca inventes. Un nombre \
-parecido pero de otra variante/producto NO coincide."""
-
-
-async def run_match(items: List[Dict[str, Any]]) -> Optional[Dict[str, List[str]]]:
-    """One simple 0.0 call that replaces brittle score thresholds: given each
-    request and its catalog candidates, return which candidate codes genuinely
-    match. -> {pedido: [codigo…ranked]} or None on failure (callers then fall
-    back to the score-based verdict, staying permissive)."""
-    payload_items = [it for it in items if it.get("candidatos")]
-    if not payload_items:
-        return None
-    payload = json.dumps({"items": payload_items}, ensure_ascii=False)
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_MATCH_SYSTEM),
-             Message(role="user", content=_cap_middle(payload, max(MAX_RESULTS_CHARS, 6000)))],
-            fmt="json",
-            options={"temperature": TRIAGE_TEMPERATURE, "top_p": 1.0, "num_predict": TRIAGE_MAX_TOKENS},
-            timeout=TRIAGE_TIMEOUT_S,
-        )
-        text = (resp.content or "").strip()
-        start, end = text.find("{"), text.rfind("}")
-        data = json.loads(text[start:end + 1]) if start != -1 and end > start else None
-    except Exception as e:
-        logger.warning(f"[MATCH] Helper failed ({e}); falling back to score verdicts.")
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Hallucination guard: the model may echo a "pedido" that wasn't asked
-    # (it invented KG001399 -> SL034256P live) or a code that wasn't among the
-    # candidates. Accept only requested pedidos and only their own candidates.
-    valid_pedidos = {str(it.get("pedido")): {_sane_code(c.get("codigo"))
-                                             for c in (it.get("candidatos") or [])}
-                     for it in payload_items}
-    out: Dict[str, List[str]] = {}
-    for r in (data.get("resultados") or []):
-        if not (isinstance(r, dict) and r.get("pedido") is not None):
-            continue
-        ped = str(r["pedido"])
-        if ped not in valid_pedidos:
-            logger.info(f"[MATCH] Ignored hallucinated pedido {ped!r} (not in input).")
-            continue
-        allowed = valid_pedidos[ped]
-        codes = [_sane_code(c) for c in (r.get("codigos") or [])
-                 if _sane_code(c) and _sane_code(c) in allowed]
-        prev = out.setdefault(ped, [])
-        for c in codes:
-            if c not in prev:
-                prev.append(c)
-    logger.info(f"[MATCH] {out}")
-    return out
-
-
-def _query_verdict(hits: List[Dict[str, Any]]) -> str:
-    """resolved -> note it; leading -> pick it and mention the alternative in
-    passing; ambiguous -> the ONE question this turn; none -> ask for detail.
-    The 'leading' tier is what keeps a long list from feeling like an
-    interrogation: a salesman assumes the obvious and offers an escape hatch
-    ("te pongo el de 100ml; si era el litro, dime") instead of asking."""
-    if not hits:
-        return "none"
-    if len(hits) == 1:
-        return "resolved"
-    full = [h for h in hits if h.get("covers_query")]
-    if len(full) == 1:
-        return "resolved"       # one candidate matches every word the client used
-    s0 = float(hits[0].get("relevance_score", 0.0))
-    s1 = float(hits[1].get("relevance_score", 0.0))
-    if s0 >= 2.0:
-        return "resolved"       # exact-code short-circuit
-    if s1 > 0 and s0 / s1 >= 1.5:
-        return "leading"        # clear favorite: assume it, mention the runner-up
-    return "ambiguous"
-
-
-def _hit_line(h: Dict[str, Any]) -> Dict[str, str]:
-    return {"codigo": str(h.get("CodigoArticulo") or ""),
-            "nombre": str(h.get("DescripcionArticulo") or "")[:80],
-            "marca": str(h.get("MarcaProducto") or "")}
-
-
-def _merge_variant_queries(results: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Collapse ONLY literal-duplicate queries (same product asked twice with
-    identical wording). We deliberately do NOT merge by result overlap anymore:
-    a catalog of near-identical names (15 'Ardell Pestañas Postizas … Negras'
-    variants) returns heavily overlapping noisy hits, and the old overlap merge
-    silently fused those DISTINCT products into a handful — dropping most of the
-    client's list. Distinct products stay distinct; the cart is keyed by code,
-    so any genuine duplicate resolution dedupes there harmlessly."""
-    merged: Dict[str, List[Dict[str, Any]]] = {}
-    norm_seen: Dict[str, str] = {}
-    for q, hits in results.items():
-        norm = re.sub(r"\s+", " ", _strip_accents_lower(q)).strip()
-        if norm in norm_seen:
-            target = norm_seen[norm]
-            have = {str(h.get("CodigoArticulo")) for h in merged[target]}
-            merged[target].extend(h for h in hits if str(h.get("CodigoArticulo")) not in have)
-        else:
-            merged[q] = list(hits)
-            norm_seen[norm] = q
-    return merged
-
-
-def _triage_results(results: Dict[str, List[Dict[str, Any]]],
-                    carried_queue: List[Dict[str, Any]],
-                    is_media: bool = False,
-                    held_count: int = 0,
-                    match_map: Optional[Dict[str, List[str]]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """-> (digest for the model, open_items to persist).
-
-    Digest keys are Spanish on purpose: the 2B model relays them naturally.
-    The instruccion_* strings are CONTEXTUAL guidance — they cost tokens only
-    on the turns that need them, keeping the static system prompt small.
-
-    Turn economy (the anti-interrogatory design):
-    - resolved  -> add NOW, confirm in one line; the close summary is the one
-                   explicit confirmation gate (everything revisable until then)
-    - leading   -> add the favorite, mention the runner-up as an escape hatch
-    - ambiguous -> at most ONE question per turn; the rest wait in the queue
-    - media turns switch every 'add' instruction to propose-and-confirm so
-      this never fights the hallucination containment."""
-    merged = _merge_variant_queries(results)
-    resolved, chosen, ambiguous, missing = [], [], [], []
-    honesty_needed = False
-    for q, hits in merged.items():
-        # A CODE the client typed must resolve to THAT code or to nothing — the
-        # search may fuzzy-return other codes (KG001399 -> SL034256P live), and
-        # substituting a different code is worse than admitting we didn't find
-        # it. Handled deterministically here; never sent to the match helper.
-        if _code_shaped(q):
-            exact = [h for h in hits
-                     if _sane_code(h.get("CodigoArticulo")).upper() == q.strip().upper()]
-            if exact:
-                resolved.append({"pedido": q, **_hit_line(exact[0])})
-            else:
-                missing.append(q)
-            continue
-        # Prefer the semantic MATCH verdict (which real catalog hits are this
-        # product) over brittle score thresholds. Reorder hits to the matched
-        # codes; fall back to the score-based verdict when the match helper
-        # didn't cover this query.
-        matched_codes = match_map.get(q) if match_map else None
-        if matched_codes is not None:
-            by_code = {_sane_code(h.get("CodigoArticulo")): h for h in hits}
-            matched_hits = [by_code[c] for c in matched_codes if c in by_code]
-            if not matched_hits:
-                missing.append(q)
-                continue
-            hits = matched_hits
-            verdict = "resolved" if len(matched_hits) == 1 else "ambiguous"
-            uncovered = []
-        else:
-            verdict = _query_verdict(hits)
-            uncovered = list(hits[0].get("query_uncovered") or []) if hits else []
-        if uncovered and verdict in ("resolved", "leading"):
-            # Something the client SAID ('nivea') is in none of the options:
-            # confidence would be fortune-telling. Demote to an honest ask —
-            # never auto-add a silent substitute.
-            verdict = "ambiguous"
-        if verdict == "resolved":
-            resolved.append({"pedido": q, **_hit_line(hits[0])})
-        elif verdict == "leading":
-            alt = _hit_line(hits[1])
-            chosen.append({"pedido": q, **_hit_line(hits[0]),
-                           "alternativa": f"{alt['codigo']} — {alt['nombre']}"})
-        elif verdict == "none":
-            missing.append(q)
-        else:
-            item: Dict[str, Any] = {"pedido": q, "opciones": [_hit_line(h) for h in hits[:3]]}
-            if uncovered:
-                item["sin_coincidencia"] = uncovered
-                honesty_needed = True
-            ambiguous.append(item)
-    # Previously queued items go first: the client is mid-list. Only items
-    # that still need a client decision (enrichment or option-choice) belong
-    # in the ask queue; carried "propuesto" grounding carriers are passed
-    # through untouched and never re-asked.
-    carried_ask = [i for i in carried_queue if i.get("estado") != "propuesto"]
-    carried_grounded = [i for i in carried_queue if i.get("estado") == "propuesto"]
-    queue = list(carried_ask) + ambiguous
-    # GROUNDING PERSISTENCE (breaks the re-propose loop): resolved/leading hits
-    # persist as estado="propuesto" so next turn's "sí" has a grounded code.
-    grounded_proposals = carried_grounded + [
-        {"pedido": r["pedido"], "estado": "propuesto",
-         "opciones": [{"codigo": r["codigo"], "nombre": r.get("nombre", "")}]}
-        for r in resolved + chosen if r.get("codigo")
-    ]
-    persist = queue + grounded_proposals
-
-    digest: Dict[str, Any] = {}
-    n_items = len(resolved) + len(chosen) + len(queue) + len(missing)
-    if n_items > 1:
-        digest["instruccion_general"] = (
-            "empieza reconociendo el pedido COMPLETO en una frase natural (qué tienes "
-            "claro, qué tiene opciones, a qué le faltan datos) y luego desarrolla; "
-            "una sola pregunta")
-    # ALWAYS commit / propose the FULL matches — never make the client hunt for
-    # products the search already pinned down.
-    if resolved:
-        digest["identificados_seguros"] = resolved
-        digest["instruccion_identificados"] = (
-            "propónlos en una línea cada uno y espera el sí del cliente" if is_media else
-            "apúntalos YA con add_item (cantidad que dijo el cliente; si no dijo, 1) y "
-            "dilo en una línea cada uno; todo es revisable hasta el cierre")
-    if chosen:
-        digest["elegidos_probables"] = chosen
-        digest["instruccion_elegidos"] = (
-            "propón el elegido mencionando la alternativa y espera el sí" if is_media else
-            "apúntalos YA con add_item y di de pasada que has elegido ese "
-            "(ej.: 'te pongo X; si preferías la alternativa, me dices')")
-
-    # The UNRESOLVED set (needs the client): ambiguous options + not-found +
-    # generic-held. How we present it scales with how many there are — the
-    # count is the only threshold (the WHAT-matched decision was the run_match
-    # AI call). >2 unresolved would make a tedious "pick one for each" wall, so
-    # collapse it into a single ask for names/codes; <=2 stays helpful and
-    # concrete (options / mention). Full matches above are committed either way.
-    unresolved_names = [i["pedido"] for i in ambiguous] + list(missing)
-    n_unresolved = len(ambiguous) + len(missing) + max(0, held_count)
-    if n_unresolved > 2:
-        digest["no_encontrados"] = unresolved_names
-        digest["instruccion_no_encontrados"] = (
-            "Son varios los que NO has podido identificar con seguridad. NO listes opciones "
-            "de cada uno (sería un mensaje larguísimo): di en UNA frase, natural, cuáles no "
-            "has localizado y pídele esos por nombre completo o código de producto. Recuerda "
-            "que el código es lo más rápido y seguro.")
-        # Persist the unresolved as enrichment items so that when the client
-        # sends names/codes next turn, reconcile/search can match them — but do
-        # NOT surface per-item options now.
-        for it in ambiguous:
-            if not any(_same_item(it["pedido"], q.get("pedido", "")) for q in queue if q is not it):
-                it["estado"] = "enriquecer"
+def _contexto_extraccion(estado: Estado, mensaje: str, *,
+                         resumen: str = "", hilo: str = "") -> str:
+    partes: List[str] = []
+    if resumen.strip():
+        partes.append("RESUMEN DE LA CONVERSACIÓN:")
+        partes.append(resumen.strip())
+    if hilo.strip():
+        partes.append("CONVERSACIÓN RECIENTE (Cliente / Comercial / Asistente):")
+        partes.append(hilo.strip())
+    if estado.cart:
+        partes.append("PEDIDO ACTUAL:")
+        for i, l in enumerate(estado.cart, 1):
+            partes.append(f"{i}. {l.get('name') or l['code']} x{l['qty']} ({l['code']})")
     else:
-        # <=2 unresolved: the concrete, helpful per-item behavior.
-        ask_now = queue[0] if queue else None
-        remaining = queue[1:]
-        if ask_now:
-            digest["pregunta_ahora"] = ask_now
-            digest["instruccion_pregunta"] = ("ofrece SOLO estas opciones numeradas, pide que elija "
-                                              "y varía la forma de preguntar; si dice que ninguna "
-                                              "vale, pide nombre exacto o código de producto, apúntalo en note "
-                                              "y NO vuelvas a ofrecer esas")
-        if remaining:
-            digest["en_cola"] = [i["pedido"] for i in remaining]
-            digest["instruccion_cola"] = ("di brevemente que los verás uno a uno" +
-                                          ("; si te da códigos o marcas de esos, mejor"
-                                           if len(remaining) > 1 else ""))
-        if honesty_needed:
-            digest["instruccion_honestidad"] = (
-                'si un artículo trae "sin_coincidencia", di CLARO que ninguna opción tiene eso; '
-                "que elija una igualmente, dé el código de producto, o se lo deja al comercial")
-        if missing:
-            digest["sin_resultados"] = missing
-            digest["instruccion_sin_resultados"] = "pide marca, más detalle o el código de producto"
-    # dedupe persisted items by (estado, first-code/pedido) so a code that is
-    # both freshly resolved and already carried doesn't double up.
-    seen: set = set()
-    deduped: List[Dict[str, Any]] = []
-    for it in persist:
-        first = (it.get("opciones") or [{}])[0].get("codigo") or it.get("pedido") or ""
-        key = (it.get("estado"), _sane_code(first) or first.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    return digest, deduped
+        partes.append("PEDIDO ACTUAL: vacío")
+    pend: List[str] = []
+    for it in estado.open_items:
+        t = it.get("tipo")
+        if t == "producto":
+            ops = ", ".join(f"{o.get('name')} ({o.get('code')})"
+                            for o in it.get("opciones") or []) or "sin opciones aún"
+            q = f", cantidad dicha: {it['qty']}" if it.get("qty") else ""
+            pend.append(f"- \"{it.get('texto')}\"{q} → opciones: {ops}")
+        elif t == "conflicto_cantidad":
+            pend.append(f"- {it.get('name')} ({it.get('code')}): cantidades posibles "
+                        f"{it.get('opciones_qty')}")
+        else:
+            pend.append(f"- pregunta sí/no pendiente: {t.replace('propuesta_', '')}")
+    partes.append("PENDIENTES:" if pend else "PENDIENTES: ninguno")
+    partes.extend(pend)
+    partes.append("MENSAJE DEL CLIENTE:")
+    partes.append(mensaje[:MSG_MAX_CHARS])
+    return "\n".join(partes)
 
 
-def _internal(text: str) -> str:
-    """Wrap loop nudges: instructions, not client messages. The system prompt
-    teaches the model to follow these without quoting or apologizing."""
-    return f"[INSTRUCCIÓN INTERNA — el cliente NO ha escrito esto] {text}"
+# Formato de salida escrito para el modo laxo (cuando el schema no restringe).
+_EXTRACT_FORMATO = (
+    '\n\nResponde SOLO con este JSON, sin texto alrededor. "actos" es SIEMPRE '
+    'una lista (aunque haya un solo acto). "hablar" es true si el bot debe '
+    'responder este turno, false si NO hace falta responder (ver regla 9):\n'
+    '{"hablar": true, "actos": [{"tipo": "pedir", "producto_texto": "...", '
+    '"cantidad_modo": "total", "cantidad_valor": 0, "evidencia": "..."}]}')
 
 
-def _sane_code(code: Any) -> str:
-    return str(code or "").strip()[:64]
+async def _extraer(estado: Estado, mensaje: str, budget: _Budget, *,
+                   resumen: str = "", hilo: str = "") -> Tuple[Optional[List[Acto]], bool]:
+    # COMPRENDER: única llamada que ve la CONVERSACIÓN (resumen + hilo con
+    # roles). Devuelve (actos, hablar). Modo laxo porque cima ignora el schema.
+    user = _contexto_extraccion(estado, mensaje, resumen=resumen, hilo=hilo) + _EXTRACT_FORMATO
+    data = await _chat_json(_EXTRACT_SYSTEM, user, ACTOS_SCHEMA,
+                            max_tokens=EXTRACT_MAX_TOKENS, timeout=EXTRACT_TIMEOUT_S,
+                            temperature=0.0, budget=budget, kind="extract", fmt="json")
+    if data is None:
+        return None, True                      # fallo -> por defecto, hablar
+    hablar = bool(data.get("hablar", True)) if isinstance(data, dict) else True
+    actos = validar_actos(parse_actos(data), mensaje)
+    if actos:
+        logger.info("[PIPE] actos: " + "; ".join(a.as_log() for a in actos))
+    else:
+        logger.info(f"[PIPE] actos vacíos; crudo={json.dumps(data)[:300]}")
+    return actos, hablar
 
 
-def _sane_qty(qty: Any) -> int:
+# ------------------------------------------------------------ Etapa 2: match
+_MATCH_SYSTEM = """Eres el seleccionador de productos de un asistente de pedidos. Para cada item te doy lo que escribió el cliente y una lista numerada de candidatos del catálogo. Decide por item:
+- "unico" + indice: exactamente UN candidato es claramente lo que pide.
+- "varios": más de uno podría serlo (ante la duda, elige esto).
+- "ninguno": ninguno encaja con lo que pide.
+Los índices empiezan en 0. No inventes índices fuera de la lista.
+Responde SOLO con este JSON (una entrada por item):
+{"items": [{"item": 0, "veredicto": "unico", "indice": 2}]}"""
+
+
+def _match_user(payload: List[Dict[str, Any]]) -> str:
+    partes = []
+    for it in payload:
+        partes.append(f"ITEM {it['i']}: cliente escribió \"{it['texto']}\"")
+        for j, name in enumerate(it["opciones"]):
+            partes.append(f"  {j}. {name}")
+    return "\n".join(partes)
+
+
+# --------------------------------------------------------- Etapa 4: rewrite
+_REWRITE_SYSTEM = """Reescribe este mensaje de WhatsApp de un asistente de pedidos para que suene natural, cercano y profesional en español.
+REGLAS ESTRICTAS:
+- Toda línea que contenga un número o un código entre paréntesis debe aparecer EXACTAMENTE igual, sin cambiar ni una cifra ni una letra.
+- No añadas información, productos, números ni promesas. No hables de precios ni plazos.
+- Sin markdown, sin viñetas, sin asteriscos.
+- Conserva la firma final tal cual.
+Devuelve solo el mensaje reescrito."""
+
+
+async def _reescribir(plantilla: str, budget: _Budget, *, hilo: str = "") -> str:
+    if not REWRITE_ON or not budget.can() or not plantilla.strip():
+        return plantilla
+    congeladas = lineas_congeladas(plantilla)
+    partes = []
+    if hilo.strip():
+        partes.append("CONVERSACIÓN (para el tono y la continuidad, no la repitas):")
+        partes.append("\n".join(hilo.strip().splitlines()[-6:]))
+        partes.append("")
+    partes.append("MENSAJE A REESCRIBIR:")
+    partes.append(plantilla)
+    if congeladas:
+        partes.append("\nLINEAS BLOQUEADAS (copiar tal cual, sin cambiar nada):")
+        partes.extend(congeladas)
+    user = "\n".join(partes)
+    t0 = time.monotonic()
+    ok = False
     try:
-        return max(1, min(int(qty), 9999))
-    except Exception:
-        return 1
+        resp = await asyncio.to_thread(
+            _get_client().chat, CIMA_MODEL,
+            [Message(role="system", content=_REWRITE_SYSTEM),
+             Message(role="user", content=user)],
+            options={"temperature": 0.4, "num_predict": REWRITE_MAX_TOKENS},
+            timeout=REWRITE_TIMEOUT_S)
+        candidato = (resp.content or "").strip()
+        valido, motivo = validar_reescritura(plantilla, candidato)
+        ok = True
+        if valido:
+            return candidato
+        logger.info(f"[PIPE] reescritura descartada ({motivo}); sale la plantilla")
+        return plantilla
+    except Exception as e:
+        logger.warning(f"[PIPE] reescritura falló: {e}")
+        return plantilla
+    finally:
+        budget.spend("rewrite", int((time.monotonic() - t0) * 1000), ok)
 
 
-def _has_explicit_qty(qty: Any) -> bool:
-    """True only when the model actually supplied a usable quantity. A missing/
-    null/non-numeric qty on a re-add must NOT overwrite a real cart quantity."""
-    if qty is None:
-        return False
+_SUMMARY_SYSTEM = """Mantienes un resumen breve de UNA conversación de pedido entre un cliente y el asistente Kapa. Te doy el resumen anterior y los mensajes nuevos; devuelve el resumen ACTUALIZADO.
+Incluye solo: qué productos se han pedido y confirmado, qué quedó pendiente o por aclarar, y el tono/contexto útil del cliente. NO inventes. NO hables de pedidos pasados de otras conversaciones. Máximo 6 líneas. Devuelve solo el texto del resumen."""
+
+
+def _estimar_tokens(texto: str) -> int:
+    return len(texto) // 4     # aproximación barata (1 tok ~ 4 chars en ES)
+
+
+async def _compactar_resumen(resumen: str, hilo: str, budget: _Budget) -> str:
+    """§3.6: dispara cuando resumen+hilo pasan el 60% de la ventana. Rehace el
+    resumen desde (resumen anterior + mensajes nuevos). Llamada de
+    MANTENIMIENTO, fuera del presupuesto del turno."""
+    umbral = int(CIMA_CTX_WINDOW * 0.60)
+    if _estimar_tokens(resumen + hilo) < umbral:
+        return resumen
+    user = (f"RESUMEN ANTERIOR:\n{resumen or '(ninguno)'}\n\n"
+            f"MENSAJES NUEVOS:\n{hilo}")
+    t0 = time.monotonic()
     try:
-        int(qty)
-        return True
-    except Exception:
-        return False
+        resp = await asyncio.to_thread(
+            _get_client().chat, CIMA_MODEL,
+            [Message(role="system", content=_SUMMARY_SYSTEM),
+             Message(role="user", content=user)],
+            options={"temperature": 0.2, "num_predict": 400},
+            timeout=REWRITE_TIMEOUT_S)
+        nuevo = (resp.content or "").strip()
+        logger.info(f"[PIPE] resumen recompactado en "
+                    f"{int((time.monotonic() - t0) * 1000)}ms ({len(nuevo)} chars)")
+        return nuevo or resumen
+    except Exception as e:
+        logger.warning(f"[PIPE] compactación falló: {e}")
+        return resumen
 
 
-class _ToolExecutor:
-    """Applies tool calls to the state, enforcing every invariant in code."""
-
-    def __init__(self, session: Dict[str, Any], media_text: str = "") -> None:
-        # Media turns (image/audio/doc transcriptions) may be machine
-        # misreadings: adds are allowed ONLY for codes literally present in
-        # the extraction (dictated codes); anything else must be proposed
-        # and confirmed. Alphanumeric-normalized containment check.
-        self._media_alnum: Optional[str] = (
-            re.sub(r"[^A-Z0-9]", "", media_text.upper()) if media_text else None)
-        self.blocked_media_adds: List[str] = []
-        self.blocked_media_close: bool = False
-        self._close_requested: bool = False
-        # Multi-item work queue persisted across turns; option codes are
-        # catalog-verified from a prior search -> grounded for proposals/adds.
-        self.open_items: List[Dict[str, Any]] = list(session.get("open_items") or [])
-        self._guide_shown_out: bool = bool(session.get("guide_shown"))
-        self.held_for_enrichment: List[str] = []
-        self.held_qty: Dict[str, int] = {}   # lowercase held query -> client qty (triage)
-        self.blocked_empty_close: bool = False
-        self.order_activity: bool = False   # any cart-directed action this turn
-        self.results_this_turn: set = set()
-        self.cart: Dict[str, Dict[str, Any]] = {
-            i["code"]: {"code": i["code"], "qty": _sane_qty(i.get("qty"))}
-            for i in (session.get("cart") or []) if i.get("code")
-        }
-        self.status: str = session.get("order_status") or "IDLE"
-        self.summary: str = session.get("summary") or ""
-        self.summary_touched: bool = False
-        # Grounding set for add_item: the current cart plus the last DISPATCHED
-        # order — those codes were catalog-validated when first added, so
-        # "ponme lo mismo que la última vez" works without a redundant search.
-        self.seen_codes: set[str] = set(self.cart) | {
-            _sane_code(o.get("codigo")) for item in (session.get("open_items") or [])
-            for o in item.get("opciones", []) if o.get("codigo")
-        } | {
-            _sane_code(i.get("code")) for i in (session.get("last_closed_cart") or []) if i.get("code")
-        }
-        self.pending_adds: Dict[str, int] = {}        # rejected adds awaiting grounding
-        # Authoritative quantities parsed from FREE JSON (triage / reconcile),
-        # keyed by code. The inference server's tool-call grammar can truncate
-        # an integer argument to a single digit (10->1, 12->1), so when we have
-        # a code's quantity from a non-tool path we trust THAT over add_item's
-        # qty argument.
-        self.qty_hints: Dict[str, int] = {}
-        self.handoff = False
-        self.opt_out = False
-
-    def apply(self, calls: List[Dict[str, Any]]) -> List[str]:
-        """Apply one round of calls; return the search queries requested (deduped, grounded)."""
-        queries: List[str] = []
-        for call in calls:
-            fn = call.get("function") or {}
-            name, args = fn.get("name") or "", fn.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-
-            if name == "search_products":
-                # Queries are collected RAW here; the loop gate routes them
-                # (Pass-1 classes, query-gate helper, topic grounding). The
-                # executor never judges query semantics.
-                for q in (args.get("queries") or []):
-                    q = str(q or "").strip()
-                    if q and q not in queries:
-                        queries.append(q)
-            elif name == "add_item":
-                code = _sane_code(args.get("code"))
-                if code and self._media_alnum is not None and \
-                        re.sub(r"[^A-Z0-9]", "", code.upper()) not in self._media_alnum:
-                    # Machine-read message that does NOT contain this code: the
-                    # model is acting on history/imagination, not on what the
-                    # client actually sent. Block; propose-and-confirm instead.
-                    logger.warning(f"[AGENT] add_item BLOCKED on media turn "
-                                   f"(code {code} not present in the extraction).")
-                    self.order_activity = True
-                    self.blocked_media_adds.append(code)
-                elif code in self.seen_codes:
-                    self.order_activity = True
-                    # Re-adding a code ALREADY in the cart without an explicit
-                    # quantity must NOT reset it to 1 — the 2B model re-emits
-                    # add_item on the close turn to 'confirm', and that silently
-                    # wiped real quantities (cart showed 1, reply showed N, the
-                    # Excel shipped 1). Keep the existing qty unless the model
-                    # gives a new valid one; set_qty remains the way to change it.
-                    raw_qty = args.get("qty")
-                    if code in self.qty_hints:
-                        # Authoritative quantity from triage/reconcile (free
-                        # JSON) — beats the tool-call arg, which the grammar may
-                        # have truncated to a single digit.
-                        qty = self.qty_hints[code]
-                    elif code in self.cart and not _has_explicit_qty(raw_qty):
-                        qty = self.cart[code]["qty"]
-                    else:
-                        qty = _sane_qty(raw_qty)
-                    self.cart[code] = {"code": code, "qty": qty}
-                    self.status = "BUILDING" if self.status != "CLOSED" else self.status
-                    logger.info(f"[AGENT] add_item applied: {code} x{self.cart[code]['qty']} "
-                                f"(cart={len(self.cart)})")
-                    # Adding one of a queued item's options resolves that item.
-                    self.open_items = [
-                        i for i in self.open_items
-                        if code not in {_sane_code(o.get("codigo")) for o in i.get("opciones", [])}
-                    ]
-                elif code:
-                    # Unseen code (e.g. proposed in a PREVIOUS turn, or typed by the
-                    # client): don't trust it — demote to a search. The exact-code
-                    # short-circuit in RAG grounds real codes, and register_results()
-                    # replays the add automatically once grounded, so a legitimate
-                    # confirmation is never lost while invented codes stay impossible.
-                    logger.info(f"[AGENT] add_item deferred for unseen code {code}; grounding via search.")
-                    self.order_activity = True
-                    raw_qty = args.get("qty")
-                    # Preserve a known qty (hint, cart, or prior pending add) on
-                    # a bare re-add; only a new explicit qty overrides it.
-                    if code in self.qty_hints:
-                        self.pending_adds[code] = self.qty_hints[code]
-                    elif not _has_explicit_qty(raw_qty):
-                        self.pending_adds[code] = (self.cart.get(code, {}).get("qty")
-                                                   or self.pending_adds.get(code) or 1)
-                    else:
-                        self.pending_adds[code] = _sane_qty(raw_qty)
-                    queries.append(code)
-            elif name == "remove_item":
-                self.cart.pop(_sane_code(args.get("code")), None)
-            elif name == "set_qty":
-                code = _sane_code(args.get("code"))
-                if code in self.cart:
-                    self.cart[code]["qty"] = self.qty_hints.get(code) or _sane_qty(args.get("qty"))
-            elif name == "close_order":
-                # Decide AFTER the whole tool pass (below), so the order of
-                # add_item vs close_order in this turn's calls doesn't matter.
-                self._close_requested = True
-            elif name == "handoff_to_human":
-                self.handoff = True
-            elif name == "opt_out_client":
-                self.opt_out = True
-            elif name == "note":
-                s = str(args.get("summary") or "").strip()
-                if s:
-                    self.summary = s[:300]
-                    self.summary_touched = True
-            else:
-                logger.debug(f"[AGENT] Ignoring unknown tool: {name}")
-        # Resolve a requested close now that every add_item in this turn has
-        # been processed. On a MEDIA turn the close is blocked ONLY when the
-        # same audio/image also tried to add items that couldn't be verified
-        # (blocked_media_adds) — that is the dangerous "add X and close" case
-        # that would ship an incomplete cart. A plain voice confirmation of an
-        # already-built cart ("ciérralo así, gracias") is honored: the cart was
-        # confirmed in earlier text turns, nothing is pending.
-        if getattr(self, "_close_requested", False):
-            if not self.cart:
-                self.blocked_empty_close = True
-                logger.warning("[AGENT] close_order ignored: empty cart.")
-            elif self._media_alnum is not None and self.blocked_media_adds:
-                self.blocked_media_close = True
-                logger.warning("[AGENT] close_order BLOCKED: media turn with unverified adds "
-                               "pending (confirm those as text first).")
-            else:
-                self.status = "CLOSED"
-                logger.info(f"[AGENT] Order CLOSED via close_order ({len(self.cart)} items).")
-            self._close_requested = False
-        if queries and self.status == "IDLE":
-            self.status = "BUILDING"
-        return queries
-
-    def register_results(self, results: Dict[str, List[Dict[str, Any]]]) -> None:
-        """Ground the codes returned by search, then replay any deferred adds."""
-        for hits in results.values():
-            codes = {_sane_code(h.get("CodigoArticulo")) for h in hits if h.get("CodigoArticulo")}
-            self.seen_codes |= codes
-            self.results_this_turn |= codes
-        for code, qty in list(self.pending_adds.items()):
-            grounded = next((c for c in self.seen_codes if c.upper() == code.upper()), None)
-            if grounded:
-                self.cart[grounded] = {"code": grounded, "qty": qty}
-                if self.status != "CLOSED":
-                    self.status = "BUILDING"
-                del self.pending_adds[code]
-                logger.info(f"[AGENT] Deferred add grounded and applied: {grounded} x{qty}")
-
-    def result(self, reply: str) -> AgentResult:
-        return AgentResult(
-            reply=reply, order_status=self.status if self.status in VALID_STATUS else "IDLE",
-            cart=list(self.cart.values()), summary=self.summary,
-            open_items=self.open_items,
-            guide_shown=bool(self._guide_shown_out),
-            handoff=self.handoff, opt_out=self.opt_out,
-        )
-
-
-_KNOWN_TOOLS = ("search_products", "add_item", "remove_item", "set_qty",
-                "close_order", "handoff_to_human", "opt_out_client", "note")
-
-# cima's DEGRADED special-token tool-call format, observed live under long
-# context: <|tool_call>call:search_products{queries:[<|"|>KG001399<|"|>, `65062`]}<tool_call|>
-# Normalize it to plain JSON so the call still EXECUTES instead of leaking.
-_TOKEN_SOUP_RE = re.compile(r"<\|[^>|]{0,24}\|>|<\|[a-z_]+>|<[a-z_]+\|>", re.IGNORECASE)
-
-
-def _normalize_token_soup(content: str) -> str:
-    """Rewrite the special-token tool-call dialect into parseable JSON:
-    <|"|> -> ", backticks -> ", call:name{...} -> {"name": {...}}, and bare
-    keys ({queries: -> {"queries":)."""
-    if "<|" not in content and "`" not in content and "call:" not in content:
-        return content
-    s = content.replace('<|"|>', '"').replace("`", '"')
-    s = _TOKEN_SOUP_RE.sub(" ", s)
-    s = re.sub(r"call\s*:\s*(" + "|".join(_KNOWN_TOOLS) + r")\s*\{",
-               r'{"\1": {', s)
-    # quote bare keys: {queries: [...]} -> {"queries": [...]}
-    s = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', s)
-    # the call:name{ rewrite opened one extra object -> close it
-    opens, closes = s.count("{"), s.count("}")
-    if opens > closes:
-        s += "}" * (opens - closes)
-    return s
-
-
-def _recover_text_tool_calls(content: str) -> List[Dict[str, Any]]:
-    """Parse tool calls the model emitted as TEXT (malformed, not via the tool
-    channel) and normalize them to the executor's {"function": {...}} shape, so
-    a search/add the model 'said' in prose still executes instead of vanishing.
-    Handles {"tool_calls":[{name:args}]}, {"function":{"name","arguments"}}, and
-    a bare {name: args}. Best-effort: unparseable blocks are ignored."""
-    if not content or "{" not in content:
-        return []
-    content = _normalize_token_soup(content)
-    blocks, i, n = [], 0, len(content)
-    while i < n:
-        if content[i] == "{":
-            depth, j = 0, i
-            while j < n:
-                if content[j] == "{":
-                    depth += 1
-                elif content[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            if depth == 0:
-                blocks.append(content[i:j + 1])
-                i = j + 1
-                continue
-        i += 1
-    out: List[Dict[str, Any]] = []
-    for blk in blocks:
-        try:
-            data = json.loads(blk)
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        calls = data.get("tool_calls")
-        if not isinstance(calls, list):
-            calls = [data]        # bare {name: args} or {"function": {...}}
-        for c in calls:
-            if not isinstance(c, dict):
-                continue
-            fn = c.get("function")
-            if isinstance(fn, dict) and fn.get("name") in _KNOWN_TOOLS:
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                out.append({"function": {"name": fn["name"], "arguments": args or {}}})
-                continue
-            for k, v in c.items():
-                if k in _KNOWN_TOOLS:
-                    out.append({"function": {"name": k,
-                                             "arguments": v if isinstance(v, dict) else {}}})
+def _actos_estructurales(texto: str, estado: Estado) -> List[Acto]:
+    """Cuando la extracción no ve ningún acto, lo puramente ESTRUCTURAL no
+    puede perderse por ello (el LLM interpreta lenguaje; los códigos son
+    forma): un token con forma de código se convierte en `pedir` (la
+    resolución ya lo liga a la opción viva, con herencia de cantidad, o lo
+    busca), y un número suelto que casa con un conflicto de cantidad vivo se
+    convierte en `elegir`. Nada más: el resto sí es semántica y sigue siendo
+    territorio del modelo."""
+    out: List[Acto] = []
+    for c in codes_in_text(texto):
+        out.append(Acto(tipo="pedir", producto_texto=c, evidencia=c))
+    limpio = re.sub(r"[^0-9]", "", texto) if len(texto.strip()) <= 12 else ""
+    if limpio.isdigit() and limpio:
+        n = int(limpio)
+        if any(n in (i.get("opciones_qty") or []) for i in estado.open_items
+               if i.get("tipo") == "conflicto_cantidad"):
+            out.append(Acto(tipo="elegir", objetivo_texto=limpio, evidencia=limpio))
     return out
 
 
-def _clean(text: str) -> str:
-    """Strip reasoning tags, the silence token, raw tool-call JSON the model
-    leaked as text, and sentences where the model leaks its OWN internal
-    process into the client reply."""
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
-    if "<NO_REPLY>" in text:
-        return ""
-    # The 2B model sometimes emits a TOOL CALL as plain text instead of through
-    # the tool channel — observed live: a whole {"tool_calls":[{"note":{...}}]}
-    # blob shipped to the client. Strip any JSON object that carries "tool_calls"
-    # or names one of our tools, plus stray ```json fences. What remains (if
-    # anything) is the real prose; an all-JSON reply becomes empty -> the caller
-    # forces a proper answer / deterministic fallback instead of leaking.
-    text = re.sub(r"```(?:json)?|```", "", text)
-    # Rewrite cima's degraded special-token tool syntax into plain JSON first,
-    # so the same balanced-brace stripper removes it (and prose survives).
-    if "<|" in text or "call:" in text:
-        text = _normalize_token_soup(text)
-    _tool_names = ("tool_calls", "search_products", "add_item", "remove_item",
-                   "set_qty", "close_order", "handoff_to_human", "opt_out_client", "note")
-    tool_re = re.compile(r'"(?:' + "|".join(_tool_names) + r')"')
-    # Remove balanced {...} blocks that mention a tool name (repeat until stable).
-    def _strip_tool_json(s: str) -> str:
-        out, i, n = [], 0, len(s)
-        while i < n:
-            if s[i] == "{":
-                depth, j = 0, i
-                while j < n:
-                    if s[j] == "{":
-                        depth += 1
-                    elif s[j] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            break
-                    j += 1
-                block = s[i:j + 1]
-                if depth == 0 and tool_re.search(block):
-                    i = j + 1          # drop this tool-call block
-                    continue
-                out.append(s[i]); i += 1
-            else:
-                out.append(s[i]); i += 1
-        return "".join(out)
-    if tool_re.search(text):
-        text = _strip_tool_json(text).strip()
-        logger.info("[AGENT] Stripped leaked tool-call JSON from the reply.")
-    # Small models leak their machinery into the reply in a few recurring ways,
-    # all about the BOT's own process (never anything the client wrote):
-    #   - acknowledging our internal nudges ("...esa instrucción interna",
-    #     "interpreto que me pides que reformule");
-    #   - apologizing for a technical delay / narrating that it is waiting on a
-    #     search ("disculpa, estaba esperando la respuesta de la búsqueda");
-    #   - promising to go look instead of having looked ("dame un segundo
-    #     mientras lo reviso", "voy a buscar", "un momento").
-    # Drop whole sentences that match — these are structural signatures of the
-    # bot malfunctioning, not client-intent vocabulary. Runs on EVERY exit
-    # path (loop and forced answers) because every reply passes through here.
-    leak = re.compile(
-        r"instruccion interna|reformul\w+ mi respuesta|"
-        r"me estas pidiendo que (reformul|reescrib|reh[ai]c)|"
-        r"(disculpa|perdona|lo siento|te pido disculpas)[^.!?]*"
-        r"(busqued|esperando|sistema|proceso|resultado|interno)|"
-        r"estaba esperando|esperando (la|el|los|las) (respuesta|resultado|busqued)|"
-        r"(dame|espera|deja(me)?) un (momento|segundo|segundito|instante)|"
-        r"un (momento|segundo|segundito|instante)(,| )|"
-        r"(mientras|ahora mismo) (lo |las |los )?(reviso|busco|miro|consulto|localizo)|"
-        r"voy a (buscar|mirar|revisar|consultar|localizar|enfocarme)|"
-        r"estoy (buscando|mirando|revisando|consultando)|"
-        r"enseguida (te )?(digo|miro|busco|reviso|localizo)")
-    parts = re.split(r"(?<=[.!?\n])\s+", text)
-    kept = [p for p in parts if not leak.search(_strip_accents_lower(p))]
-    cleaned = " ".join(kept).strip()
-    if cleaned != text:
-        logger.info("[AGENT] Stripped a leaked internal/process reference from the reply.")
-    # FINAL MACHINERY GATE — the "no matter what" guarantee. If ANY machinery
-    # signature survives the stripping above (special tokens like <|...|>,
-    # tool syntax, raw JSON braces with our tool/argument names), the reply is
-    # NOT sendable: return empty so the caller produces a forced answer or the
-    # deterministic fallback. A slightly generic but professional message
-    # always beats a leaked one in front of clients and bosses.
-    if _looks_like_machinery(cleaned):
-        logger.warning("[AGENT] Machinery gate: reply still contained internal "
-                       "syntax after cleaning; discarding it for a safe fallback.")
-        return ""
-    return cleaned
+# ------------------------------------------------------------------ run_agent
+async def run_agent(*, client_name: str, salesman_name: str,
+                    session: Dict[str, Any], recent_history: str,
+                    current_message: str, intro_mode: str,
+                    search: Retriever,
+                    code_lookup: Optional[CodeLookup] = None) -> AgentResult:
+    """Un turno completo. Firma compatible con handlers.handle_ai_trigger.
+    `recent_history` llega con roles (Cliente/Comercial/Asistente) y ENTRA en
+    el prompt de COMPRENDER: es lo que permite resolver "sí ese", "13",
+    "quítame el otro" leyendo lo que se dijo antes."""
+    t_turn = time.monotonic()
+    budget = _Budget()
+    estado_in = Estado.from_session(session)
+    guide_shown = bool(session.get("guide_shown"))
+    resumen = str(session.get("summary") or "")
+    hilo = recent_history or ""
+    resumen_out = {"v": resumen}     # el resumen a persistir (por defecto, el previo)
 
+    def _result(reply: str, estado: Estado, hechos: List[Hecho],
+                extra_ctx: Optional[Dict[str, Any]] = None) -> AgentResult:
+        handoff = any(h.tipo in ("derivacion", "escalada", "aviso_comercial") for h in hechos)
+        opt_out = any(h.tipo == "opt_out" for h in hechos)
+        ctx = {"pipeline": "v2", "llm_calls": budget.detail,
+               "turn_ms": int((time.monotonic() - t_turn) * 1000),
+               **(extra_ctx or {})}
+        return AgentResult(reply=reply, order_status=estado.order_status,
+                           cart=estado.cart, summary=resumen_out["v"],
+                           handoff=handoff, opt_out=opt_out, silent=False,
+                           open_items=estado.open_items,
+                           guide_shown=guide_shown, ctx=ctx)
 
-_MACHINERY_RE = re.compile(
-    r"<\|.*?\|>|<\|[a-z_]+>|<[a-z_]+\|>|"                       # special tokens
-    r"</?tool_call>?|tool_calls?\s*[:>{]|call\s*:\s*[a-z_]+\s*\{|"  # tool syntax
-    r"\{\s*\"?(?:" + "|".join(("search_products", "add_item", "remove_item",
-                               "set_qty", "close_order", "handoff_to_human",
-                               "opt_out_client", "note", "queries",
-                               "arguments", "function")) + r")\"?\s*[:\]}]",
-    re.IGNORECASE | re.DOTALL)
+    # -------- Etapa 0
+    pre = preprocesar(current_message)
+    if pre.log:
+        logger.info("[PIPE] pre: " + ", ".join(pre.log))
+    if not pre.texto and not pre.pedidos and pre.cantidad_global is None \
+            and not pre.fuente_media:
+        return _result("", estado_in, [])   # nada que responder
 
+    # renglones de lista consumidos en la Etapa 0: actos construidos por
+    # código, con su cantidad de SU línea (los casos 1-2 por construcción)
+    actos_lista = [Acto(tipo="pedir", producto_texto=n, evidencia=orig,
+                        cantidad=(Cantidad("total", q) if q is not None else Cantidad()))
+                   for n, q, orig in pre.pedidos]
 
-def _looks_like_machinery(text: str) -> bool:
-    """True when a reply still carries internal tool/token syntax that must
-    never reach a client."""
-    return bool(text) and bool(_MACHINERY_RE.search(text))
-
-
-def _fallback_reply(cart: List[Dict[str, Any]], open_items: List[Dict[str, Any]],
-                    client_name: str, salesman_name: str, greet: bool) -> str:
-    """Deterministic confirmation built from state — the last resort when the
-    model spends its whole step budget without ever writing text. Never empty:
-    a client who just added items and asked for a summary must get an answer,
-    not silence."""
-    parts: List[str] = []
-    if greet:
-        parts.append(f"¡Hola {client_name}! Soy Kapa, el asistente de {salesman_name}.")
-    lines = [f"{i.get('qty', 1)}x código de producto {i['code']}"
-             for i in (cart or []) if i.get("code")]
-    if lines:
-        parts.append("Te confirmo lo que tenemos apuntado: " + "; ".join(lines) + ".")
+    # -------- Etapa 1 COMPRENDER (solo si queda LENGUAJE que interpretar)
+    hablar = True
+    if pre.texto:
+        actos, hablar = await _extraer(estado_in, pre.texto, budget, resumen=resumen, hilo=hilo)
     else:
-        parts.append("Todavía no tengo nada apuntado en el pedido.")
-    pend = [i.get("pedido") for i in (open_items or [])
-            if i.get("estado") == "enriquecer" and i.get("pedido")]
-    if pend:
-        parts.append("Me falta un poco más de detalle para " + ", ".join(pend) +
-                     " (marca, línea o medida); el código de producto es lo más rápido y seguro.")
-    parts.append("¿Te apunto algo más o cerramos el pedido?")
-    return " ".join(parts)
+        actos = []
+    if not actos and not actos_lista:   # ilegible dos veces O schema-válido pero vacío
+        actos = _actos_estructurales(pre.texto or current_message, estado_in) or actos
+        if actos:
+            logger.info("[PIPE] salvamento estructural: "
+                        + "; ".join(a.as_log() for a in actos))
+    if actos is None and actos_lista:
+        actos = []          # la lista se procesa aunque la extracción muriera
+    if actos is not None:
+        actos = actos_lista + actos          # la lista entra SIEMPRE al turno
+    if not actos:
+        # Extracción sin actos: puede ser fallo real O un simple saludo/charla.
+        # En el turno de PRESENTACIÓN, "hola" no es un error: el bot se presenta
+        # y ofrece el servicio, sin añadir "no te he entendido" detrás. Solo se
+        # emite sin_entender cuando NO es intro (el cliente intentó algo que no
+        # se entendió). Inv. 7 intacto: siempre sale un mensaje.
+        intro = intro_mode in ("new", "renew")
+        resultado = aplicar(estado_in, [], fuente_media=False, cantidad_global_pre=None)
+        hechos = list(resultado.hechos)
+        if not intro:
+            hechos = [Hecho("sin_entender")] + hechos
+        plantilla = render(hechos, resultado.estado, intro_mode=intro_mode,
+                           client_name=client_name, salesman_name=salesman_name,
+                           commercial_turn=intro)
+        return _result(plantilla, resultado.estado, hechos,
+                       {"degradado": "extraccion" if actos is None else "sin_actos"})
 
+    # -------- Etapa 2
+    async def _match_call(payload: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        data = await _chat_json(_MATCH_SYSTEM, _match_user(payload), MATCH_SCHEMA,
+                                max_tokens=MATCH_MAX_TOKENS, timeout=MATCH_TIMEOUT_S,
+                                temperature=0.0, budget=budget, kind="match", fmt="json")
+        return (data or {}).get("items") if data else None
 
-# ----------------------------------------------------------------------- loop
-async def run_agent(
-    *,
-    client_name: str,
-    salesman_name: str,
-    session: Dict[str, Any],
-    recent_history: str,
-    current_message: str,
-    intro_mode: str,          # "new" | "renew" | "ongoing"  (decided by handlers, in code)
-    search: Retriever,
-) -> AgentResult:
-    """
-    One conversation turn as a TWO-PASS orchestration:
-      Pass 1  run_triage() at temperature 0.0 -> escalation short-circuit,
-              WORTHY/AMBIGUOUS classification (gates retrieval below).
-      Pass 2  LLM <-> tools loop (max MAX_STEPS calls), grounded live
-              searches, code-validated state edits.
-    Blocking cima calls run in a thread so the event loop stays free.
-    """
-    # MULTI-ACTOR SILENCE GUARD: if the human salesman (Comercial:) was the
-    # last to speak, he has taken manual control of the conversation — the
-    # bot stays completely silent. The FSM normally cancels the trigger on
-    # a manual reply, but a salesman message landing DURING processing (or a
-    # missed on_user_message) must not be answered over.
-    last_line = next((l for l in reversed((recent_history or "").splitlines()) if l.strip()), "")
-    if last_line.startswith("Comercial:"):
-        logger.info("[AGENT] Salesman spoke last (manual control); staying silent.")
-        return AgentResult(
-            reply="", order_status=session.get("order_status") or "IDLE",
-            cart=list(session.get("cart") or []), summary=session.get("summary") or "",
-            open_items=list(session.get("open_items") or []),
-            guide_shown=bool(session.get("guide_shown")), silent=True,
-        )
+    res = await resolver(actos, estado_in, search=search, code_lookup=code_lookup,
+                         match_call=_match_call,
+                         cantidad_global_pre=pre.cantidad_global)
 
-    # ---- PASS 1: intent & specificity triage (temperature 0.0) -------------
-    triage = await run_triage(current_message, recent_history)
+    # -------- Etapa 3
+    resultado = aplicar(estado_in, res.ops, fuente_media=pre.fuente_media,
+                        cantidad_global_pre=pre.cantidad_global)
+    if resultado.descartes:
+        logger.info("[PIPE] descartes: " + "; ".join(resultado.descartes))
 
-    topic = _topic_from_history(recent_history)   # structural product-family grounding
-    executor = _ToolExecutor(session,
-                             media_text=current_message if _is_media_message(current_message) else "")
+    commercial = bool(resultado.estado.cart) or \
+        resultado.estado.order_status in ("BUILDING", "CLOSED") or \
+        any(h.tipo in ("pregunta_opciones", "sin_candidatos", "propuesta",
+                       "conflicto_cantidad") for h in resultado.hechos)
 
-    # QUEUE RECONCILIATION (extra LLM pass, temp 0.0): read the running queue
-    # against the new message and apply what the CLIENT decided — drop
-    # abandoned items, commit confirmations of already-located ones. This is
-    # what keeps the thread coherent turn-to-turn; without it the bot re-asks
-    # items the client dropped and fails to honor a plain "sí". The model
-    # decides; the code below only applies the verdict.
-    reconciled_msg = ""
-    if executor.open_items:
-        rec = await run_open_items_reconcile(current_message, executor.open_items)
-        if rec:
-            dropped, confirmed = [], []
-            if rec["descartar"]:
-                keep = []
-                for it in executor.open_items:
-                    ped = it.get("pedido", "")
-                    if any(_same_item(ped, d) for d in rec["descartar"]):
-                        dropped.append(ped)
-                    else:
-                        keep.append(it)
-                executor.open_items = keep
-            for c in rec["confirmar"]:
-                code = c["codigo"]
-                # Confirmations only commit codes already grounded (proposed
-                # earlier or in the cart/last order) — never an invented code.
-                if code and code in executor.seen_codes:
-                    executor.cart[code] = {"code": code, "qty": c["cantidad"]}
-                    executor.qty_hints[code] = c["cantidad"]   # authoritative (free JSON)
-                    executor.order_activity = True
-                    executor.status = "BUILDING" if executor.status != "CLOSED" else executor.status
-                    executor.open_items = [
-                        i for i in executor.open_items
-                        if code not in {_sane_code(o.get("codigo")) for o in i.get("opciones", [])}
-                    ]
-                    confirmed.append(f"{c['cantidad']}x {code}")
-            notes = []
-            if dropped:
-                notes.append("el cliente DESCARTÓ (no los menciones más): " + ", ".join(dropped))
-            if confirmed:
-                notes.append("ya APUNTADO por confirmación del cliente (dilo como hecho, no "
-                             "vuelvas a preguntar '¿te apunto?'): " + ", ".join(confirmed))
-            if dropped or confirmed:
-                reconciled_msg = "### YA APLICADO ESTE TURNO\n- " + "\n- ".join(notes) + "\n"
-                logger.info(f"[RECONCILE] applied dropped={dropped} confirmed={confirmed}")
+    # -------- ¿callar? (§3.2) El bot contesta POCO. Calla cuando COMPRENDER
+    # dijo hablar=false Y no hay nada del pedido que atender: o es charla no
+    # comercial, o el cliente y el comercial ya están en una conversación
+    # no-pedido (precios, detalles) y el bot no debe meterse en medio.
+    # PERO: nunca calla ante algo del pedido, ni ante "pide_comercial" (avisa),
+    # ni en el turno de presentación.
+    NO_INTERPONERSE = {"cortesia", "derivacion"}   # charla o tema del comercial
+    solo_no_pedido = resultado.hechos and all(h.tipo in NO_INTERPONERSE
+                                              for h in resultado.hechos)
+    pide_comercial = any(h.tipo == "aviso_comercial" for h in resultado.hechos)
+    intro = intro_mode in ("new", "renew")
+    if not hablar and solo_no_pedido and not pide_comercial and not intro:
+        motivo = "tema_comercial" if any(h.tipo == "derivacion" for h in resultado.hechos) \
+            else "charla"
+        logger.info(f"[PIPE] silencio: no interponerse ({motivo})")
+        return _result("", resultado.estado, [], {"silencio": motivo})
 
-    # AMBIGUOUS items are queued for enrichment UP FRONT (with the client's
-    # quantities): even if the agent never emits a query for them, they land
-    # in open_items at _finish and survive across turns.
-    for item in (triage.ambiguous if triage.ok else []):
-        if not any(_same_item(item.query, h) for h in executor.held_for_enrichment) and \
-                not any(_same_item(item.query, i.get("pedido", "")) for i in executor.open_items):
-            executor.held_for_enrichment.append(item.query)
-            executor.held_qty[item.query.strip().lower()] = item.qty
+    # -------- Etapa 4
+    plantilla = render(resultado.hechos, resultado.estado, intro_mode=intro_mode,
+                       client_name=client_name, salesman_name=salesman_name,
+                       commercial_turn=commercial)
+    mensaje = await _reescribir(plantilla, budget, hilo=hilo) if plantilla else ""
 
-    intro_rule_text = _INTRO_RULES.get(intro_mode, _INTRO_RULES["ongoing"])
-    if not session.get("guide_shown"):
-        # Once per conversation: set expectations like a person would, then
-        # never repeat it. Persisted via AgentResult.guide_shown.
-        intro_rule_text += (
-            " ADEMÁS (solo esta vez): explica en 1-2 frases naturales cómo trabajas mejor: "
-            "el código de producto es lo más fácil (lo verificas al momento); si no, nombre casi exacto o "
-            "palabras clave útiles y le das opciones; y lo que no salga, se lo deja a "
-            "{salesman_name}.")
-    intro = intro_rule_text.format(
-        client_name=client_name, salesman_name=salesman_name)
-    system = _SYSTEM.format(salesman_name=salesman_name, client_name=client_name, intro_rule=intro)
+    # -------- commit-side: verificar (cinturón del invariante 6)
+    permitidos = {l["code"] for l in resultado.estado.cart}
+    permitidos |= {l["code"] for l in estado_in.cart}
+    permitidos |= {c.get("code") for c in estado_in.last_closed_cart if c.get("code")}
+    for it in resultado.estado.open_items:
+        permitidos |= {o.get("code") for o in it.get("opciones") or [] if o.get("code")}
+        if it.get("code"):
+            permitidos.add(it["code"])
+    for h in resultado.hechos:
+        for k in ("code",):
+            if h.datos.get(k):
+                permitidos.add(h.datos[k])
+        for o in h.datos.get("opciones") or []:
+            if isinstance(o, dict) and o.get("code"):
+                permitidos.add(o["code"])
+        for itx in (h.datos.get("items") or []) + (h.datos.get("cart") or []):
+            if isinstance(itx, dict) and itx.get("code"):
+                permitidos.add(itx["code"])
+    permitidos.discard(None)
 
-    # Budget-aware assembly: cap the message, then give history whatever
-    # tokens remain under CTX_BUDGET_TOKENS. Older context lives in Memoria.
-    current_message = _cap_middle(current_message or "", MAX_MESSAGE_CHARS)
-    triage_block = _triage_block(triage)
-    if reconciled_msg:
-        triage_block = reconciled_msg + triage_block
-    # Media turns carry a per-turn DESCRIPCIÓN of the image/audio; a short note
-    # points the model at it. (The humility/no-add-without-confirm rules live in
-    # the system prompt; messy-list handling is enforced structurally by the
-    # batch-quality gate, not by prompt enumeration.)
-    if _is_media_message(current_message):
-        triage_block = (
-            "### LLEGÓ COMO IMAGEN/AUDIO (interpretación, puedes fallar)\n"
-            "- Al inicio hay una DESCRIPCIÓN de qué es y lo legible que es. Si es difícil de "
-            "leer, díselo con naturalidad y pide una foto más clara o los códigos de producto.\n"
-            "- Di qué entendiste y qué no; invita a corregir; nunca apuntes sin confirmación.\n"
-        ) + triage_block
-    open_line = "; ".join(
-        (f"{i.get('pedido')} (x{i.get('qty', 1)}, falta detalle del cliente)"
-         if i.get("estado") == "enriquecer" else
-         (f"{i.get('pedido')} → YA localizado {(i.get('opciones') or [{}])[0].get('codigo','')} "
-          f"(si el cliente confirma, add_item directo; NO lo vuelvas a buscar)"
-          if i.get("estado") == "propuesto" else
-          f"{i.get('pedido')} (opciones: " + ", ".join(
-              o.get("codigo", "") for o in i.get("opciones", [])[:3]) + ")"))
-        for i in executor.open_items) or "(ninguno)"
-    shell = _USER.format(
-        order_status=executor.status,
-        open_items_line=open_line,
-        cart_json=json.dumps(list(executor.cart.values()), ensure_ascii=False),
-        last_closed_json=json.dumps(session.get("last_closed_cart") or [], ensure_ascii=False),
-        summary=executor.summary or "(sin memoria previa)",
-        history="",
-        triage_block=triage_block,
-        current_message=current_message or "(sin texto)",
-    )
-    # Reserve room for what the LOOP will append on top of this base prompt
-    # (search-result digests + tool-call announcements + nudges), so the total
-    # context stays under budget once the loop grows it — history is trimmed
-    # tail-first now instead of tool results being dropped later.
-    _LOOP_RESERVE_TOKENS = _est_tokens("x" * MAX_RESULTS_CHARS) + 200
-    avail_tokens = (CTX_BUDGET_TOKENS - _est_tokens(system) - _est_tokens(shell)
-                    - _GENERATION_SLACK_TOKENS - _LOOP_RESERVE_TOKENS)
-    history = _tail_lines_to_fit(recent_history or "", min(max(avail_tokens, 0) * 3, MAX_HISTORY_CHARS))
+    ok, motivo = verificar(mensaje, resultado.estado, permitidos)
+    if not ok:
+        logger.error(f"[PIPE][INCIDENTE] verificar falló: {motivo} — se descarta el "
+                     "turno y se responde desde el estado anterior.")
+        return _result(mensaje_seguro(estado_in, salesman_name), estado_in, [],
+                       {"incidente_verificar": motivo})
 
-    messages: List[Message] = [
-        Message(role="system", content=system),
-        Message(role="user", content=_USER.format(
-            order_status=executor.status,
-            open_items_line=open_line,
-            cart_json=json.dumps(list(executor.cart.values()), ensure_ascii=False),
-            last_closed_json=json.dumps(session.get("last_closed_cart") or [], ensure_ascii=False),
-            summary=executor.summary or "(sin memoria previa)",
-            history=history or "(sin historial)",
-            triage_block=triage_block,
-            current_message=current_message or "(sin texto)",
-        )),
-    ]
-
-    # ---- context telemetry (est. tokens; the gauge the console monitors) ----
-    ctx_stats: Dict[str, Any] = {
-        "window": CTX_WINDOW, "budget": CTX_BUDGET_TOKENS, "used": 0,
-        "history_chars_kept": len(history), "history_chars_total": len(recent_history or ""),
-        "message_truncated": "[recortado]" in (current_message or ""),
-        "triage_ok": triage.ok, "triage_ms": round(triage.elapsed_ms, 1),
-        "triage_worthy": len(triage.worthy), "triage_ambiguous": len(triage.ambiguous),
-    }
-
-    def _fit_and_track() -> None:
-        """Trim the accumulated context under budget and record the real peak
-        usage (the gauge the console monitors — must stay < CTX_BUDGET_TOKENS,
-        i.e. under 70% of the window)."""
-        nonlocal messages
-        messages = _fit_messages(messages, CTX_BUDGET_TOKENS)
-        ctx_stats["used"] = max(int(ctx_stats["used"]), _messages_tokens(messages))
-
-    def _res(rep: str) -> AgentResult:
-        r = executor.result(rep)
-        used = ctx_stats["used"]
-        r.ctx = {**ctx_stats,
-                 "pct_window": round(100 * used / max(1, CTX_WINDOW), 1),
-                 "pct_budget": round(100 * used / max(1, CTX_BUDGET_TOKENS), 1),
-                 "history_trimmed": ctx_stats["history_chars_kept"] < ctx_stats["history_chars_total"]}
-        return r
-
-    async def _finish(rep: str) -> AgentResult:
-        if rep.strip() and "<NO_REPLY>" not in rep:
-            executor._guide_shown_out = True
-            # Greeting guarantee: a NEW conversation greets, whatever the
-            # nudge cascade did to the draft (observed live: a grounding
-            # rewrite dropped the intro). Renewals greet when the client is
-            # actually starting a new order flow.
-            must_greet = intro_mode == "new" or (
-                intro_mode == "renew" and (executor.order_activity
-                                           or executor.results_this_turn))
-            if must_greet and "kapa" not in rep.lower():
-                rep = (f"¡Hola {client_name}! Soy Kapa, el asistente de "
-                       f"{salesman_name}. ") + rep.lstrip()
-            elif intro_mode == "ongoing":
-                # Symmetric guarantee: mid-conversation turns never
-                # re-introduce (observed live: identical intro replayed).
-                low = _strip_accents_lower(rep[:160])
-                if "soy kapa" in low:
-                    idx = low.index("soy kapa")
-                    cut = len(rep)
-                    for stop in (".", "!", "\n"):
-                        p = rep.find(stop, idx)
-                        if p != -1:
-                            cut = min(cut, p + 1)
-                    stripped = rep[cut:].lstrip(" 👋😊✨🙌\n")
-                    if stripped:
-                        logger.info("[AGENT] Stripped a re-introduction on an ongoing turn.")
-                        rep = stripped
-            # SIGNATURE: guarantee the client can tell this is the assistant,
-            # not the human salesman — on EVERY delivered message, regardless
-            # of intro mode. Deterministic and idempotent (skip if the exact
-            # signature is already the tail, e.g. from a retried draft).
-            sig = BOT_SIGNATURE.strip()
-            if sig and _strip_accents_lower(sig) not in _strip_accents_lower(rep[-len(sig) - 4:]):
-                rep = rep.rstrip() + "\n\n" + sig
-        existing = {i.get("pedido") for i in executor.open_items}
-        for h in executor.held_for_enrichment:
-            key = h.strip().lower()
-            if key and key not in existing:
-                executor.open_items.append({"pedido": key, "estado": "enriquecer",
-                                            "opciones": [],
-                                            "qty": executor.held_qty.get(key, 1)})
-        """Every exit runs the final grounding pass: deferred add_item calls
-        (codes confirmed from a previous turn, unseen in this one) whose
-        grounding search never ran — e.g. the confirmation landed on the LAST
-        loop step after a nudge consumed a round — get one out-of-budget
-        exact-code search here. A client-confirmed item must never be lost to
-        step accounting; if the code genuinely isn't in the catalog, that is
-        logged as an ERROR instead of vanishing silently."""
-        if executor.pending_adds:
-            codes = list(executor.pending_adds)
-            logger.warning(f"[AGENT] Final grounding pass for deferred adds: {codes}")
-            try:
-                executor.register_results(await search(codes))
-            except Exception as e:
-                logger.error(f"[AGENT] Final grounding search failed: {e}")
-            if executor.pending_adds:
-                logger.error(f"[AGENT] CONFIRMED ITEMS DROPPED (codes not found in catalog): "
-                             f"{dict(executor.pending_adds)}")
-        r = _res(rep)
-        if r.order_status == "CLOSED":
-            logger.info(f"[AGENT] Order CLOSED with {len(r.cart)} items: "
-                        f"{[(i['code'], i['qty']) for i in r.cart]}")
-        return r
-
-    reply = ""
-    llm = _get_client()
-    demoted_promise = False
-    turn_glitch = False   # a draft came out corrupted this turn (machinery gate)
-    demoted_style = False
-    demoted_humility = False
-    demoted_media_add = False
-    demoted_intro = False
-    demoted_generic_q = False
-    demoted_mixed = False
-    demoted_grounding = False
-    audit_calls = 0     # reply-audit helper budget per turn
-    budget = MAX_STEPS
-    step = -1
-    while step + 1 < budget:
-        step += 1
-        _fit_and_track()
-        try:
-            resp = await asyncio.to_thread(
-                llm.chat, CIMA_MODEL, messages, tools=_TOOLS,
-                options={"temperature": AGENT_TEMPERATURE, "top_p": 0.9, "repeat_penalty": 1.1,
-                         "num_predict": 512, "stop": ["<NO_REPLY>"]},
-            )
-        except Exception as e:
-            logger.error(f"[AGENT] LLM call failed at step {step}: {e}")
-            return await _finish("")
-
-        # The 2B model sometimes writes a tool call as TEXT instead of using the
-        # tool channel (it leaked a note-as-text live, and the same failure
-        # silently drops search_products/add_item, stalling the order). Recover
-        # any tool calls found in the text and merge them so they execute.
-        text_calls = _recover_text_tool_calls(resp.content)
-        all_calls = (resp.tool_calls or []) + text_calls
-        reply = _clean(resp.content)
-        queries = executor.apply(all_calls)
-        if text_calls:
-            logger.info(f"[AGENT] Recovered {len(text_calls)} tool call(s) emitted as text.")
-        # SELF-AWARENESS OF GLITCHES: if the draft came out corrupted (machinery
-        # gate emptied it) the model is TOLD so — as internal context, not a
-        # scripted apology — and decides itself whether/how to acknowledge it.
-        # This also covers the client's next message ("¿qué era ese mensaje
-        # raro?"): the system prompt principle + this context let it own the
-        # error naturally instead of denying or ignoring it.
-        if not turn_glitch and (resp.content or "").strip() and not reply \
-                and _looks_like_machinery(resp.content):
-            turn_glitch = True
-            messages.append(Message(role="user", content=_internal(
-                "Tu último borrador salió corrupto por un fallo técnico y se ha descartado "
-                "(el cliente NO lo ha visto, aunque puede haber visto alguno raro antes). "
-                "Escribe la respuesta de nuevo con normalidad; si el cliente menciona un "
-                "mensaje extraño, reconócelo breve y amable como un pequeño fallo técnico "
-                "tuyo, sin tecnicismos, y sigue con el pedido.")))
-        logger.info(f"[AGENT] step={step} tools={len(all_calls)} "
-                    f"queries={queries} status={executor.status} cart={len(executor.cart)} "
-                    f"handoff={executor.handoff} opt_out={executor.opt_out}")
-
-        # Trust the model's own handoff_to_human / opt_out_client decisions
-        # (guided by the brief prompt) — no triage-flag second-guessing. The
-        # only intervention is a safety net: if the model tries to hand off on a
-        # turn where it ALSO did real order work, don't strand the order —
-        # clear the handoff and let it finish the order in words.
-        can_nudge = step < budget - 1
-        if executor.handoff and not executor.opt_out and can_nudge and not demoted_mixed \
-                and (queries or executor.order_activity or executor.blocked_media_adds
-                     or executor.blocked_media_close):
-            executor.handoff = False
-            demoted_mixed = True
-            blocked = ", ".join(dict.fromkeys(executor.blocked_media_adds)) or "lo que pediste"
-            executor.blocked_media_adds.clear()
-            logger.info("[AGENT] Handoff on an order turn: keeping the order alive.")
-            messages.append(Message(role="assistant", content=reply or "(handoff)"))
-            messages.append(Message(role="user", content=_internal(
-                f"No abandones el pedido. Sigue atendiéndolo con normalidad; si hay algo que solo "
-                f"puede resolver {salesman_name} (precio, envío…), dilo en una frase y continúa "
-                f"con el pedido — propón lo que entendiste ({blocked}) y espera el 'sí' del "
-                "cliente antes de apuntar nada.")))
-            continue
-        if executor.opt_out:
-            return await _finish("")  # opt-out: caller sends the brief stop message
-        if executor.handoff:
-            # A MODEL-initiated handoff that survived the demote. We never emit
-            # the robotic canned redirect for this — a redirect must be natural
-            # and lead with what the bot CAN do. (Silence for a genuine "wants
-            # a person" is the Pass-1 corroborated-escalation path, handled
-            # before the loop.) Use the model's own reply if it wrote one;
-            # otherwise force ONE capability-explaining reply, no tools.
-            executor.handoff = False
-            if reply.strip():
-                return await _finish(reply)
-            messages.append(Message(role="user", content=_internal(
-                "No uses ningún mensaje enlatado de derivación. Responde TÚ, natural y breve: "
-                "di primero qué SÍ puedes hacer (localizar productos por nombre completo o "
-                "código de producto y montar el pedido); y SOLO para lo que de verdad no te "
-                f"toca (precios, stock, facturas, incidencias, o hablar con una persona) di que "
-                f"eso se lo confirma {salesman_name}. Termina invitándole a decirte qué producto "
-                "busca. NO llames a ninguna herramienta.")))
-            _fit_and_track()
-            try:
-                resp = await asyncio.to_thread(
-                    llm.chat, CIMA_MODEL, messages,
-                    options={"temperature": AGENT_TEMPERATURE, "top_p": 0.9,
-                             "repeat_penalty": 1.1, "num_predict": 400})
-                forced = _clean(resp.content)
-            except Exception as e:
-                logger.error(f"[AGENT] Forced capability reply failed: {e}")
-                forced = ""
-            if not forced:
-                # Never leave a redirect turn empty: a plain, leak-free line.
-                forced = (f"Puedo localizarte productos por su nombre completo o su código de "
-                          f"producto y montarte el pedido aquí mismo. Para precios, stock o "
-                          f"incidencias, eso te lo confirma {salesman_name}. ¿Qué producto buscas?")
-            return await _finish(forced)
-        # A demoted mixed turn falls through as a normal order turn: the reply
-        # still passes the grounding/humility/parroting guards. If the model
-        # insists on handoff_to_human in the NEXT round, it is honored.
-
-        # REPLY AUDIT (temperature-0.0 helper, at most twice per turn): judges
-        # the draft semantically — announced-but-not-called searches, and the
-        # humility invitation on media-derived proposals. No phrase regexes.
-        needs_promise_check = reply and not queries and can_nudge and not demoted_promise
-        needs_humility_check = (reply and not queries and can_nudge and not demoted_humility
-                                and _is_media_message(current_message)
-                                and bool(_proposal_codes(reply)))
-        audit: Optional[Dict[str, bool]] = None
-        if (needs_promise_check or needs_humility_check) and audit_calls < 2:
-            audit_calls += 1
-            ctx_stats["helper_calls"] = ctx_stats.get("helper_calls", 0) + 1
-            audit = await run_reply_audit(reply)
-
-        if needs_promise_check and audit and audit.get("promete_busqueda"):
-            demoted_promise = True
-            logger.info("[AGENT] Reply promised a search without calling the tool; nudging.")
-            messages.append(Message(role="assistant", content=reply))
-            messages.append(Message(role="user", content=_internal(
-                "Has dicho que vas a buscar pero NO has llamado a search_products. Llámala AHORA "
-                "con la consulta adecuada (combina la marca o referencia del cliente con el "
-                "producto del que hablabais en el historial), o responde con lo que ya sabes "
-                "sin prometer búsquedas.")))
-            continue
-
-        if reply and not queries and can_nudge and not demoted_style and _is_parroting(reply, recent_history):
-            demoted_style = True
-            logger.info("[AGENT] Reply parrots a previous message verbatim; asking for a rewrite.")
-            messages.append(Message(role="assistant", content=reply))
-            messages.append(Message(role="user", content=_internal(
-                "Estás repitiendo literalmente frases de tus mensajes anteriores. Reescribe la "
-                "respuesta con otras palabras: reacciona a lo que acaba de decir el cliente, "
-                "mantén la lista numerada con los MISMOS códigos y termina con una pregunta distinta.")))
-            continue
-
-        if needs_humility_check and audit and not audit.get("invita_correccion"):
-            demoted_humility = True
-            logger.info("[AGENT] Media-derived proposal lacks a correction invitation; nudging.")
-            messages.append(Message(role="assistant", content=reply))
-            messages.append(Message(role="user", content=_internal(
-                "Tu propuesta viene de interpretar una imagen/audio: dilo con naturalidad (puedes "
-                "haber leído mal) e invita al cliente a corregirte con más detalle, la marca o el "
-                "código exacto. Reescribe variando las palabras, con los MISMOS códigos.")))
-            continue
-
-        if (executor.blocked_media_adds or executor.blocked_media_close or
-                executor.blocked_empty_close) and can_nudge and not demoted_media_add:
-            demoted_media_add = True
-            parts: List[str] = []
-            if executor.blocked_media_adds:
-                codes = ", ".join(dict.fromkeys(executor.blocked_media_adds))
-                parts.append(f"el mensaje es una lectura automática (audio/imagen) y NO contiene "
-                             f"el código {codes}: no lo apuntes todavía; di qué has entendido, "
-                             f"propón el producto y espera su confirmación")
-            if executor.blocked_media_close:
-                parts.append("tampoco cierres el pedido desde un audio/imagen: resume lo entendido "
-                             "más el carrito actual y pide la confirmación final por escrito")
-            if executor.blocked_empty_close:
-                parts.append("el pedido está vacío: no se puede cerrar; pregunta qué productos quiere")
-            executor.blocked_media_adds.clear()
-            executor.blocked_media_close = False
-            executor.blocked_empty_close = False
-            messages.append(Message(role="assistant", content=reply or "(acción bloqueada)"))
-            messages.append(Message(role="user", content=_internal("; ".join(parts).capitalize() + ".")))
-            continue
-
-        if (reply and not queries and can_nudge and not demoted_intro
-                and intro_mode in ("new", "renew")
-                and len((current_message or "").split()) >= 5
-                and not executor.results_this_turn
-                and not executor.held_for_enrichment and not demoted_generic_q
-                and not _proposal_codes(reply) and not executor.order_activity):
-            demoted_intro = True
-            logger.info("[AGENT] Intro reply ignored the message content; nudging.")
-            messages.append(Message(role="assistant", content=reply))
-            messages.append(Message(role="user", content=_internal(
-                "El cliente YA ha dicho lo que necesita en su mensaje: atiéndelo en esta misma "
-                "respuesta (busca los productos que nombra o responde a lo que plantea), además "
-                "del saludo. No le preguntes qué necesita.")))
-            continue
-
-        # PROPOSAL GROUNDING: every code in a numbered proposal must come from
-        # THIS turn's search results (or the cart; or the last closed order when
-        # the client asks to repeat it). Anything else — Memoria, old history,
-        # prompt examples — presented as "found" is inventing availability.
-        if reply and not queries:
-            allowed = set(executor.results_this_turn) | {_sane_code(c) for c in executor.cart}
-            # Last dispatched order's codes are real and grounded, so allow the
-            # client to repeat them without a re-search regardless of the flag.
-            allowed |= {_sane_code(i.get("code", "")) for i in (session.get("last_closed_cart") or [])}
-            bad = {c for c in _proposal_codes(reply) if c and c not in allowed}
-            if bad:
-                if can_nudge and not demoted_grounding:
-                    demoted_grounding = True
-                    logger.info(f"[AGENT] Ungrounded proposal codes {sorted(bad)}; asking for a rewrite.")
-                    messages.append(Message(role="assistant", content=reply))
-                    messages.append(Message(role="user", content=_internal(
-                        f"Has propuesto códigos que NO están en los resultados de esta búsqueda: "
-                        f"{', '.join(sorted(bad))}. Reescribe la propuesta usando SOLO los resultados "
-                        "actuales (busca de nuevo si lo necesitas). No ofrezcas nada que no haya salido; "
-                        "los códigos de ejemplo de tus instrucciones NO existen.")))
-                    continue
-                logger.warning(f"[AGENT] Stripping ungrounded proposal codes {sorted(bad)} from the reply.")
-                reply = _strip_ungrounded_lines(reply, bad)
-
-        if queries and step >= budget - 1 and not executor.results_this_turn \
-                and budget == MAX_STEPS:
-            budget += 1     # grace: run the turn's first search + one phrasing call
-            logger.info("[AGENT] Grace round granted for a last-step first search.")
-        if queries and step < budget - 1:
-            enrich_pending = {i.get("pedido") for i in executor.open_items
-                              if i.get("estado") == "enriquecer"}
-            uniq = list(dict.fromkeys(queries))
-            route: Dict[str, str] = {}          # query -> RUN | HOLD | ATTR
-            uncovered: List[str] = []
-            for q in uniq:
-                ql = q.strip().lower()
-                if ql in enrich_pending or any(_same_item(q, p or "") for p in enrich_pending):
-                    route[q] = "RUN"            # client already engaged on this item
-                elif _code_shaped(q):
-                    route[q] = "RUN"            # a code is always searchable, turn one included
-                else:
-                    cls = _classify_query(q, triage)
-                    if cls == TRIAGE_WORTHY:
-                        route[q] = "RUN"        # Pass-1 verdict: specific enough — search NOW
-                    elif cls == TRIAGE_AMBIGUOUS:
-                        route[q] = "HOLD"       # Pass-1 verdict: needs conversational narrowing
-                    elif cls == TRIAGE_ATTRIBUTE:
-                        route[q] = "ATTR"       # Pass-1 verdict: variant of the current topic
-                    else:
-                        uncovered.append(q)     # invented mid-loop: ask the query-gate helper
-            if uncovered:
-                ctx_stats["helper_calls"] = ctx_stats.get("helper_calls", 0) + 1
-                verdicts = await run_query_gate(uncovered)
-                for q in uncovered:
-                    # Missing verdict -> PERMISSIVE (run it): the result triage
-                    # and the uncovered-token honesty rule absorb noisy hits.
-                    v = verdicts.get(q.strip().lower(), "SEARCHABLE")
-                    route[q] = {"SEARCHABLE": "RUN", "GENERIC": "HOLD", "ATTRIBUTE": "ATTR"}[v]
-            runnable, held = [], []
-            for q in uniq:
-                verdict = route[q]
-                if verdict == "ATTR":
-                    if topic:
-                        grounded = f"{' '.join(topic)} {q}"
-                        logger.info(f"[AGENT] Attribute query grounded with topic: '{q}' -> '{grounded}'")
-                        runnable.append(grounded)
-                    else:
-                        held.append(q)          # no product context: ask which product it refers to
-                elif verdict == "HOLD":
-                    held.append(q)
-                else:
-                    runnable.append(q)
-            if held:
-                logger.info(f"[AGENT] Queries HELD for enrichment (no Qdrant call): {held}")
-                for h in held:
-                    if not any(_same_item(h, e) for e in executor.held_for_enrichment):
-                        executor.held_for_enrichment.append(h)
-                        executor.held_qty.setdefault(h.strip().lower(), _triage_qty(h, triage))
-            if not runnable:
-                if can_nudge and not demoted_generic_q:
-                    demoted_generic_q = True
-                    messages.append(Message(role="assistant", content=json.dumps(
-                        {"tool_calls": [{"search_products": queries}]}, ensure_ascii=False)))
-                    held_line = "; ".join(
-                        f"{h} (x{executor.held_qty.get(h.strip().lower(), 1)})" for h in held)
-                    nudge = (
-                        f"Estas menciones son demasiado genéricas para identificar un artículo "
-                        f"entre miles ({held_line}): NO las busques a ciegas. Si el mensaje o el "
-                        f"historial dan más contexto (marca, línea, medida, color), busca con ESO. "
-                        f"Si no, resume con naturalidad lo que has entendido (con sus cantidades) "
-                        f"y pide amablemente un poco más de detalle, recordando con humildad que "
-                        f"el código de producto es lo más rápido y seguro para apuntarlo sin "
-                        f"error; si dice que se llama así tal cual, lo buscarás. Una sola pregunta.")
-                    messages.append(Message(role="user", content=_internal(nudge)))
-                    continue
-                queries = []
-                reply = reply or ""
-                break
-            queries = runnable
-            results = await search(queries)
-            executor.register_results(results)
-            # Semantic MATCH pass (one simple 0.0 call): decide which retrieved
-            # candidates truly are each requested product, instead of guessing
-            # from relevance-score thresholds. Uses the merged (per-item) hits
-            # and the top few candidates each.
-            merged_for_match = _merge_variant_queries(results)
-            # Code queries are resolved deterministically (exact match) in the
-            # triage, so they never go to the match helper. Cap candidates per
-            # item to 4 so a long list's payload isn't middle-cut (which would
-            # silently drop items from the match).
-            match_items = [
-                {"pedido": q, "candidatos": [_hit_line(h) for h in hits[:4]]}
-                for q, hits in merged_for_match.items() if hits and not _code_shaped(q)
-            ]
-            match_map = await run_match(match_items) if match_items else None
-            # Feed a TRIAGED digest, not a raw hit dump: resolved items in one
-            # line each, ONE question at a time, the rest queued — how a real
-            # salesman walks a client's list. The queue persists in the session.
-            digest, executor.open_items = _triage_results(
-                results, executor.open_items,
-                is_media=_is_media_message(current_message),
-                held_count=len(executor.held_for_enrichment),
-                match_map=match_map)
-            # Record authoritative quantities (from the free-JSON triage) for
-            # every code the search resolved this turn, so add_item uses the
-            # real number even if the tool-call grammar truncates its argument.
-            for key in ("identificados_seguros", "elegidos_probables"):
-                for r in digest.get(key, []):
-                    code = _sane_code(r.get("codigo"))
-                    if code:
-                        executor.qty_hints[code] = _triage_qty(r.get("pedido", ""), triage)
-            many_unresolved = "no_encontrados" in digest
-            if many_unresolved:
-                # >2 unresolved: we already collapsed them into one ask for
-                # names/codes. Don't also spell out per-item enrichment prompts
-                # (that's the tedious wall we're avoiding) — fold the held names
-                # into the same ask and clear them.
-                if executor.held_for_enrichment:
-                    digest["no_encontrados"] = list(digest["no_encontrados"]) + \
-                        list(executor.held_for_enrichment)
-                    executor.held_for_enrichment.clear()
-            elif executor.held_for_enrichment:
-                digest["necesitan_detalle"] = list(executor.held_for_enrichment)
-                digest["instruccion_detalle"] = (
-                    "para estos pide, con humildad, nombre exacto o palabras clave "
-                    "(sugiere tú un ejemplo de búsqueda más completa); el código es lo más "
-                    "exacto; si de verdad se llama así tal cual, lo buscarás")
-            # A runnable query that covers a pending-enrichment item means the
-            # client already gave the detail: clear the stale item.
-            ran_tokens = {t for q in queries for t in _query_tokens(q)}
-            executor.open_items = [
-                i for i in executor.open_items
-                if i.get("estado") != "enriquecer"
-                or not (set(_query_tokens(i.get("pedido", ""))) & ran_tokens)
-            ]
-            messages.append(Message(role="assistant", content=json.dumps(
-                {"tool_calls": [{"search_products": queries}]}, ensure_ascii=False)))
-            messages.append(Message(role="tool", content=_cap_middle(
-                json.dumps({"resultados_busqueda": digest}, ensure_ascii=False), MAX_RESULTS_CHARS)))
-            continue
-
-        if not reply and all_calls and step < MAX_STEPS - 1:
-            # Small models often emit only tool calls first; ask for the final text.
-            messages.append(Message(role="assistant", content=json.dumps(
-                {"tool_calls": [c.get("function", {}).get("name") for c in all_calls]})))
-            messages.append(Message(role="user",
-                                    content="Cambios aplicados. Escribe AHORA tu respuesta final al cliente (o <NO_REPLY>)."))
-            continue
-
-        break
-
-    # Budget spent with NO reply on a turn that did real work: the small model
-    # burned its steps tool-calling (observed live: re-searching an
-    # already-searched code, a promise-nudge eating a round) and never wrote
-    # text. Silence here strands a client who is mid-order and even asked for a
-    # summary. Force ONE text-only call (no tools -> it MUST answer); if that
-    # still yields nothing, send a deterministic confirmation from state.
-    # Genuine silence (handoff / opt-out / nothing happened) is left untouched.
-    active_turn = (executor.order_activity or executor.results_this_turn
-                   or executor.cart or executor.open_items or executor.pending_adds)
-    if not reply and not executor.handoff and not executor.opt_out and active_turn:
-        logger.info("[AGENT] Budget spent with no reply on an active turn; forcing a final answer.")
-        glitch_note = ("Además, tus borradores de este turno salieron corruptos por un fallo "
-                       "técnico: si encaja, reconoce breve y amable un pequeño fallo por tu "
-                       "parte (sin tecnicismos) antes de continuar. "
-                       if turn_glitch else "")
-        messages.append(Message(role="user", content=_internal(
-            glitch_note +
-            "Se acabaron los pasos. Escribe AHORA la respuesta final al cliente siguiendo tus "
-            "reglas: confirma con naturalidad lo que has apuntado (con sus códigos y cantidades), "
-            "y si pidió un resumen, dáselo a partir del carrito actual. PROHIBIDO prometer que "
-            "vas a buscar, pedir que espere ('un momento', 'dame un segundo'), disculparte por "
-            "demoras o mencionar búsquedas, sistemas o procesos internos: la búsqueda ya ha "
-            "terminado, responde con lo que TIENES. NO llames a ninguna herramienta; responde "
-            "solo con el texto para el cliente.")))
-        _fit_and_track()
-        try:
-            resp = await asyncio.to_thread(
-                llm.chat, CIMA_MODEL, messages,   # NO tools: text is the only valid output
-                options={"temperature": AGENT_TEMPERATURE, "top_p": 0.9,
-                         "repeat_penalty": 1.1, "num_predict": 512},
-            )
-            reply = _clean(resp.content)
-        except Exception as e:
-            logger.error(f"[AGENT] Forced final-answer call failed: {e}")
-        if len(reply.strip()) < 20:
-            # Empty, or cleaned down to a stub like "Entendido." after a leak
-            # was stripped — a deterministic state summary is more useful.
-            greet = intro_mode == "new" or (
-                intro_mode == "renew" and (executor.order_activity or executor.results_this_turn))
-            reply = _fallback_reply(list(executor.cart.values()), executor.open_items,
-                                    client_name, salesman_name, greet)
-            logger.warning("[AGENT] Forced reply empty/stub; using deterministic fallback.")
-
-    reply, leaked_note = _split_leaked_note(reply)
-    if leaked_note and not executor.summary_touched:
-        executor.summary = leaked_note[:300]
-        logger.info(f"[AGENT] Leaked visible note rerouted to summary: '{leaked_note[:60]}'")
-    return await _finish(reply)
+    logger.info(f"[PIPE] turno ok: llamadas={budget.used} hechos="
+                f"{[h.tipo for h in resultado.hechos]} cart={len(resultado.estado.cart)} "
+                f"status={resultado.estado.order_status}")
+    # Mantenimiento: recompactar el resumen si el hilo creció (§3.6). Fuera del
+    # presupuesto del turno; si falla, el resumen previo sigue sirviendo.
+    resumen_out["v"] = await _compactar_resumen(resumen, hilo, budget)
+    return _result(mensaje, resultado.estado, resultado.hechos)

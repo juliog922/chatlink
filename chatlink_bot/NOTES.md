@@ -1,369 +1,325 @@
-# WORKFLOW SPECIFICATION: MULTI-CHANNEL SALES ASSISTANT
+# NOTES — Kapa (bot de pedidos ChatLink)
 
-## 1. Goal
-Build a multi-channel sales order assistant that monitors WhatsApp (WhatsMeow) and Gmail (IMAP/SMTP). It normalizes messages into a single stream and only reacts to known clients found in SQL Server.
-
-## 2. Core Logic
-1.  **Ingestion:**
-    * **WhatsApp:** Via gRPC (WhatsMeow). Salesmen pair via QR.
-    * **Email:** Per-user IMAP monitoring.
-    * **Admin Control:** An "Admin" WhatsApp channel listens for commands ("login [email]", "logout [email]") from specific numbers to manage Salesman sessions (generate QR codes, start/stop email monitoring).
-2.  **Identification (The Gatekeeper):**
-    * Incoming messages are checked against SQL Server `Clientes`.
-    * **Phone Match:** Check `Telefono`, `Telefono2`, `Telefono3`.
-    * **Email Match:** Check `EMail1`, `EMail2`.
-    * *Action:* Discard if no match.
-3.  **Content Processing:**
-    * Persist all messages (Text + Media).
-    * **Audio:** Transcribe via Whisper.
-    * **Images:** Extract text via Vision model.
-    * **Docs:** Extract text from PDF/CSV/XLSX/DOC/TXT.
-4.  **Conversation State Machine:**
-    * **Debounce:** 15-minute timer per conversation (reset on new client msg).
-    * **Human Takeover:** If commercial replies before timer ends, cancel event.
-    * **Trigger:** When timer fires, load incremental history.
-5.  **Order Intelligence (RAG & LLM):**
-    * **Product Indexing (Qdrant):** On startup + Daily Event. Indexes `DescripcionArticulo`, `Descripcion2Articulo`, `DescripcionLinea`, `ComentarioArticulo`, `MarcaProducto` where `K_BOT=1`.
-    * **Summarizer:** Analyze history for (1) Closed Orders, (2) Building Orders, (3) Mentioned Products, (4) Narrative Context.
-    * **Hybrid Search:** Split client messages into intent blocks. Run hybrid search (Dense + Sparse) on Qdrant to find potential products.
-    * **LLM Context:** Send Summary + Top K Product Candidates + Recent Chat.
-    * **LLM Role:** Strictly order building. Clarify ambiguities. Natural but professional tone.
-    * **Non-Commercial Guardrail:** If message is purely conversational/status check, respond: "The commercial will contact you soon."
-6.  **Output:**
-    * Confirmed list -> Generate XLSX -> Send to Commercial (via Admin Gmail).
+> Actualizado 2026-08-24. Este documento manda sobre el código. Si el código
+> hace algo que este documento no dice, el código está mal. Escrito tras
+> comprobar que el diseño anterior (extracción sin conversación + reglas
+> estructurales acumuladas) se volvió rígido y antinatural: el bot no leía el
+> hilo, así que "sí ese", "13", "quítame el otro" se caían y se intentaban
+> tapar con más reglas. La corrección de raíz está en §3 (el loop): **el LLM
+> lee la conversación; el código escribe el estado y verifica.**
 
 ---
 
-# DATABASE SCHEMA REFERENCE (SQL SERVER)
-*Read-Only access used for Client Identification and Product Lookup.*
+## 1. Qué es Kapa y qué NO es
 
-## TABLE: Clientes
-**Primary Key:** `CodigoCliente` (assumed based on usage)
+Kapa cubre al comercial **solo cuando este no ha contestado** por su canal
+(WhatsApp o Gmail) en un tiempo configurado. Su única función es **montar
+pedidos** y pasárselos al comercial. No es atención al cliente.
 
-### RELEVANT COLUMNS (Used for Identification & Context)
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| **Nombre** | varchar(35) | Client Name (e.g., "PELAYO OSUNA, LAURA") |
-| **Telefono** | varchar(15) | Primary Phone (e.g., "685176889") |
-| **Telefono2** | varchar(15) | Secondary Phone |
-| **Telefono3** | varchar(15) | Tertiary Phone |
-| **EMail1** | varchar(250) | Primary Email (e.g., "administracion@kapalua.es") |
-| **EMail2** | varchar(250) | Secondary Email |
+Reglas de producto, todas obligatorias:
 
-### OTHER COLUMNS (Context / Informational)
-* **Location:** `Domicilio`, `CodigoPostal`, `Municipio`, `Provincia`, `SiglaNacion`.
-* **Business:** `CifDni` (Tax ID), `RazonSocial`, `FormadePago`, `TarifaPrecio`.
-* **Logistics:** `CodigoTransportista`, `ObservacionesCliente`.
-* **Metadata:** `FechaAlta`, `CodigoEmpresa`, `CodigoCliente`.
-* **Legacy/Internal:** `ActivarLogicNet`, `UsuarioLogicNet`, `K_DtoVolumen`, `KNumTiendas`.
+1. **Solo habla si el comercial no ha respondido** en `RESPONSE_DELAY_MINUTES`.
+   Si el comercial contesta antes, Kapa calla (lo gobierna el FSM/debounce, no
+   el LLM).
+2. **Solo temas de pedido.** Cualquier otra cosa comercial que Kapa no puede
+   atender —precios, especificaciones de producto, plazos, facturas, quejas—
+   se **deriva** al comercial ("se pondrá en contacto en breve", redactado
+   por el LLM, **nunca** una frase fija).
+3. **No responde si el cliente pide hablar con el comercial** explícitamente.
+   Calla y el comercial toma el hilo.
+4. **No responde a charla no comercial.** Si no hay nada de pedido que hacer
+   y el comercial está gestionando, Kapa calla. El bot contesta POCO: hablar
+   es la excepción, no la norma.
+5. **Confirmación antes de cerrar.** Una vez cerrado el pedido no hay
+   modificación por parte del bot; para rectificar, se espera al comercial.
+   Por eso el cierre siempre pide confirmación explícita.
+6. **El comercial es el último filtro.** Todo pedido lo valida él antes de
+   salir. Kapa es permisivo al apuntar y honesto cuando duda.
 
-## TABLE: Articulos (Mapped to Products)
-**Primary Key:** `CodigoArticulo`
-
-### RELEVANT COLUMNS (Used for Order Resolution)
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| **CodigoArticulo** | varchar(21) | Unique SKU (e.g., "00104") |
-| **DescripcionArticulo** | varchar(60) | Main Name (e.g., "GN QUITA ESMALTE ROS...") |
-| **Descripcion2Articulo** | varchar(40) | Secondary Name |
-| **DescripcionLinea** | text | Extended Description |
-| **ComentarioArticulo** | text | Internal comments |
-| **MarcaProducto** | varchar(50) | Brand (e.g., "GENA", "TAIFF") |
-| **K_BOT** | smallint | Bot Visibility Flag (e.g., -1 or 1) |
-
-### OTHER COLUMNS (Context / Informational)
-* **Pricing:** `PrecioVenta`, `PrecioCosteEstandar`, `%Descuento`, `IvaIncluido`.
-* **Stock:** `StockMinimo`, `StockMaximo`, `PuntoPedido`.
-* **Logistics:** `PesoBrutoUnitario_`, `KUnidXCaja`, `KEANCaja`.
-* **Dimensions:** `KAltoArticulo`, `KAnchoArticulo`, `KLargoArticulo`.
-* **Classification:** `CodigoFamilia`, `CodigoSubfamilia`, `Temporada`.
+Nada de respuestas hardcodeadas. Las frases fijas se ven falsas y, peor,
+hacen que el bot "responda sin leer". El LLM redacta; el código solo verifica
+que no invente códigos ni cantidades (§3, etapa REDACTAR/VERIFICAR).
 
 ---
 
-# DATABASE SCHEMA REFERENCE (POSTGRESQL)
-*Write access. Stores Application State, Users, and Normalized Chat History.*
+## 2. Cómo son los clientes y los datos (por qué esto es difícil)
 
-## TABLE: app_users
-*Stores internal system users (Salesmen/Admins).*
+- Los clientes **ya han hablado con el comercial** antes, una o varias veces.
+  Piden con abreviaturas, apodos y nombres que **no** coinciden con el nombre
+  de catálogo ("el kajal negro", "brow 403", "lo de siempre").
+- Mandan **listas largas** (10-15 productos de golpe) por **texto, imagen o
+  documento**. La media y los documentos ya llegan transcritos con marcador.
+- La base por cliente son **sus pedidos pasados**, filtrados a lo visible por
+  el bot (`K_BOT == 0`). Hoy es lo único fiable (el catálogo general está
+  sucio). **Más adelante** se ampliará al catálogo total con el filtro del
+  bot; el loop no debe asumir que la fuente es solo el historial, solo que
+  "hay un recuperador de productos del cliente".
+- El cliente **se refiere a cosas anteriores**: "quítame el otro", "agrégame
+  2 más", "como el pedido pasado". El bot **tiene que mantener el hilo**.
+- Puede pedir **rehacer un pedido anterior**. El bot los conoce por orden
+  cronológico, pero **siempre pide confirmación** antes de rehacerlo.
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| **id** | Integer (PK) | Auto-incrementing ID. |
-| **name** | String | Full name of the user. |
-| **email** | String (Unique) | User email (used for login/notifications). |
-| **phone** | String | User phone number. |
-| **role** | Enum | 'admin' or 'user'. |
-| **created_at** | DateTime | Record creation timestamp. |
-
-## TABLE: chats
-*Stores normalized WhatsApp messages.*
-
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| **id** | Integer (PK) | Auto-incrementing ID. |
-| **chat_id** | String | The unique identifier for the conversation (Client Phone). |
-| **user** | String | The internal user (Salesman) phone involved. |
-| **client** | String | The client phone involved. |
-| **message** | Text | The content of the message. |
-| **direction** | String | 'sent' (Salesman->Client) or 'received' (Client->Salesman). |
-| **input_type** | Enum | 'text', 'image', 'audio', 'pdf', 'xlsx', etc. |
-| **is_bot** | Boolean | True if the message was generated by the AI agent. |
-| **timestamp** | DateTime | When the message occurred. |
-| **created_at** | DateTime | When the record was saved. |
-
-## TABLE: email_chats
-*Stores normalized Email threads.*
-
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| **id** | Integer (PK) | Auto-incrementing ID. |
-| **chat_id** | String | The unique identifier (Client Email). |
-| **user** | String | The internal user (Salesman) email. |
-| **client** | String | The client email. |
-| **message** | Text | Content (Subject + Body). |
-| **direction** | String | 'sent' or 'received'. |
-| **input_type** | Enum | 'text', 'pdf', 'xlsx', etc. (based on attachment). |
-| **is_bot** | Boolean | True if the email was generated by the AI agent. |
-| **timestamp** | DateTime | When the email was sent/received. |
-| **created_at** | DateTime | When the record was saved. |
+Consecuencia de diseño: sin la conversación delante, el LLM no puede resolver
+nada de esto. Por eso el hilo entra en el prompt (§3).
 
 ---
 
-# DEVELOPMENT PLAN
+## 3. EL LOOP (el corazón — leer con atención)
 
-## 1. Logic Modules & Responsibilities
+Inspiración: los orquestadores de chat (Claude, etc.) mantienen la
+conversación como fuente de verdad y compactan cuando crece. Kapa hace lo
+mismo, con una diferencia forzada por el modelo: gemma-4-E2B es un 2B con
+ventana de 8192 y **no** sostiene un bucle de herramientas (probado: emitía
+las tool-calls como texto). Así que en vez de un agente que decide qué
+herramienta llamar, Kapa ejecuta un **plan fijo de 3 llamadas**, cada una con
+un solo trabajo. La "inteligencia de agente" está concentrada en la PRIMERA
+llamada, que es la única que ve toda la conversación y decide qué hacer.
 
-### A. **Gateway Module (Ingestion & Normalization)**
-* **Role:** The "Ears" of the system.
-* **Responsibilities:**
-    * Manage gRPC connection to `chatlink-meow` (WhatsApp).
-    * Manage multi-threaded IMAP listeners (Gmail).
-    * Admin Command Listener: Monitor "Admin" WhatsApp for commands (`login`, `logout`) to spawn QR codes or kill sessions.
-    * **Crucial:** Filter traffic. Check every incoming ID (Phone/Email) against SQL Server. If not found -> Drop immediately.
-    * Normalize valid messages into `MessageEvent` objects and persist to Postgres (`chats` / `email_chats`).
+Principio rector, en una frase:
+**El LLM LEE (conversación → intención). El código ESCRIBE (estado) y VERIFICA
+(que la respuesta no mienta). El LLM REDACTA (estado → lenguaje natural).**
 
-### B. **State Machine Module (The Orchestrator)**
-* **Role:** The "Clock" and "State Keeper".
-* **Responsibilities:**
-    * Maintain a per-conversation state: `IDLE` -> `ACTIVE` -> `DEBOUNCING` -> `PROCESSING`.
-    * **Debounce Logic:** On client msg, set timer (15m). If commercial replies, Cancel Timer (Human Takeover).
-    * **Trigger:** When timer expires, trigger the **Intelligence Module**.
+### 3.0 Puerta de entrada (código, sin LLM)
 
-### C. **Intelligence Module (RAG & Parsing)**
-* **Role:** The "Brain".
-* **Responsibilities:**
-    * **Text Extraction:** Route media (Images/Docs) to specific parsers/OCR.
-    * **Intent Splitting:** Pre-process client text to isolate potential product mentions from chatter.
-    * **Vector Search (Qdrant):**
-        * **Startup/Daily:** Index `Articulos` (where `K_BOT=1`) into Qdrant. Fields: `Descripcion*`, `Comentario`, `Marca`.
-        * **Runtime:** Perform Hybrid Search (Dense + Keyword) for each extracted intent block. Return `Top-K` candidates with scores.
-    * **LLM Integration:** Assemble context (Summary + Candidates + Chat) and call LLM.
+Antes del loop, dos cosas que NO decide el LLM:
 
-### D. **Output Module (Action)**
-* **Role:** The "Hands".
-* **Responsibilities:**
-    * **Response Generation:** Send LLM response to Client (WhatsApp/Email).
-    * **Order Finalization:** If LLM detects "Confirmed Order":
-        * Generate structured XLSX.
-        * Send Email to Commercial (using Admin Gmail credentials) with XLSX attachment.
+- **¿Debe el bot actuar?** Lo decide el FSM: el debounce dispara solo si el
+  comercial no respondió en `RESPONSE_DELAY_MINUTES`. Si respondió → handoff,
+  el turno ni empieza.
+- **¿Hay algo nuevo que contestar?** Si el único mensaje pendiente es un eco
+  del propio bot o no hay mensajes nuevos del cliente → silencio.
 
----
+Lo que llega al loop: la tanda de mensajes del cliente acumulada en el
+debounce (uno o varios), más todo el contexto de la conversación.
 
-## 2. Conversation State Machine (Finite State Machine)
+### 3.1 Ensamblado de contexto (código, sin LLM)
 
-We will implement a simplified FSM for each Client-Salesman pair.
+Se construye UN paquete de contexto, presupuestado, que alimenta la llamada 1:
 
-1.  **IDLE**: No recent activity.
-    * *Event:* Client Message -> Transition to **DEBOUNCING**. Start 15m Timer.
-2.  **DEBOUNCING**: Waiting for potential follow-up messages.
-    * *Event:* Client Message -> Reset 15m Timer. Stay in **DEBOUNCING**.
-    * *Event:* Commercial Message -> **CANCEL**. Transition to **IDLE** (Human replied).
-    * *Event:* Timer Expired -> Transition to **PROCESSING**.
-3.  **PROCESSING**: AI is working.
-    * *Action:* Run RAG -> Call LLM -> Send Reply.
-    * *Transition:* Back to **IDLE**.
+| Ingrediente | Qué es | Presupuesto aprox. |
+|---|---|---|
+| Resumen | El resumen compactado de la conversación (§3.6) | ~400 tok |
+| Hilo reciente | Las últimas ~10 intervenciones, **etiquetadas por rol**: `CLIENTE:`, `COMERCIAL:`, `KAPA:` | ~900 tok |
+| Pedido actual | El carrito, numerado (nombre, cantidad, código) | ~200 tok |
+| Pendientes | Preguntas abiertas del bot y opciones vivas | ~200 tok |
+| Mensaje(s) del turno | Lo que hay que contestar ahora | ~800 tok |
 
----
+Los **roles importan**: en la conversación intervienen cliente, comercial y
+bot. "Quítame el otro" solo se entiende viendo qué dijo KAPA justo antes;
+"como acordamos" puede referirse a algo que dijo el COMERCIAL. El LLM debe ver
+quién dijo qué.
 
-## 3. Qdrant & RAG Strategy
+Total típico ~2500 tok (30% de la ventana). Nunca se "recorta a posteriori":
+si el hilo + resumen se acercan al 60% de la ventana, se dispara la
+compactación (§3.6) ANTES, no se truncan mensajes a lo bruto.
 
-* **Collection Name:** `products`
-* **Payload Fields:**
-    * `CodigoArticulo` (ID)
-    * `DescripcionArticulo`
-    * `MarcaProducto`
-    * `K_BOT`
-* **Indexing Strategy:**
-    * Combine `DescripcionArticulo` + `Descripcion2Articulo` + `DescripcionLinea` + `MarcaProducto` into a single text blob for embedding.
-    * Use a Multi-Lingual model (e.g., `paraphrase-multilingual-mpnet-base-v2`) for dense vectors.
-    * Enable Sparse Vectors (BM25) for exact keyword matching (critical for specific brand names or codes).
+### 3.2 Llamada 1 — COMPRENDER (el cerebro del turno)
 
----
+Única llamada que ve la conversación entera. Entrada: el paquete de §3.1.
+Tarea: leer el hilo y decidir qué quiere el cliente **ahora**, resolviendo
+referencias a lo anterior. Salida (JSON, un objeto):
 
-## 4. LLM Prompt Proposals (Provisional)
-
-### Prompt A: The Summarizer (Internal Logic)
-*Goal: Maintain a running summary of the order status AND the conversational context.*
-
-```text
-You are an Order Assistant. Update the conversation summary based on the new messages.
-
-Current Summary: {current_summary}
-New Messages:
-{new_messages_text}
-
-Output JSON:
+```
 {
-  "order_status": "BUILDING" | "CLOSED" | "IDLE",
-  "confirmed_items": [{"code": "...", "qty": 1}],
-  "potential_mentions": ["list", "of", "vague", "products"],
-  "last_interaction_intent": "ORDER" | "QUESTION" | "CHATTER",
-  "chat_context_summary": "Brief narrative of the conversation flow so far. (e.g., 'User asked for shampoo prices, rejected the first offer, and is now asking for conditioners. User seems in a hurry.')"
+  "hablar": true|false,          # ¿el bot debe responder este turno?
+  "derivar": null | "precio" | "especificacion" | "plazo_factura"
+             | "queja" | "hablar_comercial" | "otro",
+  "actos": [ ... ],              # operaciones de pedido, con referencias TEXTUALES
+  "cerrar": true|false,          # el cliente da el pedido por terminado
+  "rehacer_anterior": true|false # quiere repetir un pedido pasado
 }
 ```
 
-### Prompt B: The Order Builder (The Client Response)
-*Goal: Clarify products or confirm order with a NATURAL, helpful tone.*
+- `hablar=false` → **silencio** (charla que no necesita al bot, o el comercial
+  ya está en ello). Esto es lo que hace que el bot conteste poco.
+- `derivar != null` → el bot **no** intenta resolverlo; redacta una derivación
+  natural y (según el tipo) hace handoff. `hablar_comercial` → silencio +
+  handoff.
+- `actos` usa el vocabulario cerrado (pedir / modificar / elegir / rechazar /
+  confirmar), cada uno con **evidencia** (el fragmento literal del mensaje) y
+  **referencias textuales**, nunca códigos ni índices. Los deícticos ("ese",
+  "el segundo", "el otro", "sí ese", "13") se resuelven aquí porque el LLM ve
+  contra qué: la pregunta anterior de KAPA está en el hilo.
 
-```text
-You are a Sales Assistant for a Cosmetics Distributor.
-Your Goal: Help the client build an order efficiently.
+Un turno normal produce pocos actos. Un turno de charla produce `hablar=false`
+y nada más. Una lista larga produce muchos `pedir`.
 
-Context:
-- Client Name: {client_name}
-- Conversation Narrative: {chat_context_summary}
-- Current Order State: {confirmed_items}
-- Found Product Candidates (from Database):
-  {rag_candidates_json} (Format: "User Text" -> [Top 3 DB Matches with Confidence])
+Presupuesto: 1 llamada. Salida ~400 tok.
 
-Rules:
-1. ONLY discuss the order. If the user asks about prices, delivery times, or personal topics, politely say: "The commercial will contact you soon regarding those details."
-2. If the user mentions a product vaguely, use the Candidates list to propose the most likely match. Ask for confirmation naturally.
-3. If multiple candidates are similar, list them clearly (Name + Brand) and ask which one they prefer.
-4. If the user confirms an item, acknowledge it briefly and move to the next point.
-5. If the order seems complete, ask for final confirmation of the full list.
-6. **TONE:** Speak Spanish (or user language). Be professional and natural. Avoid sounding robotic. Do not engage in unnecessary small talk, but maintain a polite, helpful flow.
+### 3.3 Resolución (código + llamada 2 solo si hace falta)
 
-User Last Message: "{last_message}"
+Por cada referencia de producto, el código la resuelve contra el recuperador
+del cliente (hoy: su historial K_BOT==0; mañana: catálogo filtrado):
 
-Response:
+- Se decide **sin LLM** cuando se puede: código tecleado que existe, alias
+  exacto, candidato único que cubre lo dicho, cero candidatos, dominancia
+  estricta (el producto gana al tester / al material de expositor porque sus
+  palabras son un subconjunto), nombres idénticos tras normalizar.
+- Solo lo **genuinamente ambiguo** (varios candidatos distinguibles) va a la
+  **llamada 2 — MATCH**: una sola llamada por lotes, salida por índice (jamás
+  un código nuevo). Tope de ítems por llamada; los excedentes quedan como
+  "por aclarar" sin llamar.
+
+Manejo de **no encontrado** y **listas largas** (requisito explícito, §2):
+
+- Si **no** encuentra un producto: se disculpa y pide **marca u otra palabra
+  clave**, con honestidad ("no lo veo entre lo que sueles pedir"). Nunca se lo
+  inventa.
+- Si encuentra **varias** coincidencias: ofrece **código + el factor que las
+  diferencia** (p. ej. "15 ml" vs "25 ml"), si lo hay. Si nada las diferencia,
+  el código es la única información accionable y se da.
+- En **listas de 3 o más**, PROHIBIDO sobrecargar: nada de recitar opciones
+  para cada producto ni listas de sí/no. El bot **sabe internamente** cuáles
+  no resolvió, pero al cliente le pide ayuda de forma natural — por marca o
+  detalle— **sin listárselos todos**, o va de **uno o dos en uno** para que
+  los aclare. Lo demás del pedido se apunta y se sigue.
+
+### 3.4 Reductor (código, único escritor)
+
+Toma las operaciones ya resueltas y las aplica al estado. **Es el único punto
+del sistema que escribe carrito y pendientes.** Puro, sin I/O. Aquí viven las
+garantías estructurales que NO se delegan al LLM porque son aritmética o
+integridad:
+
+- Cantidades: nunca se inventan; un decremento a ≤0 pregunta, no borra; una
+  línea solo desaparece por borrado explícito; el mismo producto con dos
+  cantidades pregunta con los números ya calculados (el LLM no suma).
+- Media (imagen/audio/doc) → los productos van a **propuesta a confirmar**,
+  no directos al carrito.
+- `rehacer_anterior` → propuesta desde el pedido pasado, **nunca** escritura
+  directa; requiere confirmación.
+- `cerrar` → propuesta de cierre; el `confirmar` sobre ella pasa a CLOSED.
+- Toda duda viva produce un "hecho" para que nunca se caiga del mensaje.
+
+El reductor emite una lista de **hechos** tipados (qué pasó: apuntado,
+ambiguo, no encontrado, conflicto, propuesta, cerrado, derivado…). No redacta.
+
+### 3.5 Llamada 3 — REDACTAR + VERIFICAR (código de cinturón)
+
+El LLM redacta la respuesta **desde los hechos + la cola de la conversación**
+(para tono y continuidad). Es lenguaje natural real, no una plantilla: por eso
+suena a persona y no a máquina. Reglas que se le dan: WhatsApp (sin markdown),
+breve, no sobrecargar, disculparse si no encontró algo, no hablar de precios
+ni prometer plazos.
+
+El **cinturón** es código, no confianza: `verificar()` comprueba sobre el
+texto final que (a) todo código que aparezca esté fundado en el estado o el
+retrieval del turno, y (b) toda cantidad case con el carrito. Si falla, se
+descarta la redacción y sale una plantilla mínima desde el estado (fallback
+de seguridad, no el caso normal). Un fallo de verificar es un incidente a
+registrar, no un modo de operación.
+
+Presupuesto: 1 llamada.
+
+### 3.6 Resumen / compactación (mantenimiento, no cada turno)
+
+El resumen mantiene el hilo cuando la conversación crece más allá de lo que
+cabe en la ventana. Disparo: cuando el contexto acumulado (resumen + mensajes
+crudos) alcanza el **60% de la ventana** del LLM (`CIMA_CTX_WINDOW`, 8192 →
+~4900 tok). Al dispararse:
+
+1. Se toman el **resumen anterior** + los **mensajes nuevos** aún no resumidos.
+2. Una llamada al LLM produce el **resumen nuevo** (qué se ha pedido y
+   confirmado, qué quedó pendiente, tono/contexto del cliente).
+3. Los mensajes crudos ya resumidos se sueltan del hilo; se conservan solo las
+   últimas ~10 intervenciones para el detalle inmediato.
+
+El resumen se persiste en `session.summary`. NO habla de pedidos pasados como
+tema; solo guarda el estado de ESTA conversación. Es una llamada de
+mantenimiento ocasional, fuera del presupuesto del turno.
+
+### 3.7 Presupuesto total del turno
+
+| Llamada | Cuándo | Coste |
+|---|---|---|
+| COMPRENDER | siempre | 1 |
+| MATCH | solo si hay ambigüedad real | 0-1 |
+| REDACTAR | si el bot habla | 0-1 |
+| (compactar) | ocasional, al 60% de ventana | fuera de turno |
+
+Techo del turno: **3 llamadas**. Charla que no requiere bot: **1** (COMPRENDER
+dice `hablar=false` y se acabó). Pedido simple sin ambigüedad: **2**.
+
+### 3.8 Diagrama del loop
+
+```
+mensajes del cliente (debounce ya garantizó: comercial ausente)
+        │
+   [código] ensamblar contexto: resumen + hilo(roles) + carrito + pendientes
+        │
+   [LLM 1] COMPRENDER  ── hablar? derivar? actos? cerrar? rehacer?
+        │        │
+        │        ├─ hablar=false ─────────────► silencio
+        │        └─ derivar!=null ────────────► redactar derivación / handoff
+        │
+   [código] RESOLVER referencias  ──(ambiguo)──►  [LLM 2] MATCH (lotes, índice)
+        │
+   [código] REDUCTOR (único escritor) ──► estado' + hechos
+        │
+   [LLM 3] REDACTAR desde hechos + hilo ──► [código] VERIFICAR ──(falla)──► plantilla
+        │
+   [código] persistir + enviar   (si al 60% ventana: compactar resumen)
 ```
 
-## 5. Architecture Overview: Event-Driven Modular Monolith
+---
 
-The design strictly separates "listening" (Transport), "thinking" (AI/Logic), and "data" (Database). The Event Bus (events.py) is the spine of the application—modules do not call each other directly; they emit events or subscribe to them.
+## 4. Qué se ELIMINA del diseño rígido actual
 
-1. Transport (Ingestion): Listens to WhatsApp/Email, normalizes data, and emits message_received.
-2. Logic (Orchestrator): Subscribes to events, manages the Conversation State Machine (Debounce), and decides when to trigger the AI.
-3. AI (Intelligence): Pure functions that take context and return answers (RAG + LLM).
+El loop de §3 hace innecesarias, y hay que borrar, las reglas que se
+acumularon para tapar la falta de conversación:
 
-```text
-chatlink_bot/
-├── src/
-│   └── chatlink_bot/
-│       ├── __init__.py
-│       ├── main.py              # Entry point: Wires services, starts API & listeners
-│       ├── config.py            # Centralized environment variables
-│       ├── events.py            # The Event Bus (Pub/Sub pattern)
-│       ├── database.py          # Async Engines for Postgres (Write) & SQL Server (Read)
-│       ├── models.py            # SQLAlchemy Tables (Users, Chats, Clientes, Articulos)
-│       │
-│       ├── whatsapp_pb2.py      # Protobuf Generated File
-│       ├── whatsapp_pb2_grpc.py # gRPC Generated File
-│       │
-│       ├── transport/           # "The Ears & Hands" (Input/Output)
-│       │   ├── __init__.py
-│       │   ├── whatsapp.py      # Wrapper for whatsmeow gRPC. Imports pb2 files from parent.
-│       │   └── email.py         # IMAP Listener & SMTP Sender
-│       │
-│       ├── logic/               # "The Orchestrator" (State Machine)
-│       │   ├── __init__.py
-│       │   ├── fsm.py           # Finite State Machine (Idle -> Debouncing -> Processing)
-│       │   └── handlers.py      # Event Consumers: Connects Transport -> FSM -> AI
-│       │
-│       ├── ai/                  # "The Brain" (Intelligence)
-│       │   ├── __init__.py
-│       │   ├── rag.py           # HybridRetriever logic (your provided code)
-│       │   ├── qdrant.py        # Qdrant Client setup & Indexing logic
-│       │   ├── llm.py           # LLM Client & Prompt Templates (Summarizer/Builder)
-│       │   └── parsers.py       # Whisper, Vision, & Doc extraction logic
-│       │
-│       └── api/                 # "The Control Panel" (FastAPI)
-│           ├── __init__.py
-│           └── routes.py        # Endpoints for User Mgmt, QR generation, Health
-│
-├── Dockerfile
-├── pyproject.toml
-└── README.md
-```
+- El "salvamento estructural" del número suelto y el parche del "13" en
+  resolución → los resuelve COMPRENDER leyendo la pregunta anterior.
+- Los dos intentos de extracción y el schema que cima ignora → una sola
+  llamada COMPRENDER en modo laxo con el formato en el prompt.
+- La plantilla como salida primaria → pasa a ser solo el fallback de
+  verificar; la salida normal la redacta el LLM.
+- Toda lógica de "elegir/rechazar" que intentaba adivinar el referente sin ver
+  el hilo → el hilo está ahora en el prompt.
 
-## Architecture & File Logic Description
-This architecture follows an Event-Driven Modular Monolith pattern. The core idea is to decouple "Listening" (Transport), "Thinking" (AI), and "Orchestrating" (Logic) using a central Event Bus.
+Lo que SOBREVIVE (es código correcto, no rigidez): el reductor como único
+escritor, la resolución determinista (dominancia, nombres idénticos, código
+tecleado), el retrieval por historial, `verificar`, el FSM/debounce, el
+outbox anti-eco.
 
-1. Core Infrastructure
-- events.py: The "spine" of the application. It defines the EventBus class. Modules communicate by emitting events (e.g., message_received) rather than importing and calling each other directly.
+---
 
-- database.py: Handles database connectivity.
+## 5. Variables de entorno relevantes
 
-    - Postgres (AsyncSessionPG): For write-heavy operations (Chat History, User State).
-    - SQL Server (AsyncSessionSQL): For read-only access to the legacy ERP (Clientes, Articulos).
+| Var | Default | Qué controla |
+|---|---|---|
+| `RESPONSE_DELAY_MINUTES` | 1 (prod 15) | Espera antes de que el bot cubra al comercial |
+| `BOT_SESSION_GAP_HOURS` | 6 | Fin de conversación por silencio |
+| `CIMA_CTX_WINDOW` | 8192 | Ventana del LLM; el resumen se dispara al 60% |
+| `RAG_HISTORY_ONLY` | true | Resolver solo contra el historial del cliente (hasta limpiar catálogo) |
+| `CIMA_MODEL` | gemma-4-E2B Q8_0 | Modelo único (texto/visión/audio/embed) |
 
+---
 
-- models.py: Defines all SQLAlchemy ORM models.
+## 6. Invariantes (qué no puede pasar nunca)
 
-    - Application State: User, Chat, EmailChat.
-    - Legacy Mirrors: MSClient, MSArticle.
+1. El bot habla solo si el comercial no respondió a tiempo.
+2. El bot no responde a lo no-comercial; deriva lo comercial que no puede
+   atender; calla si piden al comercial.
+3. Nunca inventa un código ni una cantidad (garantía de código en
+   resolución+verificar; de cantidad en el reductor).
+4. Ninguna línea del pedido cambia o desaparece sin que el cliente lo pida.
+5. No cierra sin confirmación explícita.
+6. En listas largas no sobrecarga: pide ayuda por marca/detalle o va de 1-2 en
+   1-2, sin recitar opciones ni listas de sí/no.
+7. Mantiene el hilo: entiende referencias a mensajes y pedidos anteriores.
+8. Redacta en lenguaje natural; el mensaje nunca contradice el pedido
+   (verificar es el cinturón).
 
-2. Transport (Ingestion & Output)
-- transport/whatsapp.py:
+---
 
-    - Logic: Acts as a wrapper for the whatsapp_pb2 generated files.
-    - Responsibility: Manages the gRPC StreamMessages loop. It normalizes incoming gRPC events into a standard dictionary and emits event_bus.emit('message_received', data). It also handles outgoing commands like send_message.
+## 7. Pendiente
 
-- transport/email.py:
-
-    - Logic: Runs a multi-threaded IMAP listener.
-    - Responsibility: Polls for unseen emails, parses attachments/body, and emits event_bus.emit('email_received', data).
-
-3. Logic (The Orchestrator)
-- logic/fsm.py:
-
-    - Logic: The "Clock" and State Machine.
-    - Responsibility: Manages the 15-minute Debounce Timer per conversation.
-    - Start/Reset: On new client message.
-    - Cancel: On commercial reply (Human Takeover).
-    - Trigger: When the timer expires, it emits trigger_ai_processing.
-
-- logic/handlers.py:
-
-    - Logic: The "Controller".
-    - Responsibility: Subscribes to events from the bus.
-        - on_message_received: Validates the sender against SQL Server (Identification). If valid, saves the chat and calls fsm.start_timer().
-        - on_ai_trigger: Orchestrates the AI flow (Load History -> RAG -> LLM -> Send Reply).
-
-4. AI (The Brain)
-- ai/rag.py:
-
-    - Logic: Implements the HybridRetriever logic.
-    - Responsibility: Performs Dense (Vector) + Sparse (BM25) search on Qdrant, followed by Cross-Encoder Reranking to find the best product matches.
-
-- ai/qdrant.py:
-
-    - Logic: Qdrant connection management.
-    - Responsibility: Runs the Indexing Routine on startup/daily events to sync SQL Server Articulos (where K_BOT=1) into the Vector Database.
-
-- ai/llm.py:
-
-    - Logic: LLM Client and Prompt Engineering.
-    - Responsibility: Contains the Summarizer and Order Builder prompts. It assembles the context (Chat History + RAG Candidates) and calls the LLM provider.
-
-- ai/parsers.py:
-
-    - Logic: File processing.
-    - Responsibility: Extracts text from non-text inputs (Whisper for Audio, Vision for Images, Text extractors for PDF/Docs) before persistence.
-
-5. API (Control)
-- api/routes.py:
-
-    - Logic: FastAPI Endpoints.
-    - Responsibility: Handles administrative tasks like User Registration, initiating WhatsApp Login (QR Code generation), and System Health Checks.
+- Implementar el loop de §3 (reescritura de la Etapa 1: de extracción ciega a
+  COMPRENDER con conversación).
+- Recuperar el generador de resumen (§3.6): vivía en el `llm.py` antiguo y se
+  perdió en la reescritura; `session.summary` lo espera.
+- Ampliar el recuperador al catálogo filtrado cuando K_BOT esté limpio; el
+  loop no debe asumir que la fuente es solo el historial.
+- Medir en la batería de 001764: fracción de turnos con `hablar=false`
+  correcto, referencias resueltas sin preguntar, incidentes de verificar (~0).

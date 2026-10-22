@@ -155,11 +155,59 @@ class MSArticle(MSBase):
     DescripcionLinea = Column(Text)
     ComentarioArticulo = Column(Text)
     MarcaProducto = Column(String(50))
-    K_BOT = Column(SmallInteger)
+    K_BOT = Column(SmallInteger)                 # -1 = vendible; 0 = inactivo (¡corregido!)
+
+    # Campos para el filtro de corpus y el dedup por reinscripción de EAN.
+    CodigoAreaCompetenciaLc = Column(String(10))  # 'MERCH' = merchandising del ERP
+    CodigoAlternativo = Column(String(40))        # EAN; agrupa referencias gemelas
+    FechaAlta = Column(DateTime)                   # alta del artículo; "el más nuevo"
 
     PrecioVenta = Column(Numeric)
     StockMinimo = Column(Numeric)
     StockMaximo = Column(Numeric)
+
+
+# --- Filtro de corpus: UNA definición, un sitio (ver NOTES §3.3.1) ---------
+# La usan la ingesta de Qdrant (ai/qdrant.py) y el cargador de historial
+# (ai/rag.py). Es un predicado sobre una FILA de artículo, no un WHERE, para
+# poder aplicarlo también al leer de las cachés (Postgres / simulación), no
+# solo al poblarlas. Cambia el criterio aquí y en un solo sitio.
+#
+# Reglas (idénticas en historial y catálogo):
+#   K_BOT = -1                          -> activo/vendible
+#   CodigoAreaCompetenciaLc <> 'MERCH'  -> flag de merchandising del ERP
+#   DescripcionArticulo no vacía
+#   la descripción NO contiene ninguna palabra de _CORPUS_STOPWORDS
+# El campo del ERP solo no basta (deja ~360 en PRO/RET y sin área); palabras
+# solas tampoco. Campo + palabras.
+K_BOT_VENDIBLE = -1
+
+_CORPUS_STOPWORDS = ("LOTE", "INTRO DEAL", "BONIF", "PROMO",
+                     "EXPOSITOR", "DISPLAY", "TESTER", "OBSEQUIO")
+
+
+def es_vendible(codigo_area=None, descripcion=None, k_bot=None) -> bool:
+    """True si el artículo es producto vendible por el bot. Acepta los campos
+    sueltos (así lo llaman tanto una fila ORM como una fila de caché)."""
+    try:
+        if int(k_bot if k_bot is not None else 0) != K_BOT_VENDIBLE:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if (codigo_area or "").strip().upper() == "MERCH":
+        return False
+    desc = (descripcion or "").strip()
+    if not desc:
+        return False
+    up = desc.upper()
+    return not any(w in up for w in _CORPUS_STOPWORDS)
+
+
+def es_vendible_articulo(a) -> bool:
+    """Conveniencia para una fila MSArticle."""
+    return es_vendible(getattr(a, "CodigoAreaCompetenciaLc", None),
+                       getattr(a, "DescripcionArticulo", None),
+                       getattr(a, "K_BOT", None))
 
 
 # --- Pydantic Schemas ---
@@ -182,3 +230,98 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# --- SQL Server: order tables (read-only mapping) ---
+# Only the columns actually used are mapped, so a SELECT never drags the ~180
+# remaining columns of LineasPedidoCliente across the VPN.
+#
+# The declared PK is the document's natural composite. SQLAlchemy only needs it
+# to identify rows; the physical PK of the lines table is LineasPosicion
+# (uniqueidentifier), which we do not need. MSBase is never passed to
+# create_all, so these mappings emit no DDL against SAGE.
+class MSOrderHeader(MSBase):
+    __tablename__ = "CabeceraPedidoCliente"
+
+    CodigoEmpresa = Column(SmallInteger, primary_key=True)
+    EjercicioPedido = Column(SmallInteger, primary_key=True)
+    SeriePedido = Column(String(10), primary_key=True)
+    NumeroPedido = Column(Integer, primary_key=True)
+
+    CodigoCliente = Column(String(15), index=True)
+    FechaPedido = Column(DateTime)
+    NumeroLineas = Column(Integer)
+    # Browsing-only columns: the order list is unreadable without a name and a
+    # total. Both are safe types to map for reads.
+    RazonSocial = Column(String(60))
+    ImporteLiquido = Column(Numeric)
+
+
+class MSOrderLine(MSBase):
+    __tablename__ = "LineasPedidoCliente"
+
+    CodigoEmpresa = Column(SmallInteger, primary_key=True)
+    EjercicioPedido = Column(SmallInteger, primary_key=True)
+    SeriePedido = Column(String(10), primary_key=True)
+    NumeroPedido = Column(Integer, primary_key=True)
+    Orden = Column(Integer, primary_key=True)
+
+    CodigoArticulo = Column(String(21))
+    # Descriptions FROZEN at order time: they can differ from today's catalog,
+    # and they are extra names by which this client may refer to the product.
+    DescripcionArticulo = Column(String(60))
+    Descripcion2Articulo = Column(String(40))
+    # The reference the CLIENT uses for the article. Where populated, this is a
+    # per-client alias that already exists inside SAGE.
+    CodigodelCliente = Column(String(30))
+    UnidadesPedidas = Column(Numeric)
+    Precio = Column(Numeric)
+    ImporteNeto = Column(Numeric)
+
+
+# --- Postgres: per-client order-history cache ---
+class ClientProductHistory(PGBase):
+    """One article a client has ordered, aggregated.
+
+    Refreshed by full replacement per client: the per-client volume is small
+    (tens to a few hundred rows), which removes any need to reason about
+    partial diffs.
+    """
+    __tablename__ = "client_product_history"
+
+    codigo_cliente = Column(String(15), primary_key=True)
+    codigo_articulo = Column(String(32), primary_key=True)
+
+    descripcion = Column(Text, default="")               # current catalog name
+    descripciones_historicas = Column(JSON, default=list)
+    marca = Column(String, default="")
+    ref_cliente = Column(String, default="")             # CodigodelCliente
+    bot_visible = Column(Boolean, default=True)          # K_BOT == 0
+
+    veces = Column(Integer, default=0)                   # distinct orders
+    unidades_total = Column(Numeric, default=0)
+    qty_moda = Column(Integer, default=1)                # this client's usual qty
+    primera_fecha = Column(DateTime, nullable=True)
+    ultima_fecha = Column(DateTime, nullable=True)
+    refreshed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClientHistorySync(PGBase):
+    """Per-client sync marker.
+
+    Exists because "zero rows" is ambiguous: this is what tells
+    'never synced' apart from 'client has no orders'.
+    """
+    __tablename__ = "client_history_sync"
+
+    codigo_cliente = Column(String(15), primary_key=True)
+    refreshed_at = Column(DateTime(timezone=True), nullable=True)
+    attempted_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String, default="ok")                # ok | empty | error
+    n_products = Column(Integer, default=0)
+    n_lines = Column(Integer, default=0)
+    n_orders = Column(Integer, default=0)
+    n_excluded = Column(Integer, default=0)
+    n_ref_cliente = Column(Integer, default=0)
+    tolerant_join = Column(Boolean, default=False)
+    error = Column(Text, default="")
