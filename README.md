@@ -21,8 +21,8 @@ write to yourself; Kapa treats you as the client.
 
 ## Test
 
-    createdb kapa_test
-    make test                     # ~6 s, no phone, no GPU
+    make test-db                  # once per boot: throwaway Postgres on localhost:55432
+    make test                     # ~6 s, no phone, no GPU, no SAGE
 
 ## Deploy
 

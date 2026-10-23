@@ -10,12 +10,13 @@ TACHYON_SRC ?= ../tachyon
 TACHYON_SHA  = $(shell git -C $(TACHYON_SRC) rev-parse --short HEAD)
 unexport TACHYON_SHA
 
-.PHONY: help up down logs test deploy update-whatsmeow
+.PHONY: help up down logs test test-db deploy update-whatsmeow
 
 help:
 	@echo "make up                             start everything locally"
 	@echo "make down / logs                    stop / follow logs"
-	@echo "make test                           scenario + unit tests (local Postgres; no SAGE, no GPU)"
+	@echo "make test-db                        start a throwaway Postgres for the tests (Docker, port 55432)"
+	@echo "make test                           scenario + unit tests (no SAGE, no GPU, no phone)"
 	@echo "make deploy HOST=<ssh host> TAG=..  ship a tagged release to a server"
 	@echo "make update-whatsmeow               bump whatsmeow on purpose, then test and deploy"
 
@@ -27,6 +28,12 @@ down:
 
 logs:
 	docker compose logs -f
+
+test-db:
+	@docker start kapa-test-db >/dev/null 2>&1 || docker run -d --name kapa-test-db \
+	  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=kapa_test -p 127.0.0.1:55432:5432 postgres:16.4-alpine >/dev/null
+	@until docker exec kapa-test-db pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+	@echo "Test Postgres ready on localhost:55432."
 
 test:
 	cd chatlink_bot && python -m pytest tests -q

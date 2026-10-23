@@ -1,9 +1,8 @@
 """Scenario harness: the real app against a real Postgres; fakes only at the
 edges (WhatsApp, email, SAGE, the clock, and Tachyon's two calls).
 
-    createdb kapa_test
-    POSTGRES_HOST=localhost POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres \
-        pytest chatlink_bot/tests -q
+    make test-db      # a throwaway Postgres on localhost:55432
+    make test
 
 Each test reads like a scenario row: the client or salesman says something
 at a time, the loop ticks, and the test checks what was sent and stored.
@@ -17,11 +16,14 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-os.environ.setdefault("POSTGRES_HOST", "localhost")
-os.environ.setdefault("POSTGRES_USER", "postgres")
-os.environ.setdefault("POSTGRES_PASSWORD", "postgres")
-os.environ.setdefault("POSTGRES_DB", "kapa_test")
-os.environ.setdefault("POSTGRES_PORT", "5432")
+# The tests DROP every table, so they never use the app's POSTGRES_* (which
+# `make test` would load from .env): only TEST_POSTGRES_*, and only a database
+# whose name ends in _test.
+for _k, _default in (("HOST", "localhost"), ("PORT", "55432"), ("USER", "postgres"),
+                     ("PASSWORD", "postgres"), ("DB", "kapa_test")):
+    os.environ[f"POSTGRES_{_k}"] = os.getenv(f"TEST_POSTGRES_{_k}", _default)
+if not os.environ["POSTGRES_DB"].endswith("_test"):
+    raise SystemExit(f"Refusing to run: test database {os.environ['POSTGRES_DB']!r} must end in _test.")
 os.environ["RESPONSE_DELAY_MINUTES"] = "15"
 os.environ["ALERT_EMAILS"] = ""
 os.environ["HEARTBEAT_URL"] = ""
