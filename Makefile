@@ -10,13 +10,14 @@ TACHYON_SRC ?= ../tachyon
 TACHYON_SHA  = $(shell git -C $(TACHYON_SRC) rev-parse --short HEAD)
 unexport TACHYON_SHA
 
-.PHONY: help up down logs test test-db deploy update-whatsmeow
+.PHONY: help up down logs test test-models test-db deploy update-whatsmeow
 
 help:
 	@echo "make up                             start everything locally"
 	@echo "make down / logs                    stop / follow logs"
 	@echo "make test-db                        start a throwaway Postgres for the tests (Docker, port 55432)"
-	@echo "make test                           scenario + unit tests (no SAGE, no GPU, no phone)"
+	@echo "make test                           scenario + unit tests, models faked (seconds)"
+	@echo "make test-models                    the same scenarios with real Gemma + Laya (needs tachyon serve)"
 	@echo "make deploy HOST=<ssh host> TAG=..  ship a tagged release to a server"
 	@echo "make update-whatsmeow               bump whatsmeow on purpose, then test and deploy"
 
@@ -37,6 +38,9 @@ test-db:
 
 test:
 	cd chatlink_bot && python -m pytest tests -q
+
+test-models:
+	cd chatlink_bot && python -m pytest tests -q -m models -rs
 
 deploy:
 	@test -n "$(HOST)" && test -n "$(TAG)" || { echo "usage: make deploy HOST=<ssh host> TAG=v3.0.0"; exit 1; }

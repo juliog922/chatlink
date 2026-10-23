@@ -37,3 +37,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chatlink_bot"]
+
+[tool.pytest.ini_options]
+markers = ["models: real Gemma and Laya through Tachyon (slow; make test-models)"]
+addopts = "-m 'not models'"

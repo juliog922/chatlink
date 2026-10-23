@@ -58,7 +58,7 @@ def act(tipo, evidencia="", **kw):
 
 
 class Kapa:
-    def __init__(self, monkeypatch):
+    def __init__(self, monkeypatch, real_models: bool = False):
         self.loop = asyncio.new_event_loop()
         self.now = DAY.replace(hour=9)
         self.sent, self.emails, self.alerts = [], [], []
@@ -84,8 +84,9 @@ class Kapa:
         async def no_codes(codes):
             return {c: None for c in codes}
         mp.setattr(handlers, "_sage_code_lookup", no_codes)
-        mp.setattr(inference, "chat", self._chat)
-        mp.setattr(inference, "decide", self._decide)
+        if not real_models:   # test_models.py lets Gemma and Laya answer for real
+            mp.setattr(inference, "chat", self._chat)
+            mp.setattr(inference, "decide", self._decide)
 
         self.run(self._reset_db())
 
@@ -213,5 +214,15 @@ class Kapa:
 @pytest.fixture
 def kapa(monkeypatch):
     k = Kapa(monkeypatch)
+    yield k
+    k.close()
+
+
+@pytest.fixture
+def kapa_real(monkeypatch):
+    """The same harness, but Gemma and Laya run in Tachyon for real."""
+    if not inference.healthy():
+        pytest.skip("Tachyon daemon not reachable: start `tachyon serve` (see README, Test)")
+    k = Kapa(monkeypatch, real_models=True)
     yield k
     k.close()

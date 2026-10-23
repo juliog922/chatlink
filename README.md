@@ -24,6 +24,17 @@ write to yourself; Kapa treats you as the client.
     make test-db                  # once per boot: throwaway Postgres on localhost:55432
     make test                     # ~6 s, no phone, no GPU, no SAGE
 
+`make test` fakes Gemma and Laya: it checks Kapa's own logic. To check that
+the models understand clients, run the same scenarios with real inference
+(slow, needs the GPU):
+
+    cd ../tachyon && cargo build --release && export PATH=$PWD/target/release:$PATH
+    tachyon pull gemma-4-e2b && tachyon pull laya-multilingual   # once (or e4b)
+    tachyon serve &
+    cd - && make test-models
+
+Add real client messages to `chatlink_bot/tests/test_models.py` as new cases.
+
 ## Deploy
 
     git tag v3.0.0 && git push --tags
