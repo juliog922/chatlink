@@ -137,7 +137,7 @@ def test_V5_opt_out_then_silence_then_kapa_by_name(kapa):
 
 
 # ------------------------------------------------------------- recognition
-def test_P_laya_confident_pick_is_added(kapa):
+def test_P2_laya_confident_pick_is_added(kapa):
     kapa.history["000139"] = SERUMS
     kapa.laya.append({"q0": ("1", 0.92)})
     kapa.client_says("ponme 3 serum noche", at="10:00",
@@ -146,7 +146,7 @@ def test_P_laya_confident_pick_is_added(kapa):
     assert kapa.cart() == [("SN25", 3)]
 
 
-def test_P_laya_unsure_becomes_a_question(kapa):
+def test_P3_laya_unsure_becomes_a_question(kapa):
     kapa.history["000139"] = SERUMS
     kapa.client_says("ponme 3 serum noche", at="10:00",
                      understood={"hablar": True, "actos": [pedir("serum noche", 3, "3 serum noche")]})
@@ -155,7 +155,7 @@ def test_P_laya_unsure_becomes_a_question(kapa):
     assert "SN15" in kapa.last_reply() and "SN25" in kapa.last_reply() and "¿Cuál quieres?" in kapa.last_reply()
 
 
-def test_P_question_budget_asks_two_and_counts_the_rest(kapa):
+def test_P5_question_budget_asks_two_and_counts_the_rest(kapa):
     kapa.history["000139"] = []
     msg = "ponme pinza roja, lima azul, borla grande y esponja rosa"
     kapa.client_says(msg, at="10:00", understood={"hablar": True, "actos": [
@@ -166,7 +166,7 @@ def test_P_question_budget_asks_two_and_counts_the_rest(kapa):
     assert "Me quedan 2 más por concretar" in r
 
 
-def test_P_alias_learned_from_a_pick_is_an_exact_hit_next_time(kapa):
+def test_P4_alias_learned_from_a_pick_is_an_exact_hit_next_time(kapa):
     kapa.history["000139"] = SERUMS
     kapa.client_says("ponme 3 serum noche", at="10:00",
                      understood={"hablar": True, "actos": [pedir("serum noche", 3, "3 serum noche")]})
@@ -230,7 +230,7 @@ def test_K7_unresolved_products_go_to_review_and_never_block_the_close(kapa):
     assert "pinzas doradas" in kapa.last_reply()
 
 
-def test_no_sabe_turns_pending_questions_into_review_lines(kapa):
+def test_P6_no_sabe_turns_pending_questions_into_review_lines(kapa):
     kapa.history["000139"] = []
     kapa.client_says("ponme pinzas doradas", at="10:00", understood={"hablar": True, "actos": [pedir("pinzas doradas")]})
     kapa.tick("10:16")
@@ -284,7 +284,7 @@ def test_A7_device_logged_out_disables_the_salesman_and_alerts(kapa):
     assert kapa.replies() == []            # C8: stored, never answered
 
 
-def test_admin_login_command_never_reaches_the_ai(kapa):
+def test_A2_admin_login_command_never_reaches_the_ai(kapa):
     seen = []
     from chatlink_bot.events import event_bus
     kapa.run(event_bus.subscribe("admin_command", lambda p: seen.append(p)))
