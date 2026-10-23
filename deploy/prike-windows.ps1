@@ -1,8 +1,10 @@
 # Prike tunnel on Windows (WSL reaches the server through it).
-# Paste into PowerShell as Administrator. The keys are read from the
+# Paste the WHOLE file into PowerShell as Administrator: it is one block
+# (& { ... }), so it stops at the first error instead of half-running. The keys are read from the
 # PRIKE_WG_* lines of the repo's .env inside WSL; nothing else holds them.
 # The endpoint stays a name so Windows can use IPv6: the server does not
 # answer WireGuard over IPv4.
+& {
 $Repo = '~/kapalua/chatlink'          # the repo, inside your default WSL distro
 $ErrorActionPreference = 'Stop'
 $wg = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
@@ -53,3 +55,4 @@ for ($i = 0; $i -lt 20; $i++) {
 }
 if ($i -eq 20) { Write-Host "Tunnel installed but $server does not answer. Send this screen to Asterio." -ForegroundColor Red }
 Write-Host "Disconnect: & '$wg' /uninstalltunnelservice prike"
+}
