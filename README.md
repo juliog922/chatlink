@@ -19,19 +19,39 @@ newer (RTX 30-series and later), plus a Tachyon checkout next to this repo.
 Live check without a client: link your number (`login` in self-chat), then
 write to yourself; Kapa treats you as the client.
 
+## VPNs
+
+Two different networks, both configured in `.env`:
+
+    make sage-check / sage-vpn-up   SAGE (SQL Server). make up checks it first and
+                                    runs SAGE_VPN_UP when SAGE does not answer.
+    make vpn-up / vpn-down          the Prike server tunnel (PRIKE_WG_*). It reaches
+                                    only 10.20.10.100, not SAGE.
+    make ssh-setup                  once: the Prike ssh key and the `prike` alias.
+
+`make test` needs neither: SAGE is faked there.
+
 ## Test
 
     createdb kapa_test
     make test                     # ~6 s, no phone, no GPU
 
+## Access to the Prike server
+
+Once: append the PRIKE_* block to `.env`, then `make ssh-setup`. After that:
+
+    make vpn-up        # WireGuard tunnel (asks for your local sudo password)
+    ssh prike
+    make vpn-down
+
 ## Deploy
 
     git tag v3.0.0 && git push --tags
-    make deploy HOST=prike TAG=v3.0.0        # WireGuard tunnel up first
+    make deploy TAG=v3.0.0          # brings the Prike tunnel up itself
 
-First time on the server: put `.env` (and `gmail_accounts.json`) in
-`~/kapa/shared/`, and run the first deploy with `HEALTH_WAIT_S=3600` because
-Tachyon downloads the models. Nightly backup: add `deploy/backup.sh` to
+First time on the server: put a `.env` (without the PRIKE_* lines, which
+only your machine needs) and `gmail_accounts.json` in `~/kapa/shared/`,
+and run the first deploy with `HEALTH_WAIT_S=3600` because Tachyon downloads the models. Nightly backup: add `deploy/backup.sh` to
 root's crontab. Alerts go to `ALERT_EMAILS`; set `HEARTBEAT_URL` to a
 healthchecks.io check so a dead server emails you too.
 

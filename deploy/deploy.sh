@@ -12,7 +12,12 @@
 set -euo pipefail
 TAG=$1; TSHA=$2
 ROOT=${KAPA_ROOT:-$HOME/kapa}
-DOCKER=${DOCKER:-sudo docker}
+# Docker needs sudo here. With SUDO_PW (sent by make deploy over stdin, never
+# on a command line) it runs unattended; without it sudo asks.
+dk() {
+  if [ -n "${SUDO_PW:-}" ]; then printf '%s\n' "$SUDO_PW" | sudo -S -p '' docker "$@"
+  else sudo docker "$@"; fi
+}
 WAIT_S=${HEALTH_WAIT_S:-300}      # first deploy: HEALTH_WAIT_S=3600 (models download)
 NEW=$ROOT/releases/$TAG
 cd "$ROOT"
@@ -25,7 +30,7 @@ ln -sfn "$ROOT/shared/gmail_accounts.json" "$NEW/chatlink_bot/gmail_accounts.jso
 export TACHYON_SRC=$ROOT/tachyon/$TSHA
 mkdir -p backups
 
-compose() { local dir=$1; shift; $DOCKER compose --project-directory "$dir" -f "$dir/docker-compose.yml" "$@"; }
+compose() { local dir=$1; shift; dk compose --project-directory "$dir" -f "$dir/docker-compose.yml" "$@"; }
 env_get() { grep -E "^$1=" shared/.env | tail -1 | cut -d= -f2-; }
 
 PREV=$(readlink current || true)
@@ -42,7 +47,7 @@ compose "$NEW" up -d --remove-orphans
 echo "==> Waiting up to ${WAIT_S}s for the bot to be healthy"
 bot=$(compose "$NEW" ps -q chatlink_bot)
 for _ in $(seq 1 $((WAIT_S / 5))); do
-  status=$($DOCKER inspect --format '{{.State.Health.Status}}' "$bot" 2>/dev/null || echo starting)
+  status=$(dk inspect --format '{{.State.Health.Status}}' "$bot" 2>/dev/null || echo starting)
   if [ "$status" = healthy ]; then
     ln -sfn "$NEW" current
     echo "==> $TAG is live."
