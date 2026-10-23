@@ -1,7 +1,7 @@
 [project]
 name = "chatlink-bot"
 version = "0.1.0"
-description = "FastAPI client for WhatsApp gRPC server using Whatsmeow"
+description = "Kapa: covers a busy salesman's WhatsApp and Gmail chats and turns them into orders"
 readme = "README.md"
 authors = [
     { name = "Julio Galindo", email = "juliogalindo922@gmail.com" }
@@ -24,6 +24,9 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.44",
     "uvicorn>=0.38.0",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [project.scripts]
 chatlink-bot = "chatlink_bot:main"
