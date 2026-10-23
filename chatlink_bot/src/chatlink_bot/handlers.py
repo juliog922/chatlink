@@ -26,12 +26,13 @@ from .ai.parsers import (
     extract_text_from_image_bytes_async,
     transcribe_audio_bytes_async,
 )
-from .ai.rag import client_history
+from .ai.rag import client_history, normalize_text
 from .database import AsyncSessionPG, AsyncSessionSQL
 from .events import event_bus
 from .logic.alerts import alert
 from .logic.lifecycle import conversation_mode, lifecycle_after_turn
-from .models import Chat, ConversationSession, EmailChat, InputType, KapaOrder, MSArticle, MSClient, User
+from .models import (Chat, ClientAlias, ConversationSession, EmailChat, InputType, KapaOrder,
+                     MSArticle, MSClient, User)
 from .transport.email import email_transport
 from .transport.whatsapp import whatsapp_transport
 
@@ -717,13 +718,25 @@ async def _build_rag_candidates(queries: List[str], top_k: int = RAG_TOP_K,
         if out:
             logger.info(f"[RAG] No client code: {len(out)} mention(s) can only resolve by typed code.")
         return out
+    # 1) His own words for a product he picked before: an exact hit.
+    async with AsyncSessionPG() as db:
+        aliases = {a.alias: a for a in (await db.execute(select(ClientAlias).where(
+            ClientAlias.codigo_cliente == client_code,
+            ClientAlias.alias.in_([normalize_text(q) for q in out])))).scalars()}
+    for q in out:
+        a = aliases.get(normalize_text(q))
+        if a:
+            out[q] = [{"CodigoArticulo": a.code, "DescripcionArticulo": a.name, "MarcaProducto": "",
+                       "relevance_score": 1.0, "covers_query": True, "query_uncovered": [],
+                       "fuente": "alias"}]
+    # 2) His order history.
     try:
         products, hstats = await client_history.load(client_code)
     except Exception as e:
         logger.warning(f"[RAG] History unavailable for {client_code}: {e}")
         return out
     verdicts: List[str] = []
-    for q in out:
+    for q in [q for q in out if not out[q]]:
         res = client_history.match(q, products, limit=top_k)
         verdicts.append(f"{q!r}->{res.verdict}")
         if res.verdict in ("resolved", "ambiguous") and res.matches:
@@ -871,6 +884,7 @@ async def run_turn(channel: str, client_id: str, user_id: str) -> None:
             intro_mode=intro_mode,
             search=partial(_build_rag_candidates, client_code=history_code),
             code_lookup=_sage_code_lookup,
+            resume=ended and not fresh and bool(session.cart),
         )
         if result.ctx.get("inference_down"):
             raise RuntimeError("inference is not answering")
@@ -909,6 +923,8 @@ async def run_turn(channel: str, client_id: str, user_id: str) -> None:
             db.add(model(chat_id=client_id, user=user_id, client=client_id, message=reply,
                          direction="sent", input_type=InputType.TEXT, is_bot=True,
                          status="queued", timestamp=_now_utc()))
+        if history_code:
+            await _learn_aliases(db, history_code, result.learned)
         if result.order_status == "CLOSED":
             session.last_closed_cart = result.cart
             db.add(KapaOrder(channel=channel, client_id=client_id, user_id=user_id,
@@ -918,6 +934,19 @@ async def run_turn(channel: str, client_id: str, user_id: str) -> None:
         await db.commit()
         logger.info(f"[TURN] {channel}/{client_id}: {'replied' if reply else 'silent'}, "
                     f"status={result.order_status}, cart={len(result.cart)}")
+
+
+async def _learn_aliases(db: AsyncSession, client_code: str, learned) -> None:
+    """Save the client's words for the product he picked (an exact hit next time)."""
+    for words, code, name in learned:
+        alias = normalize_text(words)
+        if not alias or not code:
+            continue
+        row = await db.get(ClientAlias, (client_code, alias))
+        if row:
+            row.code, row.name, row.uses = code, name or row.name, (row.uses or 0) + 1
+        else:
+            db.add(ClientAlias(codigo_cliente=client_code, alias=alias, code=code, name=name))
 
 
 async def send_queued() -> None:

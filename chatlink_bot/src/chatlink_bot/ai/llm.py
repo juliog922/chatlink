@@ -38,13 +38,13 @@ logger = logging.getLogger("LLM")
 # ACTOS — esquema, parseo y validación mecánica (invariante 4)
 # ============================================================================
 
-TIPOS = ("pedir", "modificar", "elegir", "rechazar", "confirmar",
+TIPOS = ("pedir", "modificar", "elegir", "rechazar", "confirmar", "negar",
          "cerrar", "repetir_ultimo", "cantidad_global", "otro")
 MODOS = ("total", "incremento", "decremento", "eliminar", "sin_cambio")
 SUBTIPOS_OTRO = ("saludo", "despedida", "agradecimiento", "estado_pedido",
                  "pide_comercial", "fuera_ambito",
                  "precio_stock_factura", "especificacion", "queja",
-                 "escalada", "rechazo_bot", "pregunta_bot")
+                 "escalada", "rechazo_bot", "pregunta_bot", "no_sabe")
 
 # Numerales cuya presencia en la evidencia de un `eliminar` lo degrada a
 # pregunta ("¿quito la línea o resto N?"). Clase cerrada: dígitos + cardinales
@@ -130,25 +130,6 @@ ACTOS_SCHEMA: Dict[str, Any] = {
     "required": ["actos"],
 }
 
-# Schema del match por lotes (resolucion.py): salida por índice, jamás código.
-MATCH_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "item": {"type": "integer"},
-                    "veredicto": {"type": "string", "enum": ["unico", "varios", "ninguno"]},
-                    "indice": {"type": ["integer", "null"]},
-                },
-                "required": ["item", "veredicto"],
-            },
-        }
-    },
-    "required": ["items"],
-}
 
 
 # ------------------------------------------------------------------ parseo
@@ -410,7 +391,7 @@ def _coerce_open_item(it: Any) -> Optional[Dict[str, Any]]:
     pedido/consulta) convirtiéndolos al contenedor tipado."""
     if not isinstance(it, dict):
         return None
-    if it.get("tipo") in ("producto",) + SI_NO_TIPOS + ("conflicto_cantidad",):
+    if it.get("tipo") in ("producto", "revisar") + SI_NO_TIPOS + ("conflicto_cantidad",):
         return dict(it)
     texto = str(it.get("texto") or it.get("pedido") or it.get("consulta") or "").strip()
     if not texto:
@@ -457,6 +438,11 @@ class Estado:
 
     def productos_abiertos(self) -> List[Dict[str, Any]]:
         return [i for i in self.open_items if i.get("tipo") == "producto"]
+
+    def a_revisar(self) -> List[Dict[str, Any]]:
+        """Products Kapa stopped asking about: they reach the salesman as the
+        client's own words, in the order sheet."""
+        return [i for i in self.open_items if i.get("tipo") == "revisar"]
 
 
 # -------------------------------------------------------------------- hechos
@@ -560,7 +546,14 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
         ln["qty"] = nuevo
         _emit("actualizado", code=code, name=ln.get("name") or name, qty=nuevo)
 
-    def _add(code: str, name: str, brand: str, qty: Optional[int], fuente: str) -> None:
+    def _a_revisar(it: Dict[str, Any]) -> None:
+        if it in e.open_items:
+            e.open_items.remove(it)
+        e.open_items.append({"tipo": "revisar", "texto": it.get("texto") or "", "qty": it.get("qty")})
+        _emit("a_revisar", texto=it.get("texto") or "")
+
+    def _add(code: str, name: str, brand: str, qty: Optional[int], fuente: str,
+             alias: str = "") -> None:
         seen_adds.setdefault(code, []).append(qty)
         ln = e.linea(code)
         if ln is not None:
@@ -589,7 +582,7 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             added_no_qty.append(code)
         e.order_status = "BUILDING" if e.order_status != "CLOSED" else e.order_status
         _emit("confirmado", code=code, name=name, qty=q,
-              marcado=(fuente == "codigo_cliente"))
+              marcado=(fuente == "codigo_cliente"), **({"alias": alias} if alias else {}))
 
     # ---- pase 1: operaciones --------------------------------------------
     for op in ops:
@@ -669,7 +662,7 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             if it is not None:
                 e.open_items.remove(it)
             _add(op["code"], op.get("name") or "", op.get("brand") or "", qty,
-                 op.get("fuente") or "")
+                 op.get("fuente") or "", alias=op.get("item_texto") or "")
 
         elif k == "elige_qty":
             it = next((i for i in e.open_items
@@ -706,7 +699,7 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             _nueva_si_no({"tipo": "propuesta_repetir", "items": items}, titulo="repetir")
 
         elif k == "cerrar":
-            if not e.cart:
+            if not e.cart and not e.productos_abiertos() and not e.a_revisar():
                 _emit("sin_entender")
                 continue
             _nueva_si_no({"tipo": "propuesta_cierre",
@@ -720,8 +713,13 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             e.open_items.remove(vivo)
             t = vivo["tipo"]
             if t == "propuesta_cierre":
+                for it in list(e.productos_abiertos()):   # never block a close (K7)
+                    e.open_items.remove(it)
+                    e.open_items.append({"tipo": "revisar", "texto": it.get("texto") or "",
+                                         "qty": it.get("qty")})
                 e.order_status = "CLOSED"
-                _emit("cerrado", cart=[dict(l) for l in e.cart])
+                _emit("cerrado", cart=[dict(l) for l in e.cart],
+                      revisar=[i["texto"] for i in e.a_revisar()])
             elif t == "propuesta_baja":
                 code = vivo.get("code")
                 ln = e.linea(code)
@@ -733,9 +731,23 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
                     _add(itx["code"], itx.get("name") or "", "", int(itx.get("qty") or 1),
                          "media" if t == "propuesta_media" else "repetir")
 
+        elif k == "negar":
+            vivo = e.si_no_vivo()
+            if vivo is None:
+                _emit("cortesia", subtipo="confirmacion_sin_pregunta")
+                continue
+            e.open_items.remove(vivo)
+            _emit("propuesta_retirada", tipo=vivo["tipo"])
+
         elif k == "otro":
             st = op.get("subtipo") or "fuera_ambito"
-            if st in ("escalada", "pide_comercial"):
+            if st == "no_sabe":
+                pendientes = list(e.productos_abiertos())
+                for it in pendientes:
+                    _a_revisar(it)
+                if not pendientes:
+                    _emit("cortesia", subtipo="confirmacion_sin_pregunta")
+            elif st in ("escalada", "pide_comercial"):
                 _emit("aviso_comercial")     # "aviso a X para que se conecte"
             elif st == "rechazo_bot":
                 _emit("opt_out")
@@ -807,18 +819,17 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             # Un producto SIN opciones que ya venía de un turno anterior y sigue
             # sin resolverse suma un intento. Agotados los intentos, no se
             # repregunta: se deja al comercial (no forzar el pedido).
-            if not it.get("opciones"):
-                # sube intento solo si el ítem ya venía de antes Y el turno no
-                # avanzó en NADA del pedido. Si hubo progreso, se reinicia: el
-                # cliente está aclarando otros y este puede esperar.
-                if it.get("_nuevo") or hubo_progreso:
-                    it["intentos"] = 0 if hubo_progreso else int(it.get("intentos") or 0)
-                else:
-                    it["intentos"] = int(it.get("intentos") or 0) + 1
-                if it["intentos"] >= MAX_INTENTOS_PRODUCTO:
-                    it["_derivar"] = True
-                    _emit("derivacion", motivo="producto_no_encontrado", texto=it["texto"])
-                    continue
+            # A turn that leaves it unresolved without any progress on the
+            # order costs an attempt; exhausted, it stops being asked and
+            # goes to the salesman as a review line (rule 6).
+            if it.get("_nuevo") or hubo_progreso:
+                it["intentos"] = 0 if hubo_progreso else int(it.get("intentos") or 0)
+            else:
+                it["intentos"] = int(it.get("intentos") or 0) + 1
+            if it["intentos"] >= MAX_INTENTOS_PRODUCTO:
+                it["_revisar"] = True
+                _emit("a_revisar", texto=it["texto"])
+                continue
             if recien_tratado:
                 continue
             if it.get("opciones"):
@@ -837,8 +848,10 @@ def aplicar(estado_in: Estado, ops: List[Dict[str, Any]],
             else:
                 _emit("propuesta", tipo=t, items=it.get("items") or [], titulo="")
 
-    # los productos que agotaron intentos salen del estado (ya derivados)
-    e.open_items = [it for it in e.open_items if not it.get("_derivar")]
+    # los productos que agotaron intentos pasan a líneas a revisar
+    for it in [i for i in e.open_items if i.get("_revisar")]:
+        e.open_items.remove(it)
+        e.open_items.append({"tipo": "revisar", "texto": it["texto"], "qty": it.get("qty")})
     for it in e.open_items:
         it.pop("_nuevo", None)   # marca efímera de "creado este turno"
 
@@ -1102,7 +1115,7 @@ async def resolver(actos: List[Acto], estado, *, search: Retriever,
             ops.append({"op": "repetir_ultimo",
                         "qty_override": a.cantidad.valor if a.cantidad.modo == "total" else None})
 
-        elif a.tipo in ("confirmar", "cerrar"):
+        elif a.tipo in ("confirmar", "cerrar", "negar"):
             ops.append({"op": a.tipo})
 
         elif a.tipo == "otro":
@@ -1281,7 +1294,10 @@ async def resolver(actos: List[Acto], estado, *, search: Retriever,
 
 
 BOT_SIGNATURE = os.getenv("AGENT_BOT_SIGNATURE", "— Kapa 🤖")
-COLAPSO_UMBRAL = int(os.getenv("PIPE_COLAPSO_UMBRAL", "2"))   # >N sin resolver -> colapsa
+# At most this many product questions per reply; the rest wait their turn.
+QUESTION_BUDGET = int(os.getenv("PIPE_QUESTION_BUDGET", "2"))
+_PRODUCT_QUESTIONS = ("pregunta_opciones", "sin_candidatos", "rechazo_registrado",
+                      "recordatorio_pendiente", "referencia_ambigua")
 
 _RE_MD = re.compile(r"[*_#`]|^\s*[-•]\s", re.M)
 _RE_DIGITS = re.compile(r"\d+")
@@ -1316,14 +1332,18 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
     cierre: Optional[str] = None
     derivacion: Optional[str] = None
 
-    # colapso (inv. 9): cuenta ítems que acabarán pidiendo elección/datos
-    pend = [h for h in hechos if h.tipo in ("pregunta_opciones", "sin_candidatos",
-                                            "rechazo_registrado", "recordatorio_pendiente",
-                                            "referencia_ambigua")]
-    colapsar = len(pend) > COLAPSO_UMBRAL
+    revisar: List[str] = []
+    asked = held = 0
 
     for h in hechos:
         d = h.datos
+        # Question budget: the first QUESTION_BUDGET product questions, in the
+        # order the client listed them; the others are only counted.
+        if h.tipo in _PRODUCT_QUESTIONS:
+            if asked >= QUESTION_BUDGET:
+                held += 1
+                continue
+            asked += 1
         if h.tipo == "confirmado":
             conf.append("Apuntado: " + _linea_producto(d["name"], d["qty"], d["code"],
                                                        d.get("marcado", False)))
@@ -1335,7 +1355,7 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
         elif h.tipo == "eliminado":
             conf.append(f"Quitado del pedido: {_n(d['name'], d['code'])} ({d['code']}).")
 
-        elif h.tipo == "pregunta_opciones" and not colapsar:
+        elif h.tipo == "pregunta_opciones":
             ops = d.get("opciones") or []
             if d.get("indistinguibles"):
                 cods = ", ".join(o["code"] for o in ops)
@@ -1352,16 +1372,16 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
                 preguntas.append(
                     f"De \"{d['texto']}\"{qty_txt} tengo " + " y ".join(partes) +
                     ". ¿Cuál quieres?")
-        elif h.tipo == "sin_candidatos" and not colapsar:
+        elif h.tipo == "sin_candidatos":
             preguntas.append(
                 f"\"{d['texto']}\" no lo encuentro entre lo que sueles pedir. "
                 "¿Me pasas el nombre completo o el código? Si no, se lo dejo a "
                 f"{salesman_name} para que lo mire.")
-        elif h.tipo == "rechazo_registrado" and not colapsar:
+        elif h.tipo == "rechazo_registrado":
             preguntas.append(
                 f"Entendido, esas opciones de \"{d['texto']}\" no son. "
                 "Pásame el código o el nombre completo del que buscas y lo apunto.")
-        elif h.tipo == "recordatorio_pendiente" and not colapsar:
+        elif h.tipo == "recordatorio_pendiente":
             preguntas.append(f"Sigo con \"{d['item']}\" pendiente: dime el código o el "
                              "nombre completo cuando puedas.")
 
@@ -1376,7 +1396,7 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
         elif h.tipo == "pregunta_eliminar_o_restar":
             preguntas.append(f"De {_n(d['name'], d['code'])} ({d['code']}): ¿quito la línea "
                              f"entera o resto {d.get('n') or 1}?")
-        elif h.tipo == "referencia_ambigua" and not colapsar:
+        elif h.tipo == "referencia_ambigua":
             cands = list(dict.fromkeys(d.get("candidatas") or []))   # dedup, orden
             if cands:
                 preguntas.append(
@@ -1402,23 +1422,27 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
                 preguntas.append(f"De lo que me has mandado he sacado: {lineas}. "
                                  "Al venir de una foto/audio prefiero confirmarlo: ¿lo apunto?")
             elif d.get("tipo") == "propuesta_cierre":
-                preguntas.append(f"Tu pedido queda: {lineas}. ¿Lo confirmo y se lo paso a "
-                                 f"{salesman_name}?")
+                pend = [i["texto"] for i in estado.productos_abiertos() + estado.a_revisar()]
+                extra = (f" Lo que queda por concretar ({', '.join(pend)}) se lo dejo anotado a "
+                         f"{salesman_name} para que lo revise." if pend else "")
+                preguntas.append(f"Tu pedido queda: {lineas or 'sin líneas cerradas'}.{extra} "
+                                 f"¿Lo confirmo y se lo paso a {salesman_name}?")
         elif h.tipo == "cerrado":
             items = d.get("cart") or []
             lineas = "; ".join(_linea_producto(i.get("name", ""), int(i.get("qty") or 1),
                                                i.get("code", "")) for i in items)
-            cierre = (f"¡Pedido confirmado! {lineas}. Se lo paso ahora a {salesman_name}, "
+            rv = d.get("revisar") or []
+            extra = f" Para que lo revise te dejo anotado: {', '.join(rv)}." if rv else ""
+            cierre = (f"¡Pedido confirmado! {lineas}.{extra} Se lo paso ahora a {salesman_name}, "
                       "que lo valida antes del envío. Gracias.")
 
         elif h.tipo == "derivacion":
-            if d.get("motivo") == "producto_no_encontrado":
-                cual = f" \"{d['texto']}\"" if d.get("texto") else ""
-                derivacion = (f"No consigo localizar{cual} entre lo que tenemos. Se lo paso a "
-                              f"{salesman_name}, que se conectará en cuanto pueda para ayudarte con eso.")
-            else:
-                derivacion = (f"De eso te informa {salesman_name} directamente; le aviso para "
-                              "que te escriba en cuanto pueda.")
+            derivacion = (f"De eso te informa {salesman_name} directamente; le aviso para "
+                          "que te escriba en cuanto pueda.")
+        elif h.tipo == "a_revisar":
+            revisar.append(d["texto"])
+        elif h.tipo == "propuesta_retirada":
+            cortesias.append("Vale, lo dejo como estaba.")
         elif h.tipo == "aviso_comercial":
             derivacion = (f"Aviso a {salesman_name} para que se conecte lo antes posible "
                           "y te atienda.")
@@ -1450,13 +1474,11 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
             preguntas.append("No estoy seguro de haberte entendido. Dime producto y "
                              "cantidad (mejor con el código si lo tienes) y lo apunto.")
 
-    if colapsar:
-        textos = sorted({(h.datos.get("texto") or h.datos.get("item") or "").strip()
-                         for h in pend if (h.datos.get("texto") or h.datos.get("item"))})
-        preguntas.append(
-            "Me quedan varios artículos por concretar (" + ", ".join(f"\"{t}\"" for t in textos)
-            + "). Para no marearte con opciones: ¿me pasas el nombre completo o el código "
-              "de cada uno?")
+    if held:
+        preguntas.append(f"Me quedan {held} más por concretar; te los voy preguntando.")
+    if revisar and not cierre:
+        otras.append("No lo tengo claro, así que se lo dejo anotado a "
+                     f"{salesman_name} para que lo revise: {', '.join(revisar)}.")
 
     bloques: List[str] = []
     sal = _saludo(intro_mode, client_name, salesman_name) if \
@@ -1490,9 +1512,7 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
 
 MAX_LLM_CALLS = int(os.getenv("PIPE_MAX_LLM_CALLS", "4"))
 EXTRACT_TIMEOUT_S = float(os.getenv("PIPE_EXTRACT_TIMEOUT_S", "90"))
-MATCH_TIMEOUT_S = float(os.getenv("PIPE_MATCH_TIMEOUT_S", "60"))
 EXTRACT_MAX_TOKENS = int(os.getenv("PIPE_EXTRACT_MAX_TOKENS", "700"))
-MATCH_MAX_TOKENS = int(os.getenv("PIPE_MATCH_MAX_TOKENS", "300"))
 MSG_MAX_CHARS = int(os.getenv("PIPE_MSG_MAX_CHARS", "2400"))
 
 _client: Optional[CimaClient] = None
@@ -1501,7 +1521,7 @@ _client: Optional[CimaClient] = None
 # --------------------------------------------------------------------- result
 @dataclass
 class AgentResult:
-    """Contrato con handle_ai_trigger, sin cambios. reply == "" es silencio."""
+    """What run_turn persists. reply == "" is silence."""
     reply: str = ""
     order_status: str = "IDLE"
     cart: List[Dict[str, Any]] = field(default_factory=list)
@@ -1512,6 +1532,8 @@ class AgentResult:
     open_items: List[Dict[str, Any]] = field(default_factory=list)
     guide_shown: bool = False
     ctx: Dict[str, Any] = field(default_factory=dict)
+    # (client's words, code, name) he confirmed by picking an option: aliases.
+    learned: List[Tuple[str, str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- LLM helpers
@@ -1575,10 +1597,11 @@ TIPOS de acto:
 - elegir: responde a una pregunta pendiente indicando cuál quiere (por descripción, por código o con un número si la pregunta era de cantidades). objetivo_texto = sus palabras.
 - rechazar: dice que las opciones ofrecidas NO son lo que busca pero SIGUE queriendo el artículo ("ese no es", "ninguno de esos"). objetivo_texto = el artículo si lo nombra, si no vacío.
 - confirmar: respuesta afirmativa a la última pregunta del asistente ("sí", "vale", "ok", "perfecto", "eso es"). OJO: "apunta"/"ponme"/"anota" seguido de productos NO es confirmar, es parte de pedir.
+- negar: respuesta negativa a la última pregunta sí/no del asistente ("no", "no, espera", "todavía no", "no lo apuntes").
 - cerrar: da el pedido por terminado y quiere enviarlo ("eso es todo", "mándalo", "confírmame el pedido", "ciérralo").
 - repetir_ultimo: pide lo mismo que el último pedido. Si dice "N de cada": cantidad_modo="total", cantidad_valor=N.
 - cantidad_global: una frase suelta que fija N unidades para todo lo anterior ("6 de cada uno", "todo a 6"). valor=N.
-- otro: nada de lo anterior. subtipo según la FRONTERA de arriba: estado_pedido | precio_stock_factura | especificacion | queja | fuera_ambito | escalada | rechazo_bot | saludo | despedida | agradecimiento | pregunta_bot (pregunta qué eres).
+- otro: nada de lo anterior. subtipo según la FRONTERA de arriba: estado_pedido | precio_stock_factura | especificacion | queja | fuera_ambito | escalada | rechazo_bot | saludo | despedida | agradecimiento | pregunta_bot (pregunta qué eres) | no_sabe (no sabe concretar lo pendiente: "no sé", "lo que sea", "tú mismo", "el que diga él").
 
 REGLAS:
 1. Un acto por intención; un mensaje puede tener varios actos.
@@ -1624,6 +1647,8 @@ def _contexto_extraccion(estado: Estado, mensaje: str, *,
         partes.append("PEDIDO ACTUAL: vacío")
     pend: List[str] = []
     for it in estado.open_items:
+        if it.get("tipo") == "revisar":
+            continue   # left to the salesman: not a question any more
         t = it.get("tipo")
         if t == "producto":
             ops = ", ".join(f"{o.get('name')} ({o.get('code')})"
@@ -1670,25 +1695,6 @@ async def _extraer(estado: Estado, mensaje: str, budget: _Budget, *,
     return actos, hablar
 
 
-# ------------------------------------------------------------ Etapa 2: match
-_MATCH_SYSTEM = """Eres el seleccionador de productos de un asistente de pedidos. Para cada item te doy lo que escribió el cliente y una lista numerada de candidatos del catálogo. Decide por item:
-- "unico" + indice: exactamente UN candidato es claramente lo que pide.
-- "varios": más de uno podría serlo (ante la duda, elige esto).
-- "ninguno": ninguno encaja con lo que pide.
-Los índices empiezan en 0. No inventes índices fuera de la lista.
-Responde SOLO con este JSON (una entrada por item):
-{"items": [{"item": 0, "veredicto": "unico", "indice": 2}]}"""
-
-
-def _match_user(payload: List[Dict[str, Any]]) -> str:
-    partes = []
-    for it in payload:
-        partes.append(f"ITEM {it['i']}: cliente escribió \"{it['texto']}\"")
-        for j, name in enumerate(it["opciones"]):
-            partes.append(f"  {j}. {name}")
-    return "\n".join(partes)
-
-
 def _actos_estructurales(texto: str, estado: Estado) -> List[Acto]:
     """Cuando la extracción no ve ningún acto, lo puramente ESTRUCTURAL no
     puede perderse por ello (el LLM interpreta lenguaje; los códigos son
@@ -1714,7 +1720,8 @@ async def run_agent(*, client_name: str, salesman_name: str,
                     session: Dict[str, Any], recent_history: str,
                     current_message: str, intro_mode: str,
                     search: Retriever,
-                    code_lookup: Optional[CodeLookup] = None) -> AgentResult:
+                    code_lookup: Optional[CodeLookup] = None,
+                    resume: bool = False) -> AgentResult:
     """Un turno completo (handlers.run_turn).
     `recent_history` llega con roles (Cliente/Comercial/Asistente) y ENTRA en
     el prompt de COMPRENDER: es lo que permite resolver "sí ese", "13",
@@ -1737,7 +1744,9 @@ async def run_agent(*, client_name: str, salesman_name: str,
                            cart=estado.cart, summary="",
                            handoff=handoff, opt_out=opt_out, silent=False,
                            open_items=estado.open_items,
-                           guide_shown=guide_shown, ctx=ctx)
+                           guide_shown=guide_shown, ctx=ctx,
+                           learned=[(h.datos["alias"], h.datos["code"], h.datos.get("name") or "")
+                                    for h in hechos if h.tipo == "confirmado" and h.datos.get("alias")])
 
     # -------- Etapa 0
     pre = preprocesar(current_message)
@@ -1768,6 +1777,11 @@ async def run_agent(*, client_name: str, salesman_name: str,
         actos = []          # la lista se procesa aunque la extracción muriera
     if actos is not None:
         actos = actos_lista + actos          # la lista entra SIEMPRE al turno
+    if actos is None:
+        # Inference down and nothing structural to salvage: stay silent and
+        # let run_turn alert and retry. A confused "no te he entendido" to
+        # every client is worse than the salesman covering for a while.
+        return _result("", estado_in, [], {"inference_down": True})
     if not actos:
         # Extracción sin actos: puede ser fallo real O un simple saludo/charla.
         # En el turno de PRESENTACIÓN, "hola" no es un error: el bot se presenta
@@ -1782,15 +1796,17 @@ async def run_agent(*, client_name: str, salesman_name: str,
         plantilla = render(hechos, resultado.estado, intro_mode=intro_mode,
                            client_name=client_name, salesman_name=salesman_name,
                            commercial_turn=intro)
-        return _result(plantilla, resultado.estado, hechos,
-                       {"degradado": "extraccion" if actos is None else "sin_actos"})
+        return _result(plantilla, resultado.estado, hechos, {"degradado": "sin_actos"})
 
     # -------- Etapa 2
     async def _match_call(payload: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-        data = await _chat_json(_MATCH_SYSTEM, _match_user(payload), MATCH_SCHEMA,
-                                max_tokens=MATCH_MAX_TOKENS, timeout=MATCH_TIMEOUT_S,
-                                temperature=0.0, budget=budget, kind="match", fmt="json")
-        return (data or {}).get("items") if data else None
+        # Laya scores each candidate with a probability, which is what lets a
+        # low-confidence pick become a question instead of a guess.
+        try:
+            return await asyncio.to_thread(inference.choose, pre.texto or current_message, payload)
+        except Exception as e:
+            logger.warning(f"[PIPE] Laya falló: {e}")
+            return None     # every ambiguous item becomes a question
 
     res = await resolver(actos, estado_in, search=search, code_lookup=code_lookup,
                          match_call=_match_call,
@@ -1823,6 +1839,9 @@ async def run_agent(*, client_name: str, salesman_name: str,
             else "charla"
         logger.info(f"[PIPE] silencio: no interponerse ({motivo})")
         return _result("", resultado.estado, [], {"silencio": motivo})
+
+    if resume and resultado.estado.cart and not any(h.tipo == "recap_pedido" for h in resultado.hechos):
+        resultado.hechos.append(Hecho("recap_pedido"))   # V3: he comes back to a half-made order
 
     # -------- Etapa 4: the template IS the reply. Built from the reducer's
     # facts and the cart, it cannot contradict them, so no verify step.
