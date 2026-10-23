@@ -6,7 +6,7 @@
 #   prike.sh ssh-setup    install the ssh key, the server's host key and the `prike` alias
 #   prike.sh sage-check   exit 0 if SAGE (SQLSERVER_HOST) answers on its port
 #
-# The WireGuard tunnel itself runs on Windows: deploy/prike-windows.ps1.
+# The WireGuard tunnel itself runs on Windows: Asterio's conectar-prike.ps1.
 set -euo pipefail
 
 need() { for v in "$@"; do [ -n "${!v:-}" ] || { echo "Missing $v in .env" >&2; exit 1; }; done; }
@@ -15,7 +15,7 @@ case "${1:-}" in
   reach)
     need PRIKE_HOST
     reachable "$PRIKE_HOST" && { echo "Prike answers ($PRIKE_HOST)."; exit 0; }
-    echo "Prike ($PRIKE_HOST) does not answer: connect the tunnel on Windows (deploy/prike-windows.ps1, PowerShell as Administrator)." >&2
+    echo "Prike ($PRIKE_HOST) does not answer: connect the tunnel on Windows (Asterio's conectar-prike.ps1, PowerShell as Administrator)." >&2
     exit 1 ;;
 
   ssh-setup)

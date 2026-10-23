@@ -1,8 +1,7 @@
 # Kapa. Local: make up / test. Server: make deploy TAG=v3.0.0
 #
 # Every secret comes from .env (git-ignored): SAGE and Postgres credentials,
-# the Prike WireGuard keys (read by deploy/prike-windows.ps1), the ssh key and
-# the server's sudo password.
+# the Prike ssh key and the server's sudo password.
 
 -include .env
 export
@@ -20,7 +19,7 @@ help:
 	@echo "make down / logs            stop / follow logs"
 	@echo "make test                   scenario + unit tests (local Postgres; no SAGE, no GPU)"
 	@echo "make sage-check             is SAGE reachable?    make sage-vpn-up   run SAGE_VPN_UP"
-	@echo "make prike-check            does the Prike server answer? (tunnel: deploy/prike-windows.ps1)"
+	@echo "make prike-check            does the Prike server answer? (tunnel: Asterio's conectar-prike.ps1 on Windows)"
 	@echo "make ssh-setup              install the Prike ssh key and the 'prike' alias, once"
 	@echo "make deploy TAG=v3.0.0      ship a tagged release to the Prike server"
 	@echo "make update-whatsmeow       bump whatsmeow on purpose, then test and deploy"

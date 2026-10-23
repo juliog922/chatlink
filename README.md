@@ -27,9 +27,8 @@ Two different networks, both configured in `.env`:
                                     runs SAGE_VPN_UP when SAGE does not answer.
     make prike-check                does the Prike server answer?
 
-The Prike tunnel runs on Windows: paste `deploy/prike-windows.ps1` into
-PowerShell as Administrator (it reads the PRIKE_WG_* keys from `.env` in WSL).
-WSL reaches the server through it. It cannot run inside WSL: the server
+The Prike tunnel runs on Windows, installed by Asterio's `conectar-prike.ps1`
+(PowerShell as Administrator, see his LEEME). WSL reaches the server through it. It cannot run inside WSL: the server
 answers WireGuard over IPv6 only, and WSL's NAT network has no IPv6.
 Once: `make ssh-setup` for the `ssh prike` alias.
 
