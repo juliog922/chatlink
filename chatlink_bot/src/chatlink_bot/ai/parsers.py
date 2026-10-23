@@ -10,13 +10,10 @@ from typing import Optional
 
 from PIL import Image, ImageEnhance, ImageFilter, ExifTags
 
-from .cima_client import CimaClient, Message
+from . import inference
 
 logger = logging.getLogger("Parsers")
 
-CIMA_URL = os.getenv("CIMA_URL", "http://cima:8000")
-# One GGUF model does text, vision AND audio — no separate VLM/ASR models.
-CIMA_MODEL = os.getenv("CIMA_MODEL", "unsloth/gemma-4-E2B-it-GGUF:Q8_0")
 
 # ---------------------------------------------------------------------------
 # Image preprocessing tunables (override via env for quick experiments)
@@ -30,7 +27,7 @@ IMG_MIN_LONG_EDGE = int(os.getenv("IMG_MIN_LONG_EDGE", "1500"))
 # and server-side tensor allocation sane.
 IMG_MAX_PIXELS = int(os.getenv("IMG_MAX_PIXELS", str(30_000_000)))
 
-# Hard cap on the longest edge. cima's decoder enforces dimension limits and
+# Hard cap on the longest edge. the decoder enforces dimension limits and
 # the vision tower budget is finite on a 6 GiB card; 2048px keeps OCR quality
 # while bounding VRAM and payload size.
 IMG_MAX_LONG_EDGE = int(os.getenv("IMG_MAX_LONG_EDGE", "2048"))
@@ -47,14 +44,6 @@ IMG_CONTRAST_FACTOR = float(os.getenv("IMG_CONTRAST_FACTOR", "1.15"))
 # Mild sharpness boost via Pillow's Sharpness enhancer (stacks with USM)
 IMG_SHARPNESS_FACTOR = float(os.getenv("IMG_SHARPNESS_FACTOR", "1.3"))
 
-_client: Optional[CimaClient] = None
-
-
-def _get_client() -> CimaClient:
-    global _client
-    if _client is None:
-        _client = CimaClient(CIMA_URL)
-    return _client
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +219,17 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
     if not image_bytes:
         return ""
 
-    client = _get_client()
     try:
         # --- Preprocess: enhance the WhatsApp-compressed image ---
         # This ALSO normalizes the container: WhatsApp can deliver WebP
         # (stickers) or progressive JPEG, which the engine's baseline-only
         # decoder rejects. Pillow re-decodes anything and we re-encode to
-        # lossless PNG, so what reaches cima is always decodable.
+        # lossless PNG, so what reaches the engine is always decodable.
         try:
             clean_png = _preprocess_image(image_bytes)
         except Exception as e:
             # Preprocessing failed. Only fall back to raw bytes if they are
-            # already a format cima decodes (PNG or JPEG). Sending unknown
+            # already a format the engine decodes (PNG or JPEG). Sending unknown
             # containers (WebP, HEIC, truncated files) just errors server-side.
             magic_ok = image_bytes[:8] == b"\x89PNG\r\n\x1a\n" or image_bytes[:3] == b"\xff\xd8\xff"
             if magic_ok:
@@ -251,26 +239,7 @@ def extract_text_from_image_bytes(image_bytes: bytes) -> str:
                 logger.error(f"Image undecodable (not PNG/JPEG after Pillow failure): {e}")
                 return ""
 
-        b64_img = base64.b64encode(clean_png).decode("utf-8")
-
-        resp = client.chat(
-            model=CIMA_MODEL,
-            messages=[
-                Message(role="system", content=_OCR_SYSTEM_PROMPT),
-                Message(
-                    role="user",
-                    content=_OCR_USER_PROMPT,
-                    images=[b64_img],
-                ),
-            ],
-            options={
-                "temperature": 0.0,   # Deterministic — faithful to the image
-                "top_p": 1.0,         # No nucleus sampling for OCR
-                "repeat_penalty": 1.0, # Don't penalize repeated text (tables, lists)
-                "num_predict": 2048,   # Allow long extractions (invoices, documents)
-            },
-        )
-        return (resp.content or "").strip()
+        return inference.chat(f"{_OCR_SYSTEM_PROMPT}\n\n{_OCR_USER_PROMPT}", images=[clean_png])
     except Exception as e:
         logger.error(f"Vision OCR failed: {e}")
         return ""
@@ -288,7 +257,7 @@ _ASR_USER_PROMPT = "Transcribe este audio literalmente, en su idioma original."
 
 # ---------------------------------------------------------------------------
 # Audio normalization — WhatsApp voice notes are Opus-in-OGG; emails carry
-# mp3/m4a/etc. cima decodes ONLY PCM WAV, so anything else must be transcoded
+# mp3/m4a/etc. the engine decodes ONLY PCM WAV, so anything else must be transcoded
 # BEFORE upload or the request fails. ffmpeg does the conversion; without it
 # non-WAV audio is rejected here with a clear log instead of collapsing the
 # engine with an undecodable payload.
@@ -316,7 +285,7 @@ def _sniff_audio_kind(b: bytes) -> str:
 
 
 def _wav_is_pcm16_mono_16k(b: bytes) -> bool:
-    """True only for WAVs cima ingests optimally (PCM, mono-ish is fine)."""
+    """True only for WAVs the engine ingests optimally (PCM, mono-ish is fine)."""
     try:
         # fmt chunk: bytes 20-21 codec (1 = PCM), 22-23 channels, 24-27 rate
         codec = int.from_bytes(b[20:22], "little")
@@ -366,7 +335,7 @@ def _finalize_wav_header(wav: bytes) -> bytes:
     """
     ffmpeg writing WAV to a PIPE cannot seek back to patch the RIFF and
     'data' chunk sizes, so it leaves 0xFFFFFFFF placeholders. Strict decoders
-    (cima) then reject the file: "wav: chunk 'data' truncated" — observed
+    (the engine) then reject the file: "wav: chunk 'data' truncated" — observed
     live on every WhatsApp voice note. Rewrite both sizes from the actual
     byte counts; already-correct WAVs pass through byte-identical.
     """
@@ -440,7 +409,6 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
     if not audio_bytes:
         return ""
 
-    client = _get_client()
     try:
         wav = _normalize_audio_for_cima(audio_bytes)
     except Exception as e:
@@ -448,25 +416,9 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
         return ""
 
     try:
-        b64_audio = base64.b64encode(wav).decode("utf-8")
-        # Per cima's OpenAPI spec, `audio` exists ONLY on /api/generate
-        # (top-level array); the chat Message schema has no audio field, so
-        # attaching clips there made the server drop them silently and gemma
-        # "transcribed" from imagination — observed live as fluent Spanish
-        # unrelated to the voice note. GenerateRequest has no system field
-        # either, so the instructions travel inline in the prompt.
-        resp = client.generate(
-            CIMA_MODEL,
-            prompt=f"{_ASR_SYSTEM_PROMPT}\n\n{_ASR_USER_PROMPT}",
-            audio=[b64_audio],
-            options={
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "repeat_penalty": 1.0,
-                "num_predict": 1024,
-            },
-        )
-        text = (resp.content or "").strip()
+        # Tachyon's transcribe takes up to 30 s per call: longer voice notes
+        # are cut into 30 s WAV slices and the texts joined.
+        text = " ".join(t for t in (inference.transcribe(w) for w in _wav_slices(wav, 30)) if t).strip()
         quality = _asr_quality(text, _wav_duration_seconds(wav))
         if quality == "junk":
             logger.warning(f"[ASR] Transcription judged JUNK "
@@ -481,6 +433,25 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> s
     except Exception as e:
         logger.error(f"Audio transcription failed: {e}")
         return ""
+
+
+def _wav_slices(wav: bytes, seconds: int) -> list:
+    """Split a PCM WAV into WAVs of at most `seconds` each."""
+    import io
+    import wave
+    with wave.open(io.BytesIO(wav)) as r:
+        params, per = r.getparams(), r.getframerate() * seconds
+        out = []
+        while True:
+            frames = r.readframes(per)
+            if not frames:
+                break
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setparams(params)
+                w.writeframes(frames)
+            out.append(buf.getvalue())
+    return out or [wav]
 
 
 def extract_text_from_document_bytes(data: bytes, filename: str) -> str:

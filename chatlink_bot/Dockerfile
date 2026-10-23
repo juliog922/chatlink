@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install UV
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /bin/uv
 
 # 4. Copy Config Files
 COPY pyproject.toml README.md ./
@@ -46,6 +46,10 @@ RUN uv sync --no-install-project --no-cache
 COPY src/ ./src/
 
 # 7. Final Setup
+# Same uid as the Tachyon daemon: it only serves clients of its own user.
+RUN useradd -u 1000 -m kapa && chown -R 1000:1000 /app
+USER 1000
+
 EXPOSE 8000
 
 ENV PYTHONPATH="/app/src"

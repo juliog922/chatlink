@@ -1,10 +1,14 @@
+# Kapa: four services, no published ports except the admin API on localhost
+# (reach it with: ssh -L 8000:localhost:8000 <server>).
+#
+# Local and server differ only in .env: KAPA_CHAT_MODEL=gemma-4-e2b on a small
+# GPU, gemma-4-e4b on the server. TACHYON_SRC points at a Tachyon checkout.
+name: kapa
+
 services:
   db:
-    image: postgres:16-alpine
-    container_name: chatlink-db
+    image: postgres:16.4-alpine
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -13,22 +17,14 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 60s
+      interval: 30s
       timeout: 5s
       retries: 5
-    networks:
-      - chatlink-net
 
   meow_server:
-    build:
-      context: ./meow_server
-      dockerfile: Dockerfile
-    container_name: meow-server
+    build: ./meow_server
     restart: unless-stopped
-    ports:
-      - "50051:50051"
-    env_file:
-      - .env
+    env_file: .env
     environment:
       WHATSMEOW_HOST: 0.0.0.0
       WHATSMEOW_PORT: 50051
@@ -40,86 +36,68 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/bin/grpc_health_probe", "-addr=:50051"]
-      interval: 60s
+      interval: 30s
       timeout: 5s
       retries: 5
-    networks:
-      - chatlink-net
 
-  chatlink_bot:
+  tachyon:
     build:
-      context: ./chatlink_bot
-      dockerfile: Dockerfile
-    container_name: chatlink-bot
+      context: ./deploy/tachyon
+      additional_contexts:
+        tachyon_src: ${TACHYON_SRC:-../tachyon}
     restart: unless-stopped
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
     environment:
-      API_HOST: 0.0.0.0
-      API_PORT: 8000
-      GRPC_HOST: meow_server
-      GRPC_PORT: 50051
+      KAPA_CHAT_MODEL: ${KAPA_CHAT_MODEL:-gemma-4-e4b}
+      KAPA_LAYA_MODEL: ${KAPA_LAYA_MODEL:-laya-multilingual}
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
-      - ./chatlink_bot/gmail_accounts.json:/app/gmail_accounts.json:ro
-    depends_on:
-      meow_server:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-      cima:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz', timeout=5).read()\""]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-    networks:
-      - chatlink-net
-  
-  cima:
-    image: ghcr.io/juliog922/cima:latest
-    container_name: cima
-    restart: unless-stopped
-    ports:
-      - "8001:8000"
-    env_file:
-      - .env
-    environment:
-      # Bind on 0.0.0.0:8000 so the internal `cima:8000` URL the bot already
-      # uses keeps working unchanged (cima's native port is 11435).
-      CIMA_HOST: 0.0.0.0
-      CIMA_PORT: "8000"
-      # One GGUF model does everything: text + vision + audio + embed.
-      # Pulled on first startup into the models volume (~3 GB → the long
-      # start_period below covers the download).
-      CIMA_PULL_AT_STARTUP: unsloth/gemma-4-E2B-it-GGUF:Q8_0
-    volumes:
-      - models_data:/data/models
+      - tachyon_models:/models
+      - tachyon_run:/run/tachyon
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
     healthcheck:
-      # /api/ready returns 503 until the startup pull finishes, then 200 —
-      # so `depends_on: condition: service_healthy` correctly waits for the
-      # model to be present before the bot starts talking to it.
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/ready || exit 1"]
-      interval: 300s
-      timeout: 5s
-      retries: 30
-      start_period: 1200s
-    networks:
-      - chatlink-net
+      test: ["CMD", "tachyon", "ps"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1800s   # first start downloads the models
+
+  chatlink_bot:
+    build: ./chatlink_bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      GRPC_HOST: meow_server
+      GRPC_PORT: 50051
+      POSTGRES_HOST: db
+      TACHYON_BIN: /run/tachyon/tachyon
+      TACHYON_SOCKET: /run/tachyon/tachyon.sock
+    ports:
+      - "127.0.0.1:${KAPA_API_PORT:-8000}:8000"
+    volumes:
+      - ./chatlink_bot/gmail_accounts.json:/app/gmail_accounts.json:ro
+      - tachyon_run:/run/tachyon
+    depends_on:
+      db:
+        condition: service_healthy
+      meow_server:
+        condition: service_healthy
+      tachyon:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz', timeout=5).read()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   postgres_data:
-  models_data:
-
-networks:
-  chatlink-net:
-    driver: bridge
+  tachyon_models:
+  tachyon_run:

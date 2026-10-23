@@ -1,30 +1,18 @@
 # chatlink_bot/src/chatlink_bot/ai/llm.py
 """
-Kapa v2 — tubería tipada por turno. SUSTITUYE al bucle de agente completo.
+Kapa v3 — tubería tipada por turno.
 
     Etapa 0  código   preproceso estructural            (§ PREPROCESO)
-    Etapa 1  LLM #1   extracción -> actos               (§ ACTOS + § TURNO)
+    Etapa 1  Gemma    extracción -> actos               (§ ACTOS + § TURNO)
     Etapa 2  código   resolución de referencias         (§ RESOLUCION)
-             LLM #2   match por lotes, solo ambiguos
+             Laya     elige entre candidatos, solo ambiguos
     Etapa 3  código   reductor: ÚNICO escritor          (§ REDUCTOR)
-    Etapa 4  código   renderizado desde estado          (§ RENDER)
-             LLM #3   reescritura de tono (validada)
-    commit   verificar -> (handlers persiste y envía)
+    Etapa 4  código   la plantilla ES la respuesta      (§ RENDER)
 
-Techo duro: 4 llamadas/turno (extracción + match + reescritura + re-muestreo
-de reserva). El modelo nunca ejecuta, nunca redacta el mensaje base y nunca
-emite códigos: solo spans del mensaje, enums e índices. Los invariantes viven
-en el reductor y el renderizador; `verificar` es el cinturón (expectativa de
-disparos ~0; cada disparo es un bug, D12).
-
-Interfaz idéntica a la versión anterior: run_agent(...) -> AgentResult y
-health_check(). handlers.py llama igual; con dos parches opcionales activa
-D4 (code_lookup) y la marca en el xlsx.
-
-Un solo fichero a propósito (decisión de proyecto: refactor sin módulos
-nuevos). Las secciones están marcadas con `# ===` y son independientes:
-ninguna sección inferior escribe estado de una superior; el único escritor
-de carrito/open_items es `aplicar()` (§ REDUCTOR).
+El modelo nunca ejecuta, nunca redacta el mensaje y nunca emite códigos: solo
+spans del mensaje, enums e índices. El único escritor de carrito/open_items
+es `aplicar()`; el mensaje se construye desde los hechos y el carrito, así
+que no puede contradecirlos. Inferencia: ai/inference.py (Tachyon).
 """
 from __future__ import annotations
 
@@ -40,7 +28,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from .cima_client import CimaClient, Message
+from . import inference
 from .rag import coverage_rank, tokenize, variants
 
 logger = logging.getLogger("LLM")
@@ -1288,7 +1276,7 @@ async def resolver(actos: List[Acto], estado, *, search: Retriever,
     return r
 
 # ============================================================================
-# RENDER — Etapa 4, plantilla + reescritura validada + verificar
+# RENDER — Etapa 4, la plantilla es la respuesta
 # ============================================================================
 
 
@@ -1495,109 +1483,19 @@ def render(hechos: List[Hecho], estado: Estado, *, intro_mode: str,
     return cuerpo + "\n" + BOT_SIGNATURE
 
 
-# --------------------------------------------------------------- reescritura
-def lineas_congeladas(plantilla: str) -> List[str]:
-    """Toda línea que contenga un paréntesis con código o un dígito de
-    cantidad queda congelada: debe aparecer verbatim en la reescritura."""
-    out = []
-    for ln in plantilla.splitlines():
-        if re.search(r"\(\S+\)", ln) or _RE_DIGITS.search(ln):
-            out.append(re.sub(r"\s+", " ", ln).strip())
-    return out
-
-
-def validar_reescritura(plantilla: str, reescrito: str) -> Tuple[bool, str]:
-    if not reescrito or not reescrito.strip():
-        return False, "vacía"
-    flat = re.sub(r"\s+", " ", reescrito).strip()
-    for ln in lineas_congeladas(plantilla):
-        if ln and ln not in flat:
-            return False, f"línea congelada ausente: {ln[:60]!r}"
-    if Counter(_RE_DIGITS.findall(plantilla)) != Counter(_RE_DIGITS.findall(reescrito)):
-        return False, "multiconjunto de dígitos distinto"
-    if _RE_MD.search(reescrito.replace(BOT_SIGNATURE, "")):
-        return False, "markdown/viñetas"
-    low = reescrito.lower()
-    for veto in ("instrucci", "interno", "system", "prompt", "como ia", "modelo de lenguaje"):
-        if veto in low:
-            return False, f"veto: {veto}"
-    if len(reescrito) > int(len(plantilla) * 1.4) + 80:
-        return False, "longitud desproporcionada"   # margen para conectores, no para inventar
-    return True, ""
-
-
-# ------------------------------------------------------------------ verificar
-def verificar(mensaje: str, estado: Estado, codigos_permitidos: set) -> Tuple[bool, str]:
-    """Cinturón del invariante 6 sobre el mensaje FINAL:
-    - todo token con forma (COD) ∈ permitidos (carrito ∪ retrieval del turno
-      ∪ opciones vivas ∪ last_closed),
-    - toda línea 'N uds (COD)' de un código EN CARRITO debe casar con su qty.
-    """
-    if not mensaje:
-        return True, ""
-    en_parens = set(re.findall(r"\(([A-Za-z0-9\-\./]{3,21})\)", mensaje))
-    en_parens = {c for c in en_parens if any(ch.isdigit() for ch in c)}
-    fuera = en_parens - codigos_permitidos
-    if fuera:
-        return False, f"códigos no fundados en el mensaje: {sorted(fuera)}"
-    qty_by_code = {l["code"]: int(l["qty"]) for l in estado.cart}
-    for m in re.finditer(r"(\d+)\s*uds?\s*\(([A-Za-z0-9\-\./]{3,21})\)", mensaje, re.I):
-        qty, code = int(m.group(1)), m.group(2)
-        if code in qty_by_code and qty != qty_by_code[code]:
-            return False, f"cantidad {qty} no casa con carrito ({qty_by_code[code]}) para {code}"
-    return True, ""
-
-
-def mensaje_seguro(estado_viejo: Estado, salesman_name: str) -> str:
-    """D12: fallo de verificar -> mensaje desde el ESTADO VIEJO, que sigue
-    siendo verdad, pidiendo reenviar lo último."""
-    if estado_viejo.cart:
-        lineas = "; ".join(_linea_producto(l.get("name", ""), int(l["qty"]), l["code"])
-                           for l in estado_viejo.cart)
-        cuerpo = (f"No he podido procesar bien tu último mensaje. Tu pedido sigue como "
-                  f"estaba: {lineas}. ¿Me reenvías lo último que querías cambiar o añadir?")
-    else:
-        cuerpo = ("No he podido procesar bien tu último mensaje. ¿Me lo reenvías? "
-                  f"Si lo prefieres, se lo paso a {salesman_name}.")
-    return cuerpo + "\n" + BOT_SIGNATURE
-
 # ============================================================================
 # TURNO — orquestador, llamadas LLM y contrato con handlers
 # ============================================================================
 
-CIMA_URL = os.getenv("CIMA_URL", "http://cima:8000")
-CIMA_MODEL = os.getenv("CIMA_MODEL", "unsloth/gemma-4-E2B-it-GGUF:Q8_0")
-CIMA_CTX_WINDOW = int(os.getenv("CIMA_CTX_WINDOW", "8192"))  # ventana; resumen al 60%
 
 MAX_LLM_CALLS = int(os.getenv("PIPE_MAX_LLM_CALLS", "4"))
 EXTRACT_TIMEOUT_S = float(os.getenv("PIPE_EXTRACT_TIMEOUT_S", "90"))
 MATCH_TIMEOUT_S = float(os.getenv("PIPE_MATCH_TIMEOUT_S", "60"))
-REWRITE_TIMEOUT_S = float(os.getenv("PIPE_REWRITE_TIMEOUT_S", "60"))
 EXTRACT_MAX_TOKENS = int(os.getenv("PIPE_EXTRACT_MAX_TOKENS", "700"))
 MATCH_MAX_TOKENS = int(os.getenv("PIPE_MATCH_MAX_TOKENS", "300"))
-REWRITE_MAX_TOKENS = int(os.getenv("PIPE_REWRITE_MAX_TOKENS", "450"))
-REWRITE_ON = os.getenv("RENDER_REWRITE", "on").strip().lower() not in ("0", "off", "false", "no")
 MSG_MAX_CHARS = int(os.getenv("PIPE_MSG_MAX_CHARS", "2400"))
 
 _client: Optional[CimaClient] = None
-
-
-def _get_client() -> CimaClient:
-    global _client
-    if _client is None:
-        _client = CimaClient(CIMA_URL)
-    return _client
-
-
-async def health_check() -> Dict[str, Any]:
-    """cima reachability probe (usada por /api/healthz)."""
-    url = f"{CIMA_URL}/api/version"
-    try:
-        code = await asyncio.to_thread(
-            lambda: urllib.request.urlopen(url, timeout=3).getcode())
-        return {"status": "ok" if code == 200 else "error", "code": code, "url": url}
-    except Exception as e:
-        return {"status": "error", "error": str(e), "url": url}
 
 
 # --------------------------------------------------------------------- result
@@ -1645,15 +1543,10 @@ async def _chat_json(system: str, user: str, schema: Dict[str, Any], *,
     t0 = time.monotonic()
     ok = False
     try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=system),
-             Message(role="user", content=user)],
-            options={"temperature": temperature, "num_predict": max_tokens},
-            fmt=(fmt if fmt is not None else schema), timeout=timeout)
-        data = json.loads(resp.content or "{}")
-        ok = isinstance(data, dict)
-        return data if ok else None
+        text = await asyncio.to_thread(inference.chat, f"{system}\n\n{user}", timeout=timeout)
+        data = inference.json_from(text)
+        ok = data is not None
+        return data
     except Exception as e:
         logger.warning(f"[PIPE] {kind} falló: {e}")
         return None
@@ -1796,88 +1689,6 @@ def _match_user(payload: List[Dict[str, Any]]) -> str:
     return "\n".join(partes)
 
 
-# --------------------------------------------------------- Etapa 4: rewrite
-_REWRITE_SYSTEM = """Reescribe este mensaje de WhatsApp de un asistente de pedidos para que suene natural, cercano y profesional en español.
-REGLAS ESTRICTAS:
-- Toda línea que contenga un número o un código entre paréntesis debe aparecer EXACTAMENTE igual, sin cambiar ni una cifra ni una letra.
-- No añadas información, productos, números ni promesas. No hables de precios ni plazos.
-- Sin markdown, sin viñetas, sin asteriscos.
-- Conserva la firma final tal cual.
-Devuelve solo el mensaje reescrito."""
-
-
-async def _reescribir(plantilla: str, budget: _Budget, *, hilo: str = "") -> str:
-    if not REWRITE_ON or not budget.can() or not plantilla.strip():
-        return plantilla
-    congeladas = lineas_congeladas(plantilla)
-    partes = []
-    if hilo.strip():
-        partes.append("CONVERSACIÓN (para el tono y la continuidad, no la repitas):")
-        partes.append("\n".join(hilo.strip().splitlines()[-6:]))
-        partes.append("")
-    partes.append("MENSAJE A REESCRIBIR:")
-    partes.append(plantilla)
-    if congeladas:
-        partes.append("\nLINEAS BLOQUEADAS (copiar tal cual, sin cambiar nada):")
-        partes.extend(congeladas)
-    user = "\n".join(partes)
-    t0 = time.monotonic()
-    ok = False
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_REWRITE_SYSTEM),
-             Message(role="user", content=user)],
-            options={"temperature": 0.4, "num_predict": REWRITE_MAX_TOKENS},
-            timeout=REWRITE_TIMEOUT_S)
-        candidato = (resp.content or "").strip()
-        valido, motivo = validar_reescritura(plantilla, candidato)
-        ok = True
-        if valido:
-            return candidato
-        logger.info(f"[PIPE] reescritura descartada ({motivo}); sale la plantilla")
-        return plantilla
-    except Exception as e:
-        logger.warning(f"[PIPE] reescritura falló: {e}")
-        return plantilla
-    finally:
-        budget.spend("rewrite", int((time.monotonic() - t0) * 1000), ok)
-
-
-_SUMMARY_SYSTEM = """Mantienes un resumen breve de UNA conversación de pedido entre un cliente y el asistente Kapa. Te doy el resumen anterior y los mensajes nuevos; devuelve el resumen ACTUALIZADO.
-Incluye solo: qué productos se han pedido y confirmado, qué quedó pendiente o por aclarar, y el tono/contexto útil del cliente. NO inventes. NO hables de pedidos pasados de otras conversaciones. Máximo 6 líneas. Devuelve solo el texto del resumen."""
-
-
-def _estimar_tokens(texto: str) -> int:
-    return len(texto) // 4     # aproximación barata (1 tok ~ 4 chars en ES)
-
-
-async def _compactar_resumen(resumen: str, hilo: str, budget: _Budget) -> str:
-    """§3.6: dispara cuando resumen+hilo pasan el 60% de la ventana. Rehace el
-    resumen desde (resumen anterior + mensajes nuevos). Llamada de
-    MANTENIMIENTO, fuera del presupuesto del turno."""
-    umbral = int(CIMA_CTX_WINDOW * 0.60)
-    if _estimar_tokens(resumen + hilo) < umbral:
-        return resumen
-    user = (f"RESUMEN ANTERIOR:\n{resumen or '(ninguno)'}\n\n"
-            f"MENSAJES NUEVOS:\n{hilo}")
-    t0 = time.monotonic()
-    try:
-        resp = await asyncio.to_thread(
-            _get_client().chat, CIMA_MODEL,
-            [Message(role="system", content=_SUMMARY_SYSTEM),
-             Message(role="user", content=user)],
-            options={"temperature": 0.2, "num_predict": 400},
-            timeout=REWRITE_TIMEOUT_S)
-        nuevo = (resp.content or "").strip()
-        logger.info(f"[PIPE] resumen recompactado en "
-                    f"{int((time.monotonic() - t0) * 1000)}ms ({len(nuevo)} chars)")
-        return nuevo or resumen
-    except Exception as e:
-        logger.warning(f"[PIPE] compactación falló: {e}")
-        return resumen
-
-
 def _actos_estructurales(texto: str, estado: Estado) -> List[Acto]:
     """Cuando la extracción no ve ningún acto, lo puramente ESTRUCTURAL no
     puede perderse por ello (el LLM interpreta lenguaje; los códigos son
@@ -1904,7 +1715,7 @@ async def run_agent(*, client_name: str, salesman_name: str,
                     current_message: str, intro_mode: str,
                     search: Retriever,
                     code_lookup: Optional[CodeLookup] = None) -> AgentResult:
-    """Un turno completo. Firma compatible con handlers.handle_ai_trigger.
+    """Un turno completo (handlers.run_turn).
     `recent_history` llega con roles (Cliente/Comercial/Asistente) y ENTRA en
     el prompt de COMPRENDER: es lo que permite resolver "sí ese", "13",
     "quítame el otro" leyendo lo que se dijo antes."""
@@ -1912,9 +1723,8 @@ async def run_agent(*, client_name: str, salesman_name: str,
     budget = _Budget()
     estado_in = Estado.from_session(session)
     guide_shown = bool(session.get("guide_shown"))
-    resumen = str(session.get("summary") or "")
+    resumen = ""          # el hilo reciente basta para un chat de pedido
     hilo = recent_history or ""
-    resumen_out = {"v": resumen}     # el resumen a persistir (por defecto, el previo)
 
     def _result(reply: str, estado: Estado, hechos: List[Hecho],
                 extra_ctx: Optional[Dict[str, Any]] = None) -> AgentResult:
@@ -1924,7 +1734,7 @@ async def run_agent(*, client_name: str, salesman_name: str,
                "turn_ms": int((time.monotonic() - t_turn) * 1000),
                **(extra_ctx or {})}
         return AgentResult(reply=reply, order_status=estado.order_status,
-                           cart=estado.cart, summary=resumen_out["v"],
+                           cart=estado.cart, summary="",
                            handoff=handoff, opt_out=opt_out, silent=False,
                            open_items=estado.open_items,
                            guide_shown=guide_shown, ctx=ctx)
@@ -2014,43 +1824,12 @@ async def run_agent(*, client_name: str, salesman_name: str,
         logger.info(f"[PIPE] silencio: no interponerse ({motivo})")
         return _result("", resultado.estado, [], {"silencio": motivo})
 
-    # -------- Etapa 4
-    plantilla = render(resultado.hechos, resultado.estado, intro_mode=intro_mode,
-                       client_name=client_name, salesman_name=salesman_name,
-                       commercial_turn=commercial)
-    mensaje = await _reescribir(plantilla, budget, hilo=hilo) if plantilla else ""
-
-    # -------- commit-side: verificar (cinturón del invariante 6)
-    permitidos = {l["code"] for l in resultado.estado.cart}
-    permitidos |= {l["code"] for l in estado_in.cart}
-    permitidos |= {c.get("code") for c in estado_in.last_closed_cart if c.get("code")}
-    for it in resultado.estado.open_items:
-        permitidos |= {o.get("code") for o in it.get("opciones") or [] if o.get("code")}
-        if it.get("code"):
-            permitidos.add(it["code"])
-    for h in resultado.hechos:
-        for k in ("code",):
-            if h.datos.get(k):
-                permitidos.add(h.datos[k])
-        for o in h.datos.get("opciones") or []:
-            if isinstance(o, dict) and o.get("code"):
-                permitidos.add(o["code"])
-        for itx in (h.datos.get("items") or []) + (h.datos.get("cart") or []):
-            if isinstance(itx, dict) and itx.get("code"):
-                permitidos.add(itx["code"])
-    permitidos.discard(None)
-
-    ok, motivo = verificar(mensaje, resultado.estado, permitidos)
-    if not ok:
-        logger.error(f"[PIPE][INCIDENTE] verificar falló: {motivo} — se descarta el "
-                     "turno y se responde desde el estado anterior.")
-        return _result(mensaje_seguro(estado_in, salesman_name), estado_in, [],
-                       {"incidente_verificar": motivo})
-
+    # -------- Etapa 4: the template IS the reply. Built from the reducer's
+    # facts and the cart, it cannot contradict them, so no verify step.
+    mensaje = render(resultado.hechos, resultado.estado, intro_mode=intro_mode,
+                     client_name=client_name, salesman_name=salesman_name,
+                     commercial_turn=commercial)
     logger.info(f"[PIPE] turno ok: llamadas={budget.used} hechos="
                 f"{[h.tipo for h in resultado.hechos]} cart={len(resultado.estado.cart)} "
                 f"status={resultado.estado.order_status}")
-    # Mantenimiento: recompactar el resumen si el hilo creció (§3.6). Fuera del
-    # presupuesto del turno; si falla, el resumen previo sigue sirviendo.
-    resumen_out["v"] = await _compactar_resumen(resumen, hilo, budget)
     return _result(mensaje, resultado.estado, resultado.hechos)
