@@ -30,7 +30,13 @@ via() {
 case "${1:-}" in
   vpn-up)
     need PRIKE_WG_PRIVATE_KEY PRIKE_WG_ADDRESS PRIKE_WG_PEER_PUBLIC_KEY PRIKE_WG_ENDPOINT PRIKE_WG_ALLOWED_IPS PRIKE_HOST
-    if reachable "$PRIKE_HOST"; then echo "Already reachable: $PRIKE_HOST answers via $(via "$PRIKE_HOST")."; exit 0; fi
+    if reachable "$PRIKE_HOST"; then
+      echo "Already reachable: $PRIKE_HOST answers via $(via "$PRIKE_HOST")."
+      if ! managed && is_wsl; then
+        echo "To manage it from WSL, turn the Windows tunnel off first (README: Prike tunnel from WSL), then make vpn-up again."
+      fi
+      exit 0
+    fi
     command -v wg-quick >/dev/null || { echo "Install wireguard-tools first (apt/dnf/pacman/brew)." >&2; exit 1; }
     tmp=$(umask 077; mktemp)
     {

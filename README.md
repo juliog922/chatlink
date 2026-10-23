@@ -44,6 +44,18 @@ Once: append the PRIKE_* block to `.env`, then `make ssh-setup`. After that:
     ssh prike
     make vpn-down
 
+### Prike tunnel from WSL
+
+The same key must never be up in Windows and WSL at once. Remove the Windows
+tunnel once (PowerShell as Administrator):
+
+    & "$env:ProgramFiles\WireGuard\wireguard.exe" /uninstalltunnelservice prike
+    Remove-Item -Recurse -Force "$env:ProgramData\Prike"
+
+Then in WSL: `apt install -y wireguard-tools` and `make vpn-up`. WSL drops the
+tunnel when it shuts down; `make vpn-up` again (deploy does it), or with
+systemd enabled in WSL: `systemctl enable --now wg-quick@prike`.
+
 ## Deploy
 
     git tag v3.0.0 && git push --tags
