@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Nightly Postgres dump (it holds the whatsmeow sessions too: a restore needs
 # no re-pairing). Install in root's crontab on the server:
-#   15 3 * * *  /home/julio/kapa/current/deploy/backup.sh
+#   15 3 * * *  <KAPA_ROOT>/current/deploy/backup.sh
 # Optional: BACKUP_RSYNC_TARGET=user@host:path in shared/.env copies it off the machine.
 set -euo pipefail
-ROOT=${KAPA_ROOT:-/home/julio/kapa}
+# This file lives in <KAPA_ROOT>/current/deploy/.
+ROOT=${KAPA_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$ROOT"
 mkdir -p backups
 f="backups/kapa-$(date +%F).sql.gz"

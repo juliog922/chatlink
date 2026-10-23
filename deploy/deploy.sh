@@ -12,12 +12,8 @@
 set -euo pipefail
 TAG=$1; TSHA=$2
 ROOT=${KAPA_ROOT:-$HOME/kapa}
-# Docker needs sudo here. With SUDO_PW (sent by make deploy over stdin, never
-# on a command line) it runs unattended; without it sudo asks.
-dk() {
-  if [ -n "${SUDO_PW:-}" ]; then printf '%s\n' "$SUDO_PW" | sudo -S -p '' docker "$@"
-  else sudo docker "$@"; fi
-}
+# Docker through sudo by default (make deploy uses ssh -t, so sudo can ask).
+dk() { ${DOCKER:-sudo docker} "$@"; }
 WAIT_S=${HEALTH_WAIT_S:-300}      # first deploy: HEALTH_WAIT_S=3600 (models download)
 NEW=$ROOT/releases/$TAG
 cd "$ROOT"

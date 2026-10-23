@@ -2,7 +2,7 @@
 """The admin API: salesmen and health. Nothing else.
 
 Reached only through an SSH tunnel (compose binds it to 127.0.0.1):
-    ssh -L 8000:localhost:8000 prike   ->   curl localhost:8000/api/healthz
+    ssh -L 8000:localhost:8000 <server>   ->   curl localhost:8000/api/healthz
 """
 from typing import List
 
