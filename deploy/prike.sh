@@ -14,7 +14,8 @@ set -euo pipefail
 need() { for v in "$@"; do [ -n "${!v:-}" ] || { echo "Missing $v in .env" >&2; exit 1; }; done; }
 reachable() { ping -c1 -W2 "$1" >/dev/null 2>&1; }
 wg_dir() { if [ "$(uname)" = Darwin ]; then echo "$(brew --prefix)/etc/wireguard"; else echo /etc/wireguard; fi; }
-managed() { [ -f "$(wg_dir)/prike.conf" ] && sudo wg show prike >/dev/null 2>&1; }
+# The tunnel make brought up: its config exists and its interface is up (no sudo needed).
+managed() { [ -f "$(wg_dir)/prike.conf" ] && { ip link show prike >/dev/null 2>&1 || [ "$(uname)" = Darwin ]; }; }
 # The interface traffic to $1 leaves by (wg tunnel "prike", or eth0 under WSL
 # when the WireGuard app on Windows carries it).
 route_dev() { ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
