@@ -20,6 +20,14 @@ managed() { [ -f "$(wg_dir)/prike.conf" ] && { ip link show prike >/dev/null 2>&
 # when the WireGuard app on Windows carries it).
 route_dev() { ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+# WireGuard drops a handshake whose timestamp is older than the last one the
+# server accepted for this key, so a WSL clock behind Windows (common after
+# sleep) makes the server ignore us. Seconds WSL is behind Windows (0 elsewhere).
+clock_skew() {
+  is_wsl || { echo 0; return; }
+  local win; win=$(powershell.exe -NoProfile -Command '[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()' 2>/dev/null | tr -d '\r')
+  [[ "$win" =~ ^[0-9]+$ ]] && echo $((win - $(date -u +%s))) || echo 0
+}
 via() {
   local dev; dev=$(route_dev "$1")
   if managed; then echo "the tunnel make manages (prike)"
@@ -38,6 +46,11 @@ case "${1:-}" in
       exit 0
     fi
     command -v wg-quick >/dev/null || { echo "Install wireguard-tools first (apt/dnf/pacman/brew)." >&2; exit 1; }
+    skew=$(clock_skew)
+    if [ "${skew#-}" -gt 5 ]; then
+      echo "WSL clock is ${skew}s off Windows: resyncing it (hwclock -s)."
+      sudo hwclock -s 2>/dev/null || echo "hwclock failed: run 'wsl --shutdown' in Windows and reopen WSL." >&2
+    fi
     # Resolve the endpoint to IPv4 here: under WSL (NAT) a name that also
     # has an IPv6 address can make WireGuard pick a route that goes nowhere.
     ep_host=${PRIKE_WG_ENDPOINT%:*}; ep_port=${PRIKE_WG_ENDPOINT##*:}
@@ -69,6 +82,7 @@ case "${1:-}" in
     {
       echo "The tunnel is up but $PRIKE_HOST does not answer. What WireGuard sees:"
       sudo wg show prike | grep -E 'endpoint|latest handshake|transfer' || true
+      is_wsl && echo "  WSL clock vs Windows: $(clock_skew)s"
       echo "No 'latest handshake' and 0 B received: the server is not answering our UDP"
       echo "(another device using this same key, e.g. the Windows tunnel still on, or a firewall)."
       echo "A handshake but no ping: the server side; send this output to Asterio."
