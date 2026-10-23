@@ -14,11 +14,22 @@ set -euo pipefail
 need() { for v in "$@"; do [ -n "${!v:-}" ] || { echo "Missing $v in .env" >&2; exit 1; }; done; }
 reachable() { ping -c1 -W2 "$1" >/dev/null 2>&1; }
 wg_dir() { if [ "$(uname)" = Darwin ]; then echo "$(brew --prefix)/etc/wireguard"; else echo /etc/wireguard; fi; }
+managed() { [ -f "$(wg_dir)/prike.conf" ] && sudo wg show prike >/dev/null 2>&1; }
+# The interface traffic to $1 leaves by (wg tunnel "prike", or eth0 under WSL
+# when the WireGuard app on Windows carries it).
+route_dev() { ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
+is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+via() {
+  local dev; dev=$(route_dev "$1")
+  if managed; then echo "the tunnel make manages (prike)"
+  elif is_wsl; then echo "Windows (${dev:-?}): the WireGuard app there, not make"
+  else echo "${dev:-another route}, not a tunnel make manages"; fi
+}
 
 case "${1:-}" in
   vpn-up)
     need PRIKE_WG_PRIVATE_KEY PRIKE_WG_ADDRESS PRIKE_WG_PEER_PUBLIC_KEY PRIKE_WG_ENDPOINT PRIKE_WG_ALLOWED_IPS PRIKE_HOST
-    if reachable "$PRIKE_HOST"; then echo "VPN already up: $PRIKE_HOST answers."; exit 0; fi
+    if reachable "$PRIKE_HOST"; then echo "Already reachable: $PRIKE_HOST answers via $(via "$PRIKE_HOST")."; exit 0; fi
     command -v wg-quick >/dev/null || { echo "Install wireguard-tools first (apt/dnf/pacman/brew)." >&2; exit 1; }
     tmp=$(umask 077; mktemp)
     {
@@ -46,11 +57,16 @@ case "${1:-}" in
     exit 1 ;;
 
   vpn-down)
-    sudo wg-quick down prike ;;
+    if managed; then sudo wg-quick down prike; echo "Tunnel down."; exit 0; fi
+    echo "No tunnel managed by make here."
+    if [ -n "${PRIKE_HOST:-}" ] && reachable "$PRIKE_HOST"; then
+      echo "$PRIKE_HOST still answers via $(via "$PRIKE_HOST"). Turn it off there."
+    fi ;;
 
   vpn-status)
     need PRIKE_HOST
-    if reachable "$PRIKE_HOST"; then echo "VPN up."; else echo "VPN down: run make vpn-up." >&2; exit 1; fi ;;
+    if reachable "$PRIKE_HOST"; then echo "Up: $PRIKE_HOST answers via $(via "$PRIKE_HOST")."
+    else echo "Down: run make vpn-up." >&2; exit 1; fi ;;
 
   ssh-setup)
     need PRIKE_HOST PRIKE_USER PRIKE_SSH_KEY_B64 PRIKE_HOST_KEY
@@ -70,6 +86,11 @@ case "${1:-}" in
     host=${SQLSERVER_HOST%%,*}
     port=1433
     [ "$host" != "$SQLSERVER_HOST" ] && port=${SQLSERVER_HOST#*,}
+    if ! [[ "$host" =~ ^[0-9.]+$ ]] && ! getent hosts "$host" >/dev/null; then
+      echo "Cannot resolve $host: Windows machine names do not resolve on Linux/WSL." >&2
+      echo "Put its IP in SQLSERVER_HOST (e.g. SQLSERVER_HOST=192.168.x.y,1433) or add it to /etc/hosts." >&2
+      exit 1
+    fi
     if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
       echo "SAGE answers on $host:$port."
     else
