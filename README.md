@@ -25,9 +25,13 @@ Two different networks, both configured in `.env`:
 
     make sage-check / sage-vpn-up   SAGE (SQL Server). make up checks it first and
                                     runs SAGE_VPN_UP when SAGE does not answer.
-    make vpn-up / vpn-down          the Prike server tunnel (PRIKE_WG_*). It reaches
-                                    only 10.20.10.100, not SAGE.
-    make ssh-setup                  once: the Prike ssh key and the `prike` alias.
+    make prike-check                does the Prike server answer?
+
+The Prike tunnel runs on Windows: paste `deploy/prike-windows.ps1` into
+PowerShell as Administrator (it reads the PRIKE_WG_* keys from `.env` in WSL).
+WSL reaches the server through it. It cannot run inside WSL: the server
+answers WireGuard over IPv6 only, and WSL's NAT network has no IPv6.
+Once: `make ssh-setup` for the `ssh prike` alias.
 
 `make test` needs neither: SAGE is faked there.
 
@@ -36,30 +40,10 @@ Two different networks, both configured in `.env`:
     createdb kapa_test
     make test                     # ~6 s, no phone, no GPU
 
-## Access to the Prike server
-
-Once: append the PRIKE_* block to `.env`, then `make ssh-setup`. After that:
-
-    make vpn-up        # WireGuard tunnel (asks for your local sudo password)
-    ssh prike
-    make vpn-down
-
-### Prike tunnel from WSL
-
-The same key must never be up in Windows and WSL at once. Remove the Windows
-tunnel once (PowerShell as Administrator):
-
-    & "$env:ProgramFiles\WireGuard\wireguard.exe" /uninstalltunnelservice prike
-    Remove-Item -Recurse -Force "$env:ProgramData\Prike"
-
-Then in WSL: `apt install -y wireguard-tools` and `make vpn-up`. WSL drops the
-tunnel when it shuts down; `make vpn-up` again (deploy does it), or with
-systemd enabled in WSL: `systemctl enable --now wg-quick@prike`.
-
 ## Deploy
 
     git tag v3.0.0 && git push --tags
-    make deploy TAG=v3.0.0          # brings the Prike tunnel up itself
+    make deploy TAG=v3.0.0          # checks the Prike tunnel first
 
 First time on the server: put a `.env` (without the PRIKE_* lines, which
 only your machine needs) and `gmail_accounts.json` in `~/kapa/shared/`,
