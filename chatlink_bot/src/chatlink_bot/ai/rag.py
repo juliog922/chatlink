@@ -175,8 +175,15 @@ def coverage_rank(query: str,
 
 
 def variants(token: str) -> set:
-    """The token plus its cross-language translations."""
-    return {token} | _XLATE.get(token, set())
+    """The token plus its cross-language translations, plus the other side of
+    a Spanish plural in -es: singularize() turns "labiales" into "labiale",
+    which must still meet "labial" (and the other way round)."""
+    out = {token} | _XLATE.get(token, set())
+    if len(token) > 4 and token.endswith("e") and token[-2] in "lrnd":
+        out.add(token[:-1])
+    elif len(token) > 3 and token[-1] in "lrnd":
+        out.add(token + "e")
+    return out
 
 
 

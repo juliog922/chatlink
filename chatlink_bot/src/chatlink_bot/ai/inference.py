@@ -92,10 +92,11 @@ def choose(state: str, items: List[dict]) -> List[dict]:
         a = answers.get(f"q{i}") or {}
         best = str(a.get("choice", ""))
         p = float((a.get("probabilities") or {}).get(best, 0.0))
-        if p < LAYA_PICK:
+        # "ninguno" is only a place for Laya's doubt to go: the candidates come
+        # from the client's own history and cover his words, so when Laya
+        # rejects them all Kapa asks which one; it never answers "not found".
+        if p < LAYA_PICK or best == "ninguno":
             out.append({"item": i, "veredicto": "varios", "indice": None, "p": p})
-        elif best == "ninguno":
-            out.append({"item": i, "veredicto": "ninguno", "indice": None, "p": p})
         else:
             out.append({"item": i, "veredicto": "unico", "indice": int(best), "p": p})
     logger.info("[LAYA] " + ", ".join(f"{it['texto']!r}->{o['veredicto']}({o['p']:.2f})" for it, o in zip(items, out)))

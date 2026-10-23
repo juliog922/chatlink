@@ -230,8 +230,17 @@ def validar_actos(actos: List[Acto], mensaje: str) -> List[Acto]:
             continue
         if a.tipo == "otro" and not a.subtipo:
             a.subtipo = "fuera_ambito"
+        # "¿a cuánto me dejas el kajal?" names a product but orders nothing: a
+        # pedir with no quantity inside a price/stock question is a referral.
+        if a.tipo == "pedir" and a.cantidad.valor is None and _RE_PREGUNTA_PRECIO.search(msg_flat):
+            a = Acto(tipo="otro", subtipo="precio_stock_factura", evidencia=a.evidencia)
         ok.append(a)
     return ok
+
+
+_RE_PREGUNTA_PRECIO = re.compile(
+    r"(cu[aá]nto|precio|cuesta|cuestan|vale[ns]?\b|me dejas|descuento|oferta|stock|"
+    r"te queda|os queda|ten[eé]is|tienes|hay\b|disponib|cu[aá]ndo llega|plazo)")
 
 # ============================================================================
 # PREPROCESO — Etapa 0, estructural puro
@@ -258,12 +267,15 @@ _RE_GLOBAL_QTY = re.compile(
 
 _RE_CODE_SHAPE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-\./]{2,20}$')
 
-# Línea de pedido con cantidad EXPLÍCITA al final: ", 12" o "12 uds" (la
-# unidad o la coma son obligatorias — "KAJAL 401" es nombre, no 401 uds).
+# Línea de pedido con cantidad al final: ", 12", "12 uds", "x12", o un número
+# suelto de 1-2 cifras ("kajal negro 6"). Un número suelto de 3+ cifras es
+# referencia del producto ("KAJAL 401"), no 401 uds.
 _RE_TRAIL_QTY = re.compile(
     r'^(?P<name>.+?)(?:'
     r'[,;]\s*(?P<q1>\d{1,4})\s*(?:uds?|unds?|unidades|u)?\.?'      # "..., 10" / "..., 10u"
     r'|\s+x?\s*(?P<q2>\d{1,4})\s*(?:uds?|unds?|unidades|u)\.?'     # "... 10u" / "... x10 uds"
+    r'|\s+x\s*(?P<q3>\d{1,4})'                                      # "... x10"
+    r'|\s+(?P<q4>\d{1,2})'                                           # "... 6"
     r')\s*$', re.I)
 
 
@@ -272,7 +284,8 @@ def _parse_linea_pedido(line: str) -> Tuple[str, Optional[int]]:
     body = _RE_BULLET.sub("", line).strip()
     m = _RE_TRAIL_QTY.match(body)
     if m:
-        return m.group("name").strip(" .,;-"), int(m.group("q1") or m.group("q2"))
+        q = m.group("q1") or m.group("q2") or m.group("q3") or m.group("q4")
+        return m.group("name").strip(" .,;-"), int(q)
     return body.strip(" .,;-"), None
 
 
@@ -1587,6 +1600,7 @@ _EXTRACT_SYSTEM = """Eres el intérprete de mensajes de Kapa, un asistente que S
 
 FRONTERA — decide primero de qué lado cae cada intención:
 · LO QUE KAPA ATIENDE (todo lo de montar el pedido): añadir productos, cambiar cantidades, quitar líneas, elegir/rechazar opciones, LEER el pedido actual, repetir un pedido anterior, cerrar el pedido. Esto se mapea a los tipos pedir/modificar/elegir/rechazar/confirmar/cerrar/repetir_ultimo/cantidad_global y a otro(estado_pedido). El estado del pedido lo sabe Kapa: NUNCA se deriva.
+· Preguntar POR un producto (precio, stock, si lo hay) NO es pedirlo: "¿a cuánto me dejas el kajal?" -> otro(precio_stock_factura), nunca pedir.
 · LO QUE KAPA DERIVA AL COMERCIAL (no lo puede atender): precios, descuentos, ofertas, stock/disponibilidad, plazos de entrega, envíos, facturas, pagos → otro(precio_stock_factura). Detalles o especificaciones del producto (ingredientes, uso, tono exacto, para qué sirve) → otro(especificacion). Quejas, reclamaciones, devoluciones → otro(queja). Cualquier otra cosa que no sea montar un pedido → otro(fuera_ambito).
 · LO QUE HACE QUE KAPA CALLE Y AVISE AL COMERCIAL: el cliente exige hablar con el comercial o está enfadado → otro(escalada). No quiere hablar con un asistente → otro(rechazo_bot).
 Ante la duda entre atender y derivar: si es sobre QUÉ productos van en el pedido, es de Kapa; si es sobre condiciones, detalles, dinero o problemas, es del comercial.
