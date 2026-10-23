@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Runs ON THE SERVER, called by `make deploy` after it copied the release.
-#   deploy.sh TAG TACHYON_SHA
+#   deploy.sh TAG
 # Layout under $KAPA_ROOT (default ~/kapa):
 #   shared/.env, shared/gmail_accounts.json   written once by hand, never in git
 #   releases/<TAG>/                           one directory per release
-#   tachyon/<sha>/                            the Tachyon source of that release
 #   current -> releases/<TAG>                 what is running
 #   backups/                                  pg_dump before every deploy, and nightly
 # Brings the new release up, waits until it is healthy, else brings the
 # previous one back and pings the heartbeat's /fail.
 set -euo pipefail
-TAG=$1; TSHA=$2
+TAG=$1
 ROOT=${KAPA_ROOT:-$HOME/kapa}
 # Docker through sudo by default (make deploy uses ssh -t, so sudo can ask).
 dk() { ${DOCKER:-sudo docker} "$@"; }
@@ -23,7 +22,6 @@ command -v nvidia-smi >/dev/null || { echo "No NVIDIA driver on this host: Tachy
 [ -f shared/gmail_accounts.json ] || echo '{}' > shared/gmail_accounts.json
 ln -sfn "$ROOT/shared/.env" "$NEW/.env"
 ln -sfn "$ROOT/shared/gmail_accounts.json" "$NEW/chatlink_bot/gmail_accounts.json"
-export TACHYON_SRC=$ROOT/tachyon/$TSHA
 mkdir -p backups
 
 compose() { local dir=$1; shift; dk compose --project-directory "$dir" -f "$dir/docker-compose.yml" "$@"; }

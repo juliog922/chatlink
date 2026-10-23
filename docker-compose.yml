@@ -2,7 +2,7 @@
 # (reach it with: ssh -L 8000:localhost:8000 <server>).
 #
 # Local and server differ only in .env: KAPA_CHAT_MODEL=gemma-4-e2b on a small
-# GPU, gemma-4-e4b on the server. TACHYON_SRC points at a Tachyon checkout.
+# GPU, gemma-4-e4b on the server. Tachyon is built from ./tachyon (a copy).
 name: kapa
 
 services:
@@ -44,7 +44,7 @@ services:
     build:
       context: ./deploy/tachyon
       additional_contexts:
-        tachyon_src: ${TACHYON_SRC:-../tachyon}
+        tachyon_src: ./tachyon
     restart: unless-stopped
     environment:
       KAPA_CHAT_MODEL: ${KAPA_CHAT_MODEL:-gemma-4-e4b}

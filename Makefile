@@ -5,12 +5,10 @@
 -include .env
 export
 
-KAPA_ROOT   ?= ~/kapa
-TACHYON_SRC ?= ../tachyon
-TACHYON_SHA  = $(shell git -C $(TACHYON_SRC) rev-parse --short HEAD)
-unexport TACHYON_SHA
+KAPA_ROOT        ?= ~/kapa
+TACHYON_UPSTREAM ?= ~/projects/tachyon
 
-.PHONY: help up down logs test test-models test-db deploy update-whatsmeow
+.PHONY: help up down logs test test-models test-db deploy vendor-tachyon update-whatsmeow
 
 help:
 	@echo "make up                             start everything locally"
@@ -19,6 +17,7 @@ help:
 	@echo "make test                           scenario + unit tests, models faked (seconds)"
 	@echo "make test-models                    the same scenarios with real Gemma + Laya (needs tachyon serve)"
 	@echo "make deploy HOST=<ssh host> TAG=..  ship a tagged release to a server"
+	@echo "make vendor-tachyon                 refresh ./tachyon from ~/projects/tachyon, then commit"
 	@echo "make update-whatsmeow               bump whatsmeow on purpose, then test and deploy"
 
 up:
@@ -45,12 +44,19 @@ test-models:
 deploy:
 	@test -n "$(HOST)" && test -n "$(TAG)" || { echo "usage: make deploy HOST=<ssh host> TAG=v3.0.0"; exit 1; }
 	@git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null || { echo "$(TAG) is not a tag"; exit 1; }
-	@test -z "$$(git -C $(TACHYON_SRC) status --porcelain)" || { echo "$(TACHYON_SRC) has uncommitted changes"; exit 1; }
 	git archive --format=tar "$(TAG)" | ssh $(HOST) \
 	  "mkdir -p $(KAPA_ROOT)/releases/$(TAG) && tar -x -C $(KAPA_ROOT)/releases/$(TAG)"
-	git -C $(TACHYON_SRC) archive --format=tar HEAD | ssh $(HOST) \
-	  "mkdir -p $(KAPA_ROOT)/tachyon/$(TACHYON_SHA) && tar -x -C $(KAPA_ROOT)/tachyon/$(TACHYON_SHA)"
-	ssh -t $(HOST) 'KAPA_ROOT=$(KAPA_ROOT) $(KAPA_ROOT)/releases/$(TAG)/deploy/deploy.sh $(TAG) $(TACHYON_SHA)'
+	ssh -t $(HOST) 'KAPA_ROOT=$(KAPA_ROOT) $(KAPA_ROOT)/releases/$(TAG)/deploy/deploy.sh $(TAG)'
+
+# Tachyon lives in its own repo; ./tachyon is a build copy (source only, no
+# test fixtures) so Kapa builds and deploys from one tree.
+vendor-tachyon:
+	@test -z "$$(git -C $(TACHYON_UPSTREAM) status --porcelain)" || { echo "$(TACHYON_UPSTREAM) has uncommitted changes"; exit 1; }
+	rm -rf tachyon && mkdir tachyon
+	git -C $(TACHYON_UPSTREAM) archive --format=tar HEAD -- . ':(exclude,glob)crates/*/tests/fixtures/**' ':(exclude).github' | tar -x -C tachyon
+	@printf 'Copied from %s at commit %s (%s) by make vendor-tachyon.\nDo not edit here: change Tachyon in its own repo, then run make vendor-tachyon.\n' \
+	  "$(TACHYON_UPSTREAM)" "$$(git -C $(TACHYON_UPSTREAM) rev-parse --short HEAD)" "$$(git -C $(TACHYON_UPSTREAM) log -1 --format=%cs)" > tachyon/VENDORED
+	@cat tachyon/VENDORED; echo "Now: git add tachyon && git commit"
 
 update-whatsmeow:
 	cd meow_server && go get go.mau.fi/whatsmeow@latest && go mod tidy

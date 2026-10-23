@@ -5,12 +5,13 @@ he only has to validate. What it does, scenario by scenario: [SPEC.md](SPEC.md).
 
     meow_server/    Go: WhatsApp through whatsmeow, gRPC to the bot
     chatlink_bot/   Python: ingest, the loop, the turn, delivery, alerts
+    tachyon/        a copy of Tachyon (make vendor-tachyon refreshes it)
     deploy/         Tachyon image, deploy.sh, backup.sh
 
 ## Run locally
 
 Needs Docker with the NVIDIA runtime and a GPU of compute capability 8.0 or
-newer (RTX 30-series and later), plus a Tachyon checkout next to this repo.
+newer (RTX 30-series and later). Tachyon is built from `./tachyon`.
 
     cp .env.example .env          # fill it; on a small GPU: KAPA_CHAT_MODEL=gemma-4-e2b
     make up                       # first start downloads the models
@@ -28,10 +29,11 @@ write to yourself; Kapa treats you as the client.
 the models understand clients, run the same scenarios with real inference
 (slow, needs the GPU):
 
-    cd ../tachyon && cargo build --release && export PATH=$PWD/target/release:$PATH
-    tachyon pull gemma-4-e2b && tachyon pull laya-multilingual   # once (or e4b)
+    cargo build --release --manifest-path tachyon/Cargo.toml --bin tachyon   # once
+    export PATH=$PWD/tachyon/target/release:$PATH
+    tachyon pull gemma-4-e2b && tachyon pull laya-multilingual             # once (or e4b)
     tachyon serve &
-    cd - && make test-models
+    make test-models
 
 Add real client messages to `chatlink_bot/tests/test_models.py` as new cases.
 

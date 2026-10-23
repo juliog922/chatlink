@@ -130,3 +130,4 @@ docker-compose.override.yml
 \#*#
 
 */gmail_accounts.json
+tachyon/target/
