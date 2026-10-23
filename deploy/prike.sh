@@ -38,6 +38,11 @@ case "${1:-}" in
       exit 0
     fi
     command -v wg-quick >/dev/null || { echo "Install wireguard-tools first (apt/dnf/pacman/brew)." >&2; exit 1; }
+    # Resolve the endpoint to IPv4 here: under WSL (NAT) a name that also
+    # has an IPv6 address can make WireGuard pick a route that goes nowhere.
+    ep_host=${PRIKE_WG_ENDPOINT%:*}; ep_port=${PRIKE_WG_ENDPOINT##*:}
+    ep_ip=$(getent ahostsv4 "$ep_host" | awk 'NR==1 {print $1}')
+    [ -n "$ep_ip" ] || { echo "Cannot resolve $ep_host: check your Internet / DNS." >&2; exit 1; }
     tmp=$(umask 077; mktemp)
     {
       echo "[Interface]"
@@ -47,7 +52,7 @@ case "${1:-}" in
       echo "[Peer]"
       echo "PublicKey = $PRIKE_WG_PEER_PUBLIC_KEY"
       [ -n "${PRIKE_WG_PRESHARED_KEY:-}" ] && echo "PresharedKey = $PRIKE_WG_PRESHARED_KEY"
-      echo "Endpoint = $PRIKE_WG_ENDPOINT"
+      echo "Endpoint = $ep_ip:$ep_port"
       echo "AllowedIPs = $PRIKE_WG_ALLOWED_IPS"
       echo "PersistentKeepalive = 25"
     } > "$tmp"
@@ -56,11 +61,18 @@ case "${1:-}" in
     rm -f "$tmp"
     sudo wg-quick down prike >/dev/null 2>&1 || true
     sudo wg-quick up prike >/dev/null
-    for _ in $(seq 1 15); do
+    echo "Tunnel up to $ep_host ($ep_ip:$ep_port); waiting for $PRIKE_HOST (up to 30 s)..."
+    for _ in $(seq 1 10); do
       reachable "$PRIKE_HOST" && { echo "VPN up: $PRIKE_HOST answers."; exit 0; }
-      sleep 2
+      sleep 1
     done
-    echo "Tunnel is up but $PRIKE_HOST does not answer. Check your Internet, then ask Asterio." >&2
+    {
+      echo "The tunnel is up but $PRIKE_HOST does not answer. What WireGuard sees:"
+      sudo wg show prike | grep -E 'endpoint|latest handshake|transfer' || true
+      echo "No 'latest handshake' and 0 B received: the server is not answering our UDP"
+      echo "(another device using this same key, e.g. the Windows tunnel still on, or a firewall)."
+      echo "A handshake but no ping: the server side; send this output to Asterio."
+    } >&2
     exit 1 ;;
 
   vpn-down)
